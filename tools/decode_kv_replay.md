@@ -1,5 +1,12 @@
 # Replay through an already-running D
 
+**Default mode changed:** use the [direct file replay instructions](kv_replay_files.md).
+`--source files` reads saved files without native injection and requires
+`LMCACHE_FILE_REPLAY_ENABLED=true` on D. The documentation below describes
+the older injector, now selected only by adding `--source mooncake`.
+
+## Legacy native injection mode
+
 `decode_kv_replay.py` injects a completed raw D snapshot into the current
 Mooncake deployment and submits the recorded request directly to an existing
 D API. It does not load model weights, start or stop vLLM, modify serving

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Replay a saved D receive through an existing D HTTP service and Mooncake."""
+"""Replay a saved D receive through an existing D service, reading raw files."""
 
 from __future__ import annotations
 
@@ -71,7 +71,12 @@ def metadata(options: dict) -> dict:
             skip_counts.update(int(v) for v in re.findall(r"skip_last_n_tokens[\"']?\s*[:=]\s*(\d+)", line))
     if len(skip_counts) > 1:
         raise ValueError("D logs contain different skip_last_n_tokens settings; select the current D logs")
-    transport = read_transport_environment(paths, Path(options.get("proc_root", "/proc")))
+    file_mode = options.get("source") == "files"
+    if file_mode:
+        from kv_replay_files import require_enabled
+
+        require_enabled(paths, "D")
+    transport = None if file_mode else read_transport_environment(paths, Path(options.get("proc_root", "/proc")))
     # The connector's default is zero when the extra setting is omitted.
     return dict(
         request=plan["request"],
@@ -94,6 +99,7 @@ def collect_metadata(args, output: Path) -> dict:
         request_id=request_key(args.request_id),
         snapshot_root=args.snapshot_root or str(remote_repo / "decode-kv-snapshots"),
         d_logs=args.d_logs or [str(remote_repo / "tp4_dp4_logs" / f"D_dp*_port{port}.log")],
+        source=getattr(args, "source", "mooncake"),
     )
     if not args.snapshot_host:
         result = metadata(options)
@@ -250,7 +256,8 @@ def prepare(args, meta: dict, models: dict, output: Path) -> tuple[dict, dict, i
     if contract.get("tp_size") != meta["tp_size"]:
         raise ValueError("Current D logs and snapshot TP sizes differ")
     master = args.master or contract.get("master")
-    if not master or (contract.get("master") and master != contract["master"]):
+    file_mode = getattr(args, "source", "mooncake") == "files"
+    if not file_mode and (not master or (contract.get("master") and master != contract["master"])):
         raise ValueError("Cannot determine the current D Mooncake master, or --master disagrees with D logs")
     received, prompt = meta["received_tokens"], meta["request"]["prompt_token_ids"]
     # A different D truncation policy changes the partial page's hash/key. Do
@@ -288,6 +295,10 @@ def prepare(args, meta: dict, models: dict, output: Path) -> tuple[dict, dict, i
         release_file=str(remote_repo / "prefill-kv-replays" / "leases" / (tag + ".release")),
         hold_seconds=args.timeout + 120,
     )
+    if file_mode:
+        from kv_replay_files import configure_plan
+
+        configure_plan(args, plan)
     save_json(output / "request.json", payload)
     save_json(output / "seed_plan.json", plan)
     save_json(output / "source.json", meta)
@@ -297,6 +308,8 @@ def prepare(args, meta: dict, models: dict, output: Path) -> tuple[dict, dict, i
 def parser() -> argparse.ArgumentParser:
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("--request-id")
+    cli.add_argument("--source", choices=("files", "mooncake"), default="files")
+    cli.add_argument("--file-port", type=int, default=0)
     cli.add_argument(
         "--run-dir",
         type=Path,
@@ -377,9 +390,17 @@ def main(argv=None) -> int:
                 report["status"] = "prepared_not_run"
                 return 0
             with seeded(args, plan, output) as owner:
+                if args.source == "files":
+                    from kv_replay_files import attach_source
+
+                    attach_source(payload, owner, output)
                 text, metrics = Client(args.d_url, args.timeout).complete(payload, output)
                 print(f"{PREFIX} OUTPUT BEGIN\n{text}\n{PREFIX} OUTPUT END", flush=True)
                 report.update(request_completed=True, metrics=metrics)
+                if args.source == "files":
+                    from kv_replay_files import source_stats
+
+                    report["file_reads"] = source_stats(owner, output)
                 if owner.poll() is not None:
                     raise RuntimeError("Seed owner exited during D request; replay is invalid")
                 validation = validate_response_counts(metrics, len(payload["prompt"]), expected)

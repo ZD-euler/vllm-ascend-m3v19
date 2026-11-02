@@ -98,6 +98,8 @@ def legacy_source(tmp_path):
 def args(tmp_path):
     return R.parser().parse_args(
         [
+            "--source",
+            "mooncake",
             "--request-id",
             "response-0",
             "--d-url",
@@ -270,7 +272,16 @@ def test_existing_d_lifecycle_no_model_or_service_launch(tmp_path, monkeypatch, 
     monkeypatch.setattr(R, "seeded", seed)
     monkeypatch.setattr(R, "Client", Client)
     monkeypatch.setattr(subprocess, "Popen", lambda *_a, **_k: pytest.fail("unexpected process launch"))
-    command = ["--request-id", "response-0", "--d-url", "http://D:7920", "--workspace", str(tmp_path)]
+    command = [
+        "--source",
+        "mooncake",
+        "--request-id",
+        "response-0",
+        "--d-url",
+        "http://D:7920",
+        "--workspace",
+        str(tmp_path),
+    ]
     if cached == 0:
         with pytest.raises(RuntimeError, match="Cache mismatch"):
             R.main(command)
@@ -373,6 +384,8 @@ def test_real_http_single_request_retains_seed_until_done(tmp_path, monkeypatch,
         assert (
             R.main(
                 [
+                    "--source",
+                    "mooncake",
                     "--request-id",
                     "response-0",
                     "--d-url",
@@ -457,6 +470,8 @@ def test_remote_metadata_uses_p_environment_and_preserves_failure(tmp_path, monk
 
     cli = R.parser().parse_args(
         [
+            "--source",
+            "mooncake",
             "--request-id",
             "response-0",
             "--d-url",
@@ -505,7 +520,7 @@ def test_failed_seed_never_submits_decode(tmp_path, monkeypatch):
 
     monkeypatch.setattr(R, "seeded", failed_seed)
     with pytest.raises(RuntimeError, match="readback differs"):
-        R.main(["--request-id", "response-0", "--d-url", "http://D:7920"])
+        R.main(["--source", "mooncake", "--request-id", "response-0", "--d-url", "http://D:7920"])
 
 
 def test_replay_client_modules_parse_as_python39():

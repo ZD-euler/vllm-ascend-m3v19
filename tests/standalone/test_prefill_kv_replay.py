@@ -519,6 +519,8 @@ def test_prepare_uses_live_tokenizer_and_does_not_run_inference(tmp_path, monkey
     monkeypatch.setattr(R, "http_json", http)
     args = R.parser().parse_args(
         [
+            "--source",
+            "mooncake",
             "--run-dir",
             str(tmp_path / "run"),
             "--base-url",
@@ -551,6 +553,8 @@ def test_prefill_seed_log_paths_belong_to_remote_container(tmp_path, monkeypatch
     monkeypatch.setattr(R, "http_json", http)
     args = R.parser().parse_args(
         [
+            "--source",
+            "mooncake",
             "--run-dir",
             str(tmp_path / "run"),
             "--p-url",
@@ -681,7 +685,9 @@ def test_real_case_frontier_recomputes_372_not_90(tmp_path, monkeypatch):
         return {"tokens": list(range(500084 if "问题" in body["prompt"] else 499994))}
 
     monkeypatch.setattr(R, "http_json", http)
-    args = R.parser().parse_args(["--run-dir", str(tmp_path / "run"), "--p-logs", str(tmp_path / "p.log")])
+    args = R.parser().parse_args(
+        ["--source", "mooncake", "--run-dir", str(tmp_path / "run"), "--p-logs", str(tmp_path / "p.log")]
+    )
     out = tmp_path / "out"
     out.mkdir()
     _, plan = R.prepare(args, out)
@@ -737,6 +743,8 @@ def test_existing_pd_orchestration_and_cache_miss_verdict(tmp_path, monkeypatch,
     monkeypatch.setattr(R, "seeded", seeded)
     monkeypatch.setattr(R, "Client", Client)
     argv = [
+        "--source",
+        "mooncake",
         "--run-dir",
         str(tmp_path / "run"),
         "--p-logs",
@@ -832,6 +840,8 @@ def test_proxy_check_rejects_invalid_urls(base):
 def test_remote_child_argv_preserves_linux_path_and_quoting(tmp_path):
     args = R.parser().parse_args(
         [
+            "--source",
+            "mooncake",
             "--snapshot-host",
             "root@host",
             "--workspace",

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Seed previous raw KV into an already-running PD deployment and replay one turn.
+"""Read previous raw KV files and replay one turn through an existing PD service.
 
-No model/server is started, no serving code is patched, and no debug fence is
-enabled. Run on the client/P host; use --snapshot-host if raw KV lives on D.
+No model/server is started. File mode requires the opt-in LMCache file reader;
+--source mooncake selects the older injector. Run on the client/P host and use
+--snapshot-host when raw KV lives on D.
 """
 
 from __future__ import annotations
@@ -148,7 +149,12 @@ def prepare(args, output: Path) -> tuple[dict, dict]:
         raise ValueError("No P startup logs found; --p-logs must name the NEW running P's logs")
     contract = live_contract(files)
     master = args.master or contract.get("master")
-    if not master or ":" not in master:
+    file_mode = getattr(args, "source", "mooncake") == "files"
+    if file_mode:
+        from kv_replay_files import require_enabled
+
+        require_enabled(files, "P")
+    if not file_mode and (not master or ":" not in master):
         raise ValueError("Cannot determine the live Mooncake master; pass --master HOST:PORT")
     if contract.get("master") and master != contract["master"]:
         raise ValueError("--master disagrees with the Mooncake endpoint in the running P logs")
@@ -197,6 +203,10 @@ def prepare(args, output: Path) -> tuple[dict, dict]:
         release_file=str(remote_repo / "prefill-kv-replays" / "leases" / (lease + ".release")),
         hold_seconds=args.timeout + 120,
     )
+    if file_mode:
+        from kv_replay_files import configure_plan
+
+        configure_plan(args, plan)
     save_json(output / "seed_plan.json", plan)
     print(
         f"{PREFIX} session={args.session} round={args.round} prompt={len(tokens)} "
@@ -268,7 +278,8 @@ def wait_seed(process, path: Path, timeout: float) -> dict:
 @contextmanager
 def seeded(args, plan: dict, output: Path):
     encoded = base64.b64encode(gzip.compress(json.dumps(plan).encode())).decode("ascii")
-    command = child_argv(args, "--seed-child", encoded)
+    file_mode = getattr(args, "source", "mooncake") == "files"
+    command = child_argv(args, "--file-child" if file_mode else "--seed-child", encoded)
     log_path = output / "seed.log"
     with log_path.open("wb") as log:
         process = subprocess.Popen(
@@ -282,6 +293,9 @@ def seeded(args, plan: dict, output: Path):
         try:
             info = wait_seed(process, log_path, args.seed_timeout)
             save_json(output / "seed_ready.json", info)
+            if file_mode:
+                process.file_info = info
+                save_json(output / "file_source.json", info)
             yield process
         finally:
             release = child_argv(args, "--release-child", plan["release_file"])
@@ -327,6 +341,14 @@ def format_failure(error: BaseException) -> str:
 def parser() -> argparse.ArgumentParser:
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("--run-dir", type=Path, default=Path("multi-turn-concurrent"))
+    cli.add_argument(
+        "--source",
+        choices=("files", "mooncake"),
+        default="files",
+        help="Default: read raw snapshot files; mooncake selects legacy native injection",
+    )
+    cli.add_argument("--file-port", type=int, default=0, help="Snapshot HTTP port; default: choose a free port")
+    cli.add_argument("--file-child", help=argparse.SUPPRESS)
     cli.add_argument("--session", type=int, default=0)
     cli.add_argument("--round", type=int, default=1)
     cli.add_argument("--base-url", help="Existing PD proxy URL, e.g. http://7.150.2.72:8000")
@@ -375,6 +397,11 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = parser().parse_args(argv)
+    if args.file_child:
+        from kv_replay_files import serve
+
+        serve(json.loads(gzip.decompress(base64.b64decode(args.file_child))))
+        return 0
     if args.seed_child:
         seed(json.loads(gzip.decompress(base64.b64decode(args.seed_child))))
         return 0
@@ -417,8 +444,12 @@ def main(argv=None) -> int:
             report["status"] = "prepared_not_run"
             return 0
         with password_auth(args), seeded(args, plan, output) as owner:
+            if args.source == "files":
+                from kv_replay_files import attach_source
+
+                attach_source(restored["payload"], owner, output)
             client = Client(args.base_url, args.timeout)
-            print(f"{PREFIX} native seed ready; submitting original turn to {args.base_url}", flush=True)
+            print(f"{PREFIX} source={args.source} ready; submitting original turn to {args.base_url}", flush=True)
             text, metrics = client.complete(restored["payload"], output)
             if owner.poll() is not None:
                 raise RuntimeError("Seed process exited during the request; replay is invalid")
@@ -426,6 +457,10 @@ def main(argv=None) -> int:
                 request_completed=True, metrics=metrics, text_equals_original=text == restored["original_output"]
             )
             print(f"{PREFIX} OUTPUT BEGIN\n{text}\n{PREFIX} OUTPUT END", flush=True)
+            if args.source == "files":
+                from kv_replay_files import source_stats
+
+                report["file_reads"] = source_stats(owner, output)
             validation = validate_response_counts(
                 metrics, restored["original_metrics"]["prompt_tokens"], plan["cached_tokens"]
             )

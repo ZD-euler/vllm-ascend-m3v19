@@ -1,5 +1,12 @@
 # Replay a saved conversation turn through an existing PD deployment
 
+**Default mode changed:** use the [direct file replay instructions](kv_replay_files.md).
+`--source files` reads saved files without native injection and requires
+`LMCACHE_FILE_REPLAY_ENABLED=true` on P/D. The documentation below describes
+the older injector, now selected only by adding `--source mooncake`.
+
+## Legacy native injection mode
+
 `prefill_kv_replay.py` uses an **already running P/D deployment**. Start the
 deployment normally, but do not send inference requests before this test. The
 tool starts a temporary Mooncake client, not a model, API server, or master.
