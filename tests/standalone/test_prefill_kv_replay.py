@@ -1,17 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU validation of exact turn reconstruction and native seed wire bytes."""
+"""CPU validation of exact turn reconstruction and snapshot validation."""
 
-import builtins
-import ctypes
 import hashlib
 import json
-import os
 import shlex
-import shutil
 import socket
-import subprocess
 import sys
-import weakref
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -20,8 +14,8 @@ import pytest
 
 TOOLS = Path(__file__).resolve().parents[2] / "tools"
 sys.path.insert(0, str(TOOLS))
+import kv_replay_snapshot as S  # noqa: E402
 import prefill_kv_replay as R  # noqa: E402
-import prefill_kv_seed as S  # noqa: E402
 
 
 def save(path, data):
@@ -108,7 +102,7 @@ def log_file(path, hash_root=b"root", pid=1):
         f"(Worker_DP0_TP1_EP1 pid={pid}) Initialized NONE_HASH={hash_root!r} from vLLM (>= PR#20511)\n"
         f"(Worker_DP0_TP1_EP1 pid={pid}) Using hash algorithm=sha256_cbor; Mooncake payload layout: "
         f"signature={c['signature']} role=worker rank=1 schema={c['schema']!r} (token_database.py)\n"
-        "Connected to remote storage at mooncakestore://10.0.0.1:50051/\n",
+        "[KV_FILE_REPLAY] enabled role=P\n[KV_FILE_REPLAY] enabled role=D\n",
         encoding="utf-8",
     )
 
@@ -166,12 +160,9 @@ def snapshot(root):
         contract=contract(),
         tp_size=2,
         workers=2,
-        seed_device=0,
         release_file=str(root / "lease.release"),
         hold_seconds=2,
         local_hostname="127.0.0.1",
-        master="127.0.0.1:50051",
-        store_bytes=1024,
     )
 
 
@@ -188,7 +179,7 @@ def test_reconstruct_exact_payload_and_no_new_session_prefix(tmp_path):
     assert result["cached_tokens"] == 8
 
 
-def test_changed_client_files_fail_before_seeding(tmp_path):
+def test_changed_client_files_fail_before_file_setup(tmp_path):
     make_run(tmp_path)
     (tmp_path / "initial_prompt.txt").write_text("changed")
     with pytest.raises(ValueError, match="length differs"):
@@ -199,7 +190,6 @@ def test_parse_live_abi_and_conflicting_hash_roots(tmp_path):
     log_file(tmp_path / "a.log")
     c = S.live_contract([tmp_path / "a.log"])
     assert c["hash_root"] == repr(b"root")
-    assert c["master"] == "10.0.0.1:50051"
     assert c["tp_size"] == 2
     log_file(tmp_path / "b.log", hash_root=b"other", pid=2)
     with pytest.raises(ValueError, match="one common"):
@@ -209,9 +199,8 @@ def test_parse_live_abi_and_conflicting_hash_roots(tmp_path):
 def test_tail_excluded_and_group_plane_order(tmp_path):
     plan = snapshot(tmp_path)
     tokens, rows = S.validate_snapshot(plan)
-    assert tokens == list(range(8))  # Never seed the saved 8..11 tail; it must be recomputed.
-    target = bytearray(32)
-    assert S.fill_page(rows, 0, 4, 8, memoryview(target)) == 32
+    assert tokens == list(range(8))  # Never source the saved 8..11 tail; it must be recomputed.
+    target = b"".join(p.read_bytes()[16:32] for (g, _, _), (r, p) in sorted(rows.items()) if g == 0)
     assert target == bytes(range(16, 32)) + bytes(range(36, 52))
 
 
@@ -237,7 +226,7 @@ def test_legacy_compatibility_keeps_model_and_payload_checks(tmp_path, failure):
     plan = snapshot(tmp_path)
     for path in tmp_path.rglob("replay.json"):
         path.unlink()
-    # Check TP1 as well: its identity must not be discarded when injecting TP0.
+    # Check TP1 as well: its identity must not be discarded when reading TP0.
     directory = tmp_path / "response-0/rank1"
     path = directory / "manifest.json"
     meta = json.loads(path.read_text())
@@ -267,13 +256,13 @@ def test_replay_model_remains_a_supported_identity_source(tmp_path):
 
 
 def test_child_failure_message_reaches_caller(tmp_path):
-    log = tmp_path / "seed.log"
+    log = tmp_path / "source.log"
     log.write_text(
         S.PREFIX + '{"status": "validating"}\n' + R.PREFIX + " FAILED: source model differs\n", encoding="utf-8"
     )
     process = NS(poll=lambda: 1, returncode=1)
-    with pytest.raises(RuntimeError, match="Seed failed: source model differs"):
-        R.wait_seed(process, log, 1)
+    with pytest.raises(RuntimeError, match="File source failed: source model differs"):
+        R.wait_file_source(process, log, 1)
 
 
 @pytest.mark.parametrize("failure", ["tokens", "tp_bytes", "layout", "model", "partial"])
@@ -296,215 +285,6 @@ def test_incompatible_snapshots_rejected(tmp_path, failure):
         S.validate_snapshot(plan)
 
 
-def test_ascend_hash_input_and_lmcache_key_serializer(monkeypatch):
-    calls = []
-
-    def hash_fn(value):
-        calls.append(value)
-        return b"hashed" + bytes([len(calls)])
-
-    class Key:
-        def __init__(self, model, world, worker, value, dtype, tags, kv_group):
-            self.identity = model, world, worker, value, dtype, tags, kv_group
-
-    monkeypatch.setitem(sys.modules, "vllm.utils.hashing", NS(get_hash_fn_by_name=lambda _: hash_fn))
-    monkeypatch.setitem(sys.modules, "lmcache.utils", NS(CacheEngineKey=Key))
-    monkeypatch.setitem(
-        sys.modules, "lmcache.v1.token_database", NS(DSA_INDEX_CACHE_SCHEMA="v2", DSA_INDEX_CACHE_SCHEMA_TAG="idx")
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "lmcache.v1.mooncake_layout",
-        NS(MOONCAKE_PAYLOAD_LAYOUT_TAG="layout", mooncake_page_key=lambda k, n: (k.identity, n)),
-    )
-    c = contract()
-    keys = list(S.page_keys(dict(contract=c, model_path="/model"), list(range(8))))
-    assert calls == [(b"root", (0, 1, 2, 3)), (b"hashed\x01", (4, 5, 6, 7))]
-    assert [(g, a, b) for _, g, a, b in keys] == [(0, 0, 4), (1, 0, 4), (0, 4, 8), (1, 4, 8)]
-    assert keys[1][0][0][1:3] == (1, 0)
-    assert keys[1][0][0][5] == {"layout": c["signature"], "idx": "v2"}
-
-
-@pytest.mark.parametrize(
-    "failure",
-    [
-        None,
-        "readback",
-        "register_first",
-        "register_second",
-        "tp_bytes",
-        "unregister",
-        "wrong_endpoint",
-        "transport_init",
-    ],
-)
-@pytest.mark.parametrize("decode_receive", [False, True])
-def test_native_seed_readback_before_ready(tmp_path, monkeypatch, capsys, failure, decode_receive):
-    import torch
-
-    plan = snapshot(tmp_path)
-    if decode_receive:
-        plan.update(seed_mode="decode_receive", cached_tokens=11, prefix_digest=S.token_digest(list(range(11))))
-    page_count = 6 if decode_receive else 4
-    events = []
-    owners = weakref.WeakValueDictionary()
-    real_empty = torch.empty
-
-    def empty(size, *, dtype, device, pin_memory=False):
-        tensor = real_empty(size, dtype=dtype, device=device)
-        # This CPU-only stand-in enforces the native allocator contract: an
-        # ordinary torch.empty CPU pointer is not recognized as ACL HOST memory.
-        if pin_memory:
-            owners[tensor.data_ptr()] = tensor
-        return tensor
-
-    monkeypatch.setattr(torch, "empty", empty)
-    validate_tp_copies = S.validate_tp_copies
-
-    def scan(*args):
-        events.append("scan")
-        return validate_tp_copies(*args)
-
-    monkeypatch.setattr(S, "validate_tp_copies", scan)
-    if failure == "tp_bytes":
-        path = tmp_path / "response-0/rank1/g1-l0-c0.bin"
-        data = bytearray(path.read_bytes())
-        data[1] ^= 1
-        path.write_bytes(data)
-
-    native_engine = object()
-
-    class Transport:
-        def initialize(self, host, metadata, protocol, device):
-            assert (host, metadata, protocol, device) == ("127.0.0.1", "P2PHANDSHAKE", "ascend", "")
-            return -9 if failure == "transport_init" else 0
-
-        def get_rpc_port(self):
-            return 16935
-
-        def get_engine(self):
-            return native_engine
-
-    class Store:
-        def __init__(self):
-            self.data = {}
-            self.closed = False
-            self.registered = []
-            self.unregistered = []
-            self.attempts = 0
-
-        def setup(self, *args):
-            assert args[-1] is native_engine
-            return 0
-
-        def batch_is_exist(self, keys):
-            return [0] * len(keys)
-
-        def register_buffer(self, ptr, size):
-            self.attempts += 1
-            events.append("register")
-            if ptr not in owners:
-                return -1  # Reproduces location:* is not supported.
-            assert owners[ptr].numel() == size
-            if failure == "register_first" or (failure == "register_second" and self.attempts == 2):
-                return -7
-            self.registered.append(ptr)
-            return 0
-
-        def unregister_buffer(self, ptr):
-            events.append("unregister")
-            assert ptr in self.registered
-            assert ptr in owners
-            self.unregistered.append(ptr)
-            return -8 if failure == "unregister" else 0
-
-        def get_hostname(self):
-            return "127.0.0.1:12962"
-
-        def get_replica_desc(self, key):
-            # Same host with a different port is NOT sufficient evidence of
-            # ownership. A different process on this node must still fail.
-            endpoint = "127.0.0.1:16936" if failure == "wrong_endpoint" else "127.0.0.1:16935"
-            descriptor = NS(buffer_descriptor=NS(transport_endpoint=endpoint, size=len(self.data[key])))
-            return [NS(is_memory_replica=lambda: True, get_memory_descriptor=lambda: descriptor)]
-
-        def batch_put_from_multi_buffers(self, keys, ptrs, sizes, config):
-            events.append("put")
-            assert config.preferred_segment == self.get_hostname()
-            assert ptrs[0][0] in self.registered
-            self.data[keys[0]] = ctypes.string_at(ptrs[0][0], sizes[0][0])
-            return [0]
-
-        def batch_get_into_multi_buffers(self, keys, ptrs, sizes):
-            data = self.data[keys[0]]
-            assert ptrs[0][0] in self.registered
-            if failure == "readback":
-                data = bytes([data[0] ^ 1]) + data[1:]
-            ctypes.memmove(ptrs[0][0], data, len(data))
-            if len(self.data) == page_count:
-                Path(plan["release_file"]).touch()
-            return [len(data)]
-
-        def close(self):
-            events.append("close")
-            assert all(ptr in owners for ptr in self.registered)
-            self.closed = True
-
-    store = Store()
-    monkeypatch.setitem(sys.modules, "mooncake.engine", NS(TransferEngine=Transport))
-    monkeypatch.setitem(sys.modules, "mooncake.store", NS(MooncakeDistributedStore=lambda: store, ReplicateConfig=NS))
-    monkeypatch.setitem(sys.modules, "torch_npu", NS(npu=NS(set_device=lambda _: None, init=lambda: None)))
-    monkeypatch.setattr(
-        S,
-        "page_keys",
-        lambda p, t: [(f"{g}:{i}", g, i, min(i + 4, len(t))) for i in range(0, len(t), 4) for g in (0, 1)],
-    )
-    monkeypatch.setattr(S.signal, "signal", lambda *_: None)
-    errors = {
-        "readback": "readback differs",
-        "register_first": "pinned seed CPU staging memory: bytes=32 status=-7",
-        "register_second": "pinned seed CPU staging memory: bytes=32 status=-7",
-        "tp_bytes": "Saved TP copies differ",
-        "unregister": "unregister seed CPU staging memory: status=-8",
-        "wrong_endpoint": "Unexpected Mooncake placement",
-        "transport_init": "TransferEngine initialization failed: -9",
-    }
-    if failure:
-        with pytest.raises((RuntimeError, ValueError), match=errors[failure]):
-            S.seed(plan)
-    else:
-        S.seed(plan)
-    output = capsys.readouterr().out
-    assert ('"status": "ready"' in output) is (failure in (None, "unregister"))
-    assert store.closed
-    assert events[-1] == "close"
-    if failure != "unregister":
-        assert store.unregistered == store.registered
-    if failure in ("register_first", "register_second", "transport_init"):
-        assert "scan" not in events
-        assert '"status": "staging_ready"' not in output
-    else:
-        assert events[:3] == ["register", "register", "scan"]
-        assert '"status": "staging_ready"' in output
-    if failure in ("register_first", "register_second", "tp_bytes", "transport_init"):
-        assert not store.data
-    else:
-        assert len(store.data["0:0"]) == 32
-    if failure is None:
-        assert len(store.data) == page_count
-        if decode_receive:
-            # Full D receives must retain the final three tokens in BOTH
-            # groups, packed layer-major; P history still stops before them.
-            _, rows, _ = S.snapshot_metadata(plan)
-            for group in (0, 1):
-                expected = b"".join(
-                    path.read_bytes()[8 * row["row_bytes"] : 11 * row["row_bytes"]]
-                    for (g, _, _), (row, path) in sorted(rows.items())
-                    if g == group
-                )
-                assert store.data[f"{group}:8"] == expected
-
-
 def test_prepare_uses_live_tokenizer_and_does_not_run_inference(tmp_path, monkeypatch):
     make_run(tmp_path / "run")
     log_file(tmp_path / "p.log")
@@ -519,8 +299,8 @@ def test_prepare_uses_live_tokenizer_and_does_not_run_inference(tmp_path, monkey
     monkeypatch.setattr(R, "http_json", http)
     args = R.parser().parse_args(
         [
-            "--source",
-            "mooncake",
+            "--local-hostname",
+            "127.0.0.1",
             "--run-dir",
             str(tmp_path / "run"),
             "--base-url",
@@ -535,13 +315,13 @@ def test_prepare_uses_live_tokenizer_and_does_not_run_inference(tmp_path, monkey
     restored, plan = R.prepare(args, tmp_path / "out")
     assert calls == ["/v1/models", "/tokenize", "/tokenize"]
     assert plan["cached_tokens"] == 8
-    assert plan["seed_transport_logs"] == [str(R.REPO / "tp4_dp4_logs" / "[PD]_dp*.log")]
+    assert plan["file_host"] == "127.0.0.1"
     tail = json.loads((tmp_path / "out/input_tail_tokens.json").read_text())
     assert tail["token_ids"] == list(range(8, 14))
     assert "kv_transfer_params" not in restored["payload"]
 
 
-def test_prefill_seed_log_paths_belong_to_remote_container(tmp_path, monkeypatch):
+def test_prefill_source_log_paths_belong_to_remote_container(tmp_path, monkeypatch):
     make_run(tmp_path / "run")
     log_file(tmp_path / "p.log")
 
@@ -553,8 +333,8 @@ def test_prefill_seed_log_paths_belong_to_remote_container(tmp_path, monkeypatch
     monkeypatch.setattr(R, "http_json", http)
     args = R.parser().parse_args(
         [
-            "--source",
-            "mooncake",
+            "--local-hostname",
+            "127.0.0.1",
             "--run-dir",
             str(tmp_path / "run"),
             "--p-url",
@@ -569,11 +349,8 @@ def test_prefill_seed_log_paths_belong_to_remote_container(tmp_path, monkeypatch
     )
     (tmp_path / "out").mkdir()
     _, plan = R.prepare(args, tmp_path / "out")
-    assert plan["seed_transport_logs"] == ["/workspace/sqh/vllm-ascend/tp4_dp4_logs/[PD]_dp*.log"]
+    assert plan["snapshot_root"] == "/workspace/sqh/vllm-ascend/decode-kv-snapshots"
     assert "transport" not in plan  # Never reuse the client's P-local IP/interface.
-    args.seed_logs = ["/custom/D-current.log"]
-    _, plan = R.prepare(args, tmp_path / "out")
-    assert plan["seed_transport_logs"] == args.seed_logs
 
 
 def test_release_cannot_touch_serving_paths(tmp_path, monkeypatch):
@@ -643,8 +420,9 @@ def indexer_snapshot(tmp_path, policy):
 def test_mixed_indexer_wire_order(tmp_path, policy):
     plan, components = indexer_snapshot(tmp_path, policy)
     _, rows = S.validate_snapshot(plan)
-    target = bytearray(4 * sum(width for _, _, width, _, _ in components))
-    assert S.fill_page(rows, 1, 4, 8, memoryview(target)) == len(target)
+    target = b"".join(
+        p.read_bytes()[4 * r["row_bytes"] : 8 * r["row_bytes"]] for (g, _, _), (r, p) in sorted(rows.items()) if g == 1
+    )
     assert target == b"".join(bytes([byte]) * (4 * width) for _, _, width, _, byte in components)
 
 
@@ -686,7 +464,7 @@ def test_real_case_frontier_recomputes_372_not_90(tmp_path, monkeypatch):
 
     monkeypatch.setattr(R, "http_json", http)
     args = R.parser().parse_args(
-        ["--source", "mooncake", "--run-dir", str(tmp_path / "run"), "--p-logs", str(tmp_path / "p.log")]
+        ["--local-hostname", "127.0.0.1", "--run-dir", str(tmp_path / "run"), "--p-logs", str(tmp_path / "p.log")]
     )
     out = tmp_path / "out"
     out.mkdir()
@@ -717,10 +495,10 @@ def test_existing_pd_orchestration_and_cache_miss_verdict(tmp_path, monkeypatch,
         return {"tokens": list(range(14 if "问题" in body["prompt"] else 11))}
 
     @contextmanager
-    def seeded(args, plan, output):
+    def file_source(args, plan, output):
         assert connected == ["http://proxy:8000"]
-        active.append("seed")
-        yield NS(poll=lambda: None)
+        active.append("source")
+        yield NS(poll=lambda: None, file_info=dict(file_url="http://snapshot:1234/test", role="PD"))
         active.clear()
 
     class Client:
@@ -728,7 +506,7 @@ def test_existing_pd_orchestration_and_cache_miss_verdict(tmp_path, monkeypatch,
             assert url == "http://proxy:8000"
 
         def complete(self, payload, output):
-            assert active == ["seed"]
+            assert active == ["source"]
             assert payload["prompt"].startswith("unique\r\n原文")
             return "回放回答", dict(
                 cached_tokens=cached,
@@ -740,11 +518,12 @@ def test_existing_pd_orchestration_and_cache_miss_verdict(tmp_path, monkeypatch,
 
     monkeypatch.setattr(R, "http_json", http)
     monkeypatch.setattr(R, "check_proxy_connection", check_proxy)
-    monkeypatch.setattr(R, "seeded", seeded)
+    monkeypatch.setattr(R, "file_source", file_source)
+    monkeypatch.setattr(R, "source_stats", lambda *_: {"tested_elsewhere": True})
     monkeypatch.setattr(R, "Client", Client)
     argv = [
-        "--source",
-        "mooncake",
+        "--local-hostname",
+        "127.0.0.1",
         "--run-dir",
         str(tmp_path / "run"),
         "--p-logs",
@@ -816,19 +595,19 @@ def test_proxy_check_connects_without_sending_a_request():
             assert connection.recv(1) == b""
 
 
-def test_proxy_refusal_prevents_snapshot_injection(tmp_path, monkeypatch):
+def test_proxy_refusal_prevents_snapshot_file_setup(tmp_path, monkeypatch):
     monkeypatch.setattr(R, "REPO", tmp_path)
     monkeypatch.setattr(R, "prepare", lambda *_: pytest.fail("Prepared snapshots despite proxy refusal"))
-    monkeypatch.setattr(R, "seeded", lambda *_: pytest.fail("Started injection despite proxy refusal"))
+    monkeypatch.setattr(R, "file_source", lambda *_: pytest.fail("Started file setup despite proxy refusal"))
     with socket.socket() as unlistened:
         unlistened.bind(("127.0.0.1", 0))
         base = f"http://127.0.0.1:{unlistened.getsockname()[1]}"
-        with pytest.raises(RuntimeError, match="Cannot connect to PD proxy.*KV injection has not started"):
+        with pytest.raises(RuntimeError, match="Cannot connect to PD proxy.*KV file reading has not started"):
             R.main(["--run-dir", str(tmp_path), "--base-url", base, "--p-url", "http://P:7910"])
     (report_path,) = (tmp_path / "prefill-kv-replays").glob("*/report.json")
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["status"] == "failed"
-    assert "KV injection has not started" in report["error"]
+    assert "KV file reading has not started" in report["error"]
 
 
 @pytest.mark.parametrize("base", ["", "localhost:8000", "ftp://localhost:8000"])
@@ -840,8 +619,8 @@ def test_proxy_check_rejects_invalid_urls(base):
 def test_remote_child_argv_preserves_linux_path_and_quoting(tmp_path):
     args = R.parser().parse_args(
         [
-            "--source",
-            "mooncake",
+            "--local-hostname",
+            "127.0.0.1",
             "--snapshot-host",
             "root@host",
             "--workspace",
@@ -859,107 +638,11 @@ def test_remote_child_argv_preserves_linux_path_and_quoting(tmp_path):
         "exec",
         "--",
         "serving",
-        "bash",
-        "-lc",
-        R.REMOTE_ENV_BOOTSTRAP,
-        "prefill-kv-replay",
         "/usr/bin/python3",
         "/work space/repo/tools/prefill_kv_replay.py",
         "--release-child",
         "/work space/repo/leases/test.release",
     ]
-
-
-@pytest.mark.parametrize("inherited_libraries", ["", "/opt/test-cann/lib64:/opt/test-mooncake/lib"])
-def test_remote_bootstrap_loads_environment_and_preserves_arguments(inherited_libraries):
-    shell = shutil.which("bash")
-    if os.name == "nt":
-        git = shutil.which("git")
-        candidate = Path(git).resolve().parent.parent / "bin/bash.exe" if git else None
-        if candidate and candidate.is_file():
-            shell = str(candidate)
-    if shell is None:
-        pytest.skip("Bash unavailable")
-    # Stand in for the sourced file without changing HOME or reading real user
-    # settings. Test the actual bootstrap in a child Bash, not a shell mock.
-    bootstrap = (
-        "source() { export PREFILL_REPLAY_TEST_ENV=loaded; export LD_LIBRARY_PATH="
-        + shlex.quote(inherited_libraries)
-        + "; }\n"
-        + R.REMOTE_ENV_BOOTSTRAP
-    )
-    argument = "space ' quote ; $(printf wrong) `printf wrong`"
-    code = (
-        "import os,sys,json; print(json.dumps([os.getenv('PREFILL_REPLAY_TEST_ENV'),"
-        "sys.argv[1:],os.getenv('LD_LIBRARY_PATH')]))"
-    )
-    result = subprocess.run(
-        [
-            shell,
-            "--noprofile",
-            "--norc",
-            "-c",
-            bootstrap,
-            "prefill-kv-replay",
-            sys.executable.replace("\\", "/"),
-            "-c",
-            code,
-            argument,
-        ],
-        capture_output=True,
-        text=True,
-        timeout=15,
-    )
-    assert result.returncode == 0, result.stderr
-    expected_libraries = "/usr/local/lib" + (":" + inherited_libraries if inherited_libraries else "")
-    if os.name == "nt":
-        # Git Bash translates this loader path for a native Windows Python.
-        # Linux children receive the original colon-separated POSIX paths.
-        expected_libraries = ";".join(
-            str(Path(shell).resolve().parent.parent / p.lstrip("/")) for p in expected_libraries.split(":")
-        )
-    assert json.loads(result.stdout) == ["loaded", [argument], expected_libraries]
-
-
-@pytest.mark.parametrize("inherited", [None, "", "/opt/test-cann/lib64"])
-def test_local_child_library_environment_preserves_existing_paths(monkeypatch, inherited):
-    if inherited is None:
-        monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
-    else:
-        monkeypatch.setenv("LD_LIBRARY_PATH", inherited)
-    env = R.child_environment(NS(snapshot_host=None, _passwords={}))
-    assert env["LD_LIBRARY_PATH"] == "/usr/local/lib" + (":" + inherited if inherited else "")
-    assert os.environ.get("LD_LIBRARY_PATH") == inherited
-
-
-@pytest.mark.parametrize("failure", ["backend_import", "npu_init", "cache_import"])
-def test_runtime_failure_precedes_snapshot_scan(monkeypatch, capsys, failure):
-    real_import = builtins.__import__
-
-    def import_module(name, *args, **kwargs):
-        if failure == "backend_import" and name == "torch":
-            raise RuntimeError("Failed to load backend torch_npu") from ImportError("test missing native library")
-        return real_import(name, *args, **kwargs)
-
-    def init():
-        if failure == "npu_init":
-            raise RuntimeError("test NPU init failure")
-
-    def keys(plan, tokens):
-        assert not tokens
-        raise ImportError("test cache dependency unavailable")
-
-    monkeypatch.setitem(sys.modules, "torch_npu", NS(npu=NS(set_device=lambda _: None, init=init)))
-    monkeypatch.setitem(sys.modules, "mooncake.engine", NS(TransferEngine=NS))
-    monkeypatch.setitem(sys.modules, "mooncake.store", NS(MooncakeDistributedStore=NS, ReplicateConfig=NS))
-    monkeypatch.setattr(S, "page_keys", keys)
-    monkeypatch.setattr(S, "snapshot_metadata", lambda _: pytest.fail("Read snapshots before runtime preflight"))
-    monkeypatch.setattr(builtins, "__import__", import_module)
-    with pytest.raises((RuntimeError, ImportError)):
-        S.seed(dict(seed_device=0))
-    output = capsys.readouterr().out
-    assert '"status": "runtime_check"' in output
-    assert '"status": "validating"' not in output
 
 
 def test_failure_message_preserves_extension_loader_cause():

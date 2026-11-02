@@ -2,8 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Read previous raw KV files and replay one turn through an existing PD service.
 
-No model/server is started. File mode requires the opt-in LMCache file reader;
---source mooncake selects the older injector. Run on the client/P host and use
+No model/server is started. Replay requires the opt-in LMCache file reader. Run on the client/P host and use
 --snapshot-host when raw KV lives on D.
 """
 
@@ -29,21 +28,15 @@ from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
 from decode_kv_compare import request_key
+from kv_replay_files import attach_source, configure_plan, require_enabled, source_stats
+from kv_replay_snapshot import PREFIX as FILE_PREFIX
+from kv_replay_snapshot import live_contract, token_digest
 from multi_turn_kv_reuse_concurrent import Client, read_text, save_json
 from pd_tensor_collect import ASKPASS_PASSWORD_ENV, password_auth, remote_command, run_ssh
-from prefill_kv_seed import PREFIX as SEED_PREFIX
-from prefill_kv_seed import live_contract, seed, token_digest
 
 REPO = Path(__file__).resolve().parents[1]
 PREFIX = "[PREFILL_REPLAY]"
 PROXY_CONNECT_TIMEOUT_SECONDS = 10
-# Match the serving template's container environment initialization. Arguments
-# remain positional: never interpolate credentials, paths, or plans into shell.
-REMOTE_ENV_BOOTSTRAP = """source ~/.bashrc >/dev/null 2>&1 || true
-case "$1" in */*) export PATH="${1%/*}:$PATH" ;; esac
-export LD_LIBRARY_PATH="/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-exec "$@"
-"""
 
 
 def restore_turn(root: Path, session: int, turn: int) -> dict:
@@ -107,7 +100,7 @@ def http_json(base: str, path: str, body: dict | None = None, timeout: float = 1
 
 
 def check_proxy_connection(base_url: str, timeout: float) -> None:
-    """Check the listener before costly injection, without issuing inference.
+    """Check the listener before reading large KV files, without issuing inference.
 
     Proxy health/models routes differ between deployments. A TCP connection
     checks this failure mode without requiring any optional HTTP endpoint.
@@ -123,7 +116,7 @@ def check_proxy_connection(base_url: str, timeout: float) -> None:
     except OSError as error:
         raise RuntimeError(
             f"Cannot connect to PD proxy {target.hostname}:{port}; check --base-url and the proxy listener. "
-            "KV injection has not started."
+            "KV file reading has not started."
         ) from error
     print(f"{PREFIX} PD proxy TCP reachable: {target.hostname}:{port}", flush=True)
 
@@ -148,16 +141,7 @@ def prepare(args, output: Path) -> tuple[dict, dict]:
     if not files:
         raise ValueError("No P startup logs found; --p-logs must name the NEW running P's logs")
     contract = live_contract(files)
-    master = args.master or contract.get("master")
-    file_mode = getattr(args, "source", "mooncake") == "files"
-    if file_mode:
-        from kv_replay_files import require_enabled
-
-        require_enabled(files, "P")
-    if not file_mode and (not master or ":" not in master):
-        raise ValueError("Cannot determine the live Mooncake master; pass --master HOST:PORT")
-    if contract.get("master") and master != contract["master"]:
-        raise ValueError("--master disagrees with the Mooncake endpoint in the running P logs")
+    require_enabled(files, "P")
     model = restored["payload"]["model"]
     models = http_json(args.p_url, "/v1/models")["data"]
     selected = next((m for m in models if m["id"] == model), None)
@@ -187,7 +171,6 @@ def prepare(args, output: Path) -> tuple[dict, dict]:
     plan = dict(
         contract=contract,
         model_path=selected["root"],
-        master=master,
         tp_size=tp,
         previous=restored["previous"],
         cached_tokens=cached,
@@ -196,18 +179,11 @@ def prepare(args, output: Path) -> tuple[dict, dict]:
         previous_prompt_tokens=len(previous_tokens),
         snapshot_root=snapshot_root,
         workers=args.workers,
-        seed_device=args.seed_device,
-        seed_transport_logs=args.seed_logs or [str(remote_repo / "tp4_dp4_logs" / "[PD]_dp*.log")],
-        local_hostname=args.local_hostname,
-        store_bytes=None if args.store_gb is None else int(args.store_gb * 1024**3),
         release_file=str(remote_repo / "prefill-kv-replays" / "leases" / (lease + ".release")),
         hold_seconds=args.timeout + 120,
     )
-    if file_mode:
-        from kv_replay_files import configure_plan
-
-        configure_plan(args, plan)
-    save_json(output / "seed_plan.json", plan)
+    configure_plan(args, plan)
+    save_json(output / "file_plan.json", plan)
     print(
         f"{PREFIX} session={args.session} round={args.round} prompt={len(tokens)} "
         f"expected_cached={cached} recompute={len(tokens) - cached}",
@@ -222,10 +198,6 @@ def child_argv(args, *parts: str, script_name: str = "prefill_kv_replay.py") -> 
             args,
             args.snapshot_host,
             [
-                "bash",
-                "-lc",
-                REMOTE_ENV_BOOTSTRAP,
-                "prefill-kv-replay",
                 args.remote_python,
                 str(PurePosixPath(args.workspace) / "tools" / script_name),
                 *parts,
@@ -236,10 +208,6 @@ def child_argv(args, *parts: str, script_name: str = "prefill_kv_replay.py") -> 
 
 def child_environment(args) -> dict:
     env = dict(os.environ)
-    # The serving launcher exports this after sourcing bashrc. It must be set
-    # before exec, since the ELF loader reads its search path at process start.
-    inherited_libraries = env.get("LD_LIBRARY_PATH", "")
-    env["LD_LIBRARY_PATH"] = "/usr/local/lib" + (":" + inherited_libraries if inherited_libraries else "")
     if args.snapshot_host in args._passwords:
         env.update(
             SSH_ASKPASS=args._askpass,
@@ -250,37 +218,36 @@ def child_environment(args) -> dict:
     return env
 
 
-def wait_seed(process, path: Path, timeout: float) -> dict:
+def wait_file_source(process, path: Path, timeout: float) -> dict:
     deadline = time.monotonic() + timeout
     failure = None
     with path.open(encoding="utf-8", errors="replace") as stream:
         while time.monotonic() < deadline:
             line = stream.readline()
             if line:
-                if line.startswith(SEED_PREFIX):
-                    item = json.loads(line[len(SEED_PREFIX) :])
+                if line.startswith(FILE_PREFIX):
+                    item = json.loads(line[len(FILE_PREFIX) :])
                     print(line.rstrip(), flush=True)
                     if item["status"] == "ready":
                         if process.poll() is not None:
-                            raise RuntimeError("Seed process exited before request submission")
+                            raise RuntimeError("File source process exited before request submission")
                         return item
                 elif line.startswith(PREFIX + " FAILED: "):
                     failure = line.removeprefix(PREFIX + " FAILED: ").strip()
                 continue
             if process.poll() is not None:
                 if failure:
-                    raise RuntimeError(f"Seed failed: {failure}; log: {path}")
-                raise RuntimeError(f"Seed process exited ({process.returncode}); inspect {path}")
+                    raise RuntimeError(f"File source failed: {failure}; log: {path}")
+                raise RuntimeError(f"File source process exited ({process.returncode}); inspect {path}")
             time.sleep(0.25)
-    raise TimeoutError(f"Seed setup timed out; inspect {path}")
+    raise TimeoutError(f"File source setup timed out; inspect {path}")
 
 
 @contextmanager
-def seeded(args, plan: dict, output: Path):
+def file_source(args, plan: dict, output: Path):
     encoded = base64.b64encode(gzip.compress(json.dumps(plan).encode())).decode("ascii")
-    file_mode = getattr(args, "source", "mooncake") == "files"
-    command = child_argv(args, "--file-child" if file_mode else "--seed-child", encoded)
-    log_path = output / "seed.log"
+    command = child_argv(args, "--file-child", encoded)
+    log_path = output / "file_source.log"
     with log_path.open("wb") as log:
         process = subprocess.Popen(
             command,
@@ -291,11 +258,9 @@ def seeded(args, plan: dict, output: Path):
             start_new_session=os.name != "nt",
         )
         try:
-            info = wait_seed(process, log_path, args.seed_timeout)
-            save_json(output / "seed_ready.json", info)
-            if file_mode:
-                process.file_info = info
-                save_json(output / "file_source.json", info)
+            info = wait_file_source(process, log_path, args.source_timeout)
+            process.file_info = info
+            save_json(output / "file_source.json", info)
             yield process
         finally:
             release = child_argv(args, "--release-child", plan["release_file"])
@@ -307,22 +272,22 @@ def seeded(args, plan: dict, output: Path):
                 else:
                     result = subprocess.run(release, capture_output=True, timeout=30, check=False)
                 if result.returncode:
-                    print(f"{PREFIX} seed release failed; its lease will expire automatically", flush=True)
+                    print(f"{PREFIX} file source release failed; its lease will expire automatically", flush=True)
                 process.wait(timeout=45)
             except (OSError, subprocess.TimeoutExpired):
-                # This owns only the local seed/SSH process, never a P/D process.
+                # This owns only the local file source/SSH process, never a P/D process.
                 process.terminate()
                 try:
                     process.wait(timeout=10)
                 except subprocess.TimeoutExpired:
-                    print(f"{PREFIX} seed cleanup pending; no serving process was stopped", flush=True)
+                    print(f"{PREFIX} file source cleanup pending; no serving process was stopped", flush=True)
 
 
 def release_child(path: str) -> None:
     target = Path(path).resolve()
     parent = (REPO / "prefill-kv-replays" / "leases").resolve()
     if target.parent != parent or len(target.stem) != 32 or any(c not in "0123456789abcdef" for c in target.stem):
-        raise ValueError("Invalid seed release path")
+        raise ValueError("Invalid file source release path")
     parent.mkdir(parents=True, exist_ok=True)
     target.touch()
 
@@ -341,12 +306,6 @@ def format_failure(error: BaseException) -> str:
 def parser() -> argparse.ArgumentParser:
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("--run-dir", type=Path, default=Path("multi-turn-concurrent"))
-    cli.add_argument(
-        "--source",
-        choices=("files", "mooncake"),
-        default="files",
-        help="Default: read raw snapshot files; mooncake selects legacy native injection",
-    )
     cli.add_argument("--file-port", type=int, default=0, help="Snapshot HTTP port; default: choose a free port")
     cli.add_argument("--file-child", help=argparse.SUPPRESS)
     cli.add_argument("--session", type=int, default=0)
@@ -354,18 +313,12 @@ def parser() -> argparse.ArgumentParser:
     cli.add_argument("--base-url", help="Existing PD proxy URL, e.g. http://7.150.2.72:8000")
     cli.add_argument("--p-url", help="Existing P API URL for tokenization, e.g. http://7.150.2.72:7910")
     cli.add_argument("--p-logs", nargs="+", default=[str(REPO / "tp4_dp4_logs" / "P_dp*.log")])
-    cli.add_argument("--master", help="Existing Mooncake master HOST:PORT; infer from P logs when available")
     cli.add_argument("--snapshot-host", help="SSH host containing the raw previous D snapshot; omit for local files")
     cli.add_argument("--snapshot-root", help="Snapshot root on its host; default: WORKSPACE/decode-kv-snapshots")
-    cli.add_argument(
-        "--seed-logs",
-        nargs="+",
-        help="Live local service logs on seed host; default WORKSPACE/tp4_dp4_logs/[PD]_dp*.log",
-    )
     cli.add_argument("--workspace", default=str(REPO), help="vllm-ascend path on the snapshot host/container")
     cli.add_argument("--container", help="Optional Docker container on the snapshot host")
     cli.add_argument(
-        "--remote-python", default=sys.executable, help="Python with torch_npu/LMCache/Mooncake on snapshot host"
+        "--remote-python", default=sys.executable, help="Python on snapshot host; no Torch or NPU SDK required"
     )
     password = cli.add_mutually_exclusive_group()
     password.add_argument(
@@ -377,20 +330,17 @@ def parser() -> argparse.ArgumentParser:
     cli.add_argument("--identity-file", type=Path)
     cli.add_argument("--tp-size", type=int, help="Infer from current P log labels unless overridden")
     cli.add_argument(
-        "--seed-device", type=int, default=0, help="NPU context for native Ascend transport; no model loaded"
-    )
-    cli.add_argument("--local-hostname", help="Snapshot host transport IP; auto-detect by route to master")
-    cli.add_argument(
-        "--store-gb", type=float, help="Seed-owned CPU segment size; defaults to raw prefix size plus headroom"
+        "--local-hostname", help="Snapshot file service IP reachable from all P/D nodes; default: snapshot-host"
     )
     cli.add_argument("--workers", type=int, default=8, help="Offline validation threads")
     cli.add_argument("--timeout", type=float, default=7200, help="Request timeout seconds")
-    cli.add_argument("--seed-timeout", type=float, default=7200)
+    cli.add_argument("--source-timeout", type=float, default=7200)
     cli.add_argument("--output-tokens", type=int, help="Keep the original limit unless explicitly overridden")
     cli.add_argument(
-        "--prepare-only", action="store_true", help="Check request/tokenization and write plan; do not seed or generate"
+        "--prepare-only",
+        action="store_true",
+        help="Check request/tokenization and write plan; do not read KV or generate",
     )
-    cli.add_argument("--seed-child", help=argparse.SUPPRESS)
     cli.add_argument("--release-child", help=argparse.SUPPRESS)
     return cli
 
@@ -402,21 +352,16 @@ def main(argv=None) -> int:
 
         serve(json.loads(gzip.decompress(base64.b64decode(args.file_child))))
         return 0
-    if args.seed_child:
-        seed(json.loads(gzip.decompress(base64.b64decode(args.seed_child))))
-        return 0
     if args.release_child:
         release_child(args.release_child)
         return 0
-    if not args.base_url or not args.p_url or min(args.timeout, args.seed_timeout, args.workers) <= 0:
+    if not args.base_url or not args.p_url or min(args.timeout, args.source_timeout, args.workers) <= 0:
         raise ValueError("--base-url, --p-url and positive timeouts/workers are required")
     if args.output_tokens is not None and args.output_tokens < 1:
         raise ValueError("output-tokens must be positive")
     if args.session < 0 or (args.tp_size is not None and args.tp_size < 1):
         raise ValueError("session must be nonnegative and tp-size must be positive")
-    if args.store_gb is not None and (not math.isfinite(args.store_gb) or args.store_gb <= 0):
-        raise ValueError("store-gb must be finite and positive")
-    if not all(math.isfinite(t) for t in (args.timeout, args.seed_timeout)):
+    if not all(math.isfinite(t) for t in (args.timeout, args.source_timeout)):
         raise ValueError("Timeouts must be finite")
     args.hosts = [args.snapshot_host] if args.snapshot_host else []
     args.password = args.password_per_host = False
@@ -428,7 +373,7 @@ def main(argv=None) -> int:
         output=str(output),
         accuracy_verdict="not_assessed",
         scope=(
-            "Original single request through existing PD, seeded from saved history; "
+            "Original single request through existing PD, reading saved history; "
             "original concurrency/timing not reproduced."
         ),
     )
@@ -443,24 +388,18 @@ def main(argv=None) -> int:
         if args.prepare_only:
             report["status"] = "prepared_not_run"
             return 0
-        with password_auth(args), seeded(args, plan, output) as owner:
-            if args.source == "files":
-                from kv_replay_files import attach_source
-
-                attach_source(restored["payload"], owner, output)
+        with password_auth(args), file_source(args, plan, output) as owner:
+            attach_source(restored["payload"], owner, output)
             client = Client(args.base_url, args.timeout)
-            print(f"{PREFIX} source={args.source} ready; submitting original turn to {args.base_url}", flush=True)
+            print(f"{PREFIX} source=files ready; submitting original turn to {args.base_url}", flush=True)
             text, metrics = client.complete(restored["payload"], output)
             if owner.poll() is not None:
-                raise RuntimeError("Seed process exited during the request; replay is invalid")
+                raise RuntimeError("File source process exited during the request; replay is invalid")
             report.update(
                 request_completed=True, metrics=metrics, text_equals_original=text == restored["original_output"]
             )
             print(f"{PREFIX} OUTPUT BEGIN\n{text}\n{PREFIX} OUTPUT END", flush=True)
-            if args.source == "files":
-                from kv_replay_files import source_stats
-
-                report["file_reads"] = source_stats(owner, output)
+            report["file_reads"] = source_stats(owner, output)
             validation = validate_response_counts(
                 metrics, restored["original_metrics"]["prompt_tokens"], plan["cached_tokens"]
             )

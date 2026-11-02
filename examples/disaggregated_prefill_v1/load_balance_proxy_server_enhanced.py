@@ -1940,6 +1940,7 @@ async def send_request_to_service(
 ):
     aborted_requests = proxy_state.acquire_aborted_prefiller_requests(prefiller_id)
     req_data = req_data.copy()
+    file_replay = (req_data.get("kv_transfer_params") or {}).get("lmcache.tag.file_replay")
     req_data["kv_transfer_params"] = {
         "do_remote_decode": True,
         "do_remote_prefill": False,
@@ -1957,6 +1958,8 @@ async def send_request_to_service(
             req_data["kv_transfer_params"][
                 "lmcache.mooncake_preferred_segment"
             ] = preferred_mooncake_segment
+    if file_replay is not None:
+        req_data["kv_transfer_params"]["lmcache.tag.file_replay"] = file_replay
     req_data["stream"] = False
     req_data["max_tokens"] = 1
     req_data["min_tokens"] = 1
@@ -2173,6 +2176,10 @@ async def _handle_select_instance(
                 )
         kv_transfer_params.pop("lmcache.mooncake_preferred_segment", None)
         kv_transfer_params.pop("lmcache.mooncake_preferred_kv_group", None)
+        # Preserve the explicit snapshot source for the selected decoder, too.
+        file_replay = (req_data.get("kv_transfer_params") or {}).get("lmcache.tag.file_replay")
+        if file_replay is not None:
+            kv_transfer_params["lmcache.tag.file_replay"] = file_replay
         req_data["kv_transfer_params"] = kv_transfer_params
         if kv_transfer_params:
             logger.debug(f"[{request_id}] KV transfer params received from P-node: "

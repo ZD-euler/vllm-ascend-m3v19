@@ -25,7 +25,7 @@ def equal_payload(left: Path, right: Path) -> bool:
 def build_plan(
     roots: list[Path], request: str, output: Path, *, validate_bytes: bool = True, allow_legacy: bool = False
 ) -> dict:
-    """Reject incomplete/incompatible captures before injecting snapshot bytes."""
+    """Reject incomplete/incompatible captures before reading snapshot bytes."""
     workers = read_workers(roots, request_key(request))
     plan = dict(schema=1, request_id=request_key(request), output=str(output.resolve()), workers={})
     reference = None

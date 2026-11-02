@@ -42,7 +42,7 @@ def serving(plan):
 def test_snapshot_bytes_frontier_and_completion(tmp_path, decode):
     plan = snapshot(tmp_path / "snapshots")
     if decode:
-        plan.update(seed_mode="decode_receive", cached_tokens=11, prefix_digest=P.token_digest(list(range(11))))
+        plan.update(replay_mode="decode_receive", cached_tokens=11, prefix_digest=P.token_digest(list(range(11))))
     with serving(plan) as (source, owner, http):
         url = owner.file_info["file_url"]
         manifest = json.load(http.open(url + "/manifest"))
@@ -60,7 +60,17 @@ def test_snapshot_bytes_frontier_and_completion(tmp_path, decode):
                 assert data == expected
                 if start == 0 and group == 0:
                     assert source.stats()["completed_pages"] == 0  # GET does not imply a completed H2D.
-                assert http.open(Request(url + "/ack" + suffix, data=b"")).status == 204
+                assert (
+                    http.open(
+                        Request(
+                            url + "/ack" + suffix,
+                            data=json.dumps(
+                                dict(host="worker", pid=1, rank=0, role="D" if owner.file_info["role"] == "D" else "P")
+                            ).encode(),
+                        )
+                    ).status
+                    == 204
+                )
         report = F.source_stats(owner, tmp_path)
         assert report["completed_pages"] == (6 if decode else 4)
         with pytest.raises(HTTPError):
@@ -83,7 +93,14 @@ def test_individual_layer_fallback_requires_every_layer(tmp_path):
         for layer in (1, 0):
             data = http.open(f"{url}/layer/0/{layer}/0/4").read()
             assert data == next(path.read_bytes()[:16] for row, path in source.page(0, 0, 4, layer))
-            http.open(Request(f"{url}/ack/0/0/4/{layer}", data=b"")).close()
+            http.open(
+                Request(
+                    f"{url}/ack/0/0/4/{layer}",
+                    data=json.dumps(
+                        dict(host="worker", pid=1, rank=0, role="D" if owner.file_info["role"] == "D" else "P")
+                    ).encode(),
+                )
+            ).close()
             assert source.stats()["completed_pages"] == (1 if layer == 0 else 0)
 
 
@@ -92,7 +109,7 @@ def test_attach_only_changes_cache_identity_and_preserves_input(tmp_path):
         prompt=[1, 2, 3],
         temperature=0,
         max_tokens=128,
-        kv_transfer_params={"lmcache.tag.decode_replay": "old", "bootstrap_final_hidden": "original"},
+        kv_transfer_params={"bootstrap_final_hidden": "original"},
     )
     owner = NS(file_info=dict(file_url="http://3-60:1234/random", role="PD"))
     F.attach_source(request, owner, tmp_path)
@@ -134,10 +151,9 @@ def test_file_metadata_does_not_read_proc_environment(tmp_path, monkeypatch):
     log = Path(options["d_logs"][0])
     with log.open("a") as stream:
         stream.write("[KV_FILE_REPLAY] enabled role=D\n")
-    options["source"] = "files"
-    monkeypatch.setattr(D, "read_transport_environment", lambda *_: pytest.fail("file read accessed process env"))
+    options["proc_root"] = str(tmp_path / "no-processes")
     meta = D.metadata(options)
-    assert meta["transport"] is None
+    assert "transport" not in meta
 
 
 def test_prefill_file_plan_keeps_original_frontier(tmp_path, monkeypatch):
@@ -155,6 +171,33 @@ def test_prefill_file_plan_keeps_original_frontier(tmp_path, monkeypatch):
     args = P.parser().parse_args(
         ["--run-dir", str(tmp_path / "run"), "--p-logs", str(tmp_path / "p.log"), "--snapshot-host", "root@7.150.3.60"]
     )
-    assert args.source == D.parser().parse_args([]).source == "files"
+    assert not hasattr(args, "source") and not hasattr(D.parser().parse_args([]), "source")
     _, plan = P.prepare(args, tmp_path)
     assert plan["cached_tokens"] == 8 and plan["file_host"] == "7.150.3.60"
+
+
+def test_decode_reads_cannot_mask_missing_prefill_reads(tmp_path):
+    with serving(snapshot(tmp_path / "snapshots")) as (files, owner, http):
+        url = owner.file_info["file_url"]
+        for role, host in (("D", "6-177"), ("P", "3-11")):
+            for group in (0, 1):
+                for start in (0, 4):
+                    suffix = f"/{group}/{start}/{start + 4}"
+                    # Neither reader has any local snapshot paths; only HTTP.
+                    assert http.open(url + "/page" + suffix).read()
+                    identity = json.dumps(dict(host=host, role=role, pid=22, rank=0)).encode()
+                    http.open(Request(url + "/ack" + suffix, data=identity)).close()
+            if role == "D":
+                assert files.stats()["completed_pages"] == 4
+                with pytest.raises(RuntimeError, match="entire selected KV prefix"):
+                    F.source_stats(owner, tmp_path)
+        report = F.source_stats(owner, tmp_path)
+        assert report["role_completed_pages"] == {"P": 4, "D": 4}
+        assert {r["host"] for r in report["readers"]} == {"3-11", "6-177"}
+
+
+@pytest.mark.parametrize("parser", [P.parser, D.parser])
+@pytest.mark.parametrize("flag", ["--source", "--master", "--seed-device", "--store-gb", "--seed-child"])
+def test_removed_injection_arguments_are_rejected(parser, flag):
+    with pytest.raises(SystemExit):
+        parser().parse_args([flag, "old-value"])

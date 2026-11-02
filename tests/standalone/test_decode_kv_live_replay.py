@@ -11,7 +11,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 import decode_kv_live_replay as R  # noqa: E402
-import prefill_kv_seed as S  # noqa: E402
+import kv_replay_snapshot as S  # noqa: E402
 from test_prefill_kv_replay import log_file, snapshot  # noqa: E402
 
 
@@ -19,18 +19,6 @@ def source(tmp_path, tail_token=False):
     p = snapshot(tmp_path / "snapshots")
     log = tmp_path / "D_dp0.log"
     log_file(log)
-    proc_root = tmp_path / "proc"
-    (proc_root / "1").mkdir(parents=True)
-    (proc_root / "1/cmdline").write_bytes(b"VLLM::Worker\0")
-    (proc_root / "1/status").write_text("PPid:\t11\n")
-    (proc_root / "1/environ").write_bytes(b"HCCL_IF_IP=7.150.3.60\0ASCEND_BUFFER_POOL=4:8\0")
-    (proc_root / "11").mkdir()
-    (proc_root / "11/cmdline").write_bytes(b"python3\0/usr/bin/vllm\0serve\0/model\0")
-    (proc_root / "11/environ").write_bytes(
-        b"PATH=/usr/bin\0"
-        b"HCCL_INTRA_ROCE_ENABLE=1\0ASCEND_BUFFER_POOL=4:8\0"
-        b"HCCL_IF_IP=7.150.3.60\0HCCL_SOCKET_IFNAME=enp67s0f5\0ASCEND_RT_VISIBLE_DEVICES=0,1,2,3\0"
-    )
     with log.open("a") as stream:
         stream.write(f"kv_connector_extra_config={{'skip_last_n_tokens': {int(tail_token)}}}\n")
     for path in (tmp_path / "snapshots").glob("*/rank*/replay.json"):
@@ -50,7 +38,7 @@ def source(tmp_path, tail_token=False):
         row = json.loads(manifest.read_text())
         row["replay_file"] = "replay.json"
         manifest.write_text(json.dumps(row))
-    return dict(request_id="response-0", snapshot_root=p["snapshot_root"], d_logs=[str(log)], proc_root=str(proc_root))
+    return dict(request_id="response-0", snapshot_root=p["snapshot_root"], d_logs=[str(log)])
 
 
 def legacy_source(tmp_path):
@@ -98,8 +86,8 @@ def legacy_source(tmp_path):
 def args(tmp_path):
     return R.parser().parse_args(
         [
-            "--source",
-            "mooncake",
+            "--local-hostname",
+            "127.0.0.1",
             "--request-id",
             "response-0",
             "--d-url",
@@ -121,20 +109,16 @@ def test_metadata_prepare_uses_complete_receive_and_isolated_keys(tmp_path, monk
     models = {"data": [{"id": "GLM-5.3-falcon", "root": "/model", "max_model_len": 1000}]}
     payload, plan, cached = R.prepare(cli, meta, models, tmp_path)
     assert plan["cached_tokens"] == 11  # not rounded down to eight!
-    assert plan["seed_mode"] == "decode_receive"
-    assert plan["transport"]["environment"]["HCCL_INTRA_ROCE_ENABLE"] == "1"
-    assert plan["transport"]["environment"]["ASCEND_BUFFER_POOL"] == "4:8"
-    assert plan["transport"]["source_pids"] == [11]
-    assert plan["transport"]["worker_pids"] == [1]
+    assert plan["replay_mode"] == "decode_receive"
     assert cached == (11 if tail_token else 10)
     assert payload["prompt"] == list(range(11)) + ([99] if tail_token else [])
-    assert payload["kv_transfer_params"] == {"lmcache.tag.decode_replay": plan["replay_tag"]}
-    assert plan["replay_tag"] in payload["cache_salt"]
+    assert payload["kv_transfer_params"] == {}
+    assert payload["cache_salt"].startswith("d-replay-")
     assert payload["model"] == "GLM-5.3-falcon"
     tokens, _, _ = S.snapshot_metadata(plan)
     assert tokens == list(range(11))
     _, second, _ = R.prepare(cli, meta, models, tmp_path)
-    assert second["replay_tag"] != plan["replay_tag"]
+    assert second["release_file"] != plan["release_file"]
 
 
 def test_decode_partial_exception_does_not_relax_prefill_frontier(tmp_path):
@@ -142,52 +126,11 @@ def test_decode_partial_exception_does_not_relax_prefill_frontier(tmp_path):
     plan.update(cached_tokens=11, prefix_digest=S.token_digest(list(range(11))))
     with pytest.raises(ValueError, match="full cache-block boundary"):
         S.snapshot_metadata(plan)
-    plan["seed_mode"] = "decode_receive"
+    plan["replay_mode"] = "decode_receive"
     assert S.snapshot_metadata(plan)[0] == list(range(11))
     plan["cached_tokens"] = 9
     with pytest.raises(ValueError, match="full cache-block boundary"):
         S.snapshot_metadata(plan)
-
-
-def test_partial_page_key_hash_tags_and_plane_bytes(tmp_path, monkeypatch):
-    import hashlib
-
-    from test_prefill_kv_replay import test_ascend_hash_input_and_lmcache_key_serializer
-
-    # Install the same serializer boundary mocks used by the P replay tests.
-    test_ascend_hash_input_and_lmcache_key_serializer(monkeypatch)
-    layout = sys.modules["lmcache.v1.mooncake_layout"]
-    layout.MOONCAKE_VALID_TOKENS_TAG = "lmcache.tag.internal.valid_tokens"
-    hashes = []
-
-    def digest(value):
-        hashes.append(value)
-        return hashlib.sha256(repr(value).encode()).digest()
-
-    monkeypatch.setitem(sys.modules, "vllm.utils.hashing", NS(get_hash_fn_by_name=lambda _: digest))
-    plan = snapshot(tmp_path / "snapshots")
-    plan.update(
-        seed_mode="decode_receive",
-        cached_tokens=11,
-        prefix_digest=S.token_digest(list(range(11))),
-        replay_tag="one-replay",
-    )
-    tokens, rows, _ = S.snapshot_metadata(plan)
-    pages = list(S.page_keys(plan, tokens))
-    assert [(g, a, b) for _, g, a, b in pages][-2:] == [(0, 8, 11), (1, 8, 11)]
-    assert hashes[-1][1] == (8, 9, 10)
-    for (identity, _), group, start, end in pages:
-        tags = identity[5]
-        assert tags["lmcache.tag.decode_replay"] == "one-replay"
-        assert tags.get(layout.MOONCAKE_VALID_TOKENS_TAG) == (3 if start == 8 else None)
-        buf = bytearray(32)
-        n = S.fill_page(rows, group, start, end, memoryview(buf))
-        expected = b"".join(
-            p.read_bytes()[start * row["row_bytes"] : end * row["row_bytes"]]
-            for (g, _, _), (row, p) in sorted(rows.items())
-            if g == group
-        )
-        assert bytes(buf[:n]) == expected
 
 
 def test_payload_preserves_bootstrap_stops_and_actual_token_ids():
@@ -229,7 +172,7 @@ def test_unsupported_sampler_does_not_silently_change_request(change):
 
 
 @pytest.mark.parametrize("change,match", [({"skip_last_n_tokens": 1}, "lookup frontier"), ({"tp_size": 4}, "TP sizes")])
-def test_incompatible_live_d_fails_before_seed(tmp_path, change, match):
+def test_incompatible_live_d_fails_before_source(tmp_path, change, match):
     options = source(tmp_path)
     meta = dict(R.metadata(options), snapshot_root=options["snapshot_root"], **change)
     with pytest.raises(ValueError, match=match):
@@ -250,10 +193,10 @@ def test_existing_d_lifecycle_no_model_or_service_launch(tmp_path, monkeypatch, 
         return {"data": [{"id": "glm", "root": "/model"}]}
 
     @contextmanager
-    def seed(args, plan, output):
+    def file_server(args, plan, output):
         assert plan["cached_tokens"] == 11
-        events.append("seed")
-        yield NS(poll=lambda: None)
+        events.append("source")
+        yield NS(poll=lambda: None, file_info=dict(file_url="http://snapshot:1234/test", role="D"))
         events.append("released")
 
     class Client:
@@ -261,7 +204,7 @@ def test_existing_d_lifecycle_no_model_or_service_launch(tmp_path, monkeypatch, 
             assert url == "http://D:7920"
 
         def complete(self, payload, output):
-            assert events == ["seed"]
+            assert events == ["source"]
             assert payload["prompt"] == list(range(11))
             (output / "output.txt").write_text("saved output")
             events.append("D completed")
@@ -269,12 +212,13 @@ def test_existing_d_lifecycle_no_model_or_service_launch(tmp_path, monkeypatch, 
 
     monkeypatch.setattr(R, "http_json", http)
     monkeypatch.setattr(R, "collect_metadata", lambda *_: meta)
-    monkeypatch.setattr(R, "seeded", seed)
+    monkeypatch.setattr(R, "file_source", file_server)
+    monkeypatch.setattr(R, "source_stats", lambda *_: {"tested_elsewhere": True})
     monkeypatch.setattr(R, "Client", Client)
     monkeypatch.setattr(subprocess, "Popen", lambda *_a, **_k: pytest.fail("unexpected process launch"))
     command = [
-        "--source",
-        "mooncake",
+        "--local-hostname",
+        "127.0.0.1",
         "--request-id",
         "response-0",
         "--d-url",
@@ -320,14 +264,13 @@ def test_metadata_child_binary_protocol(tmp_path, legacy):
     )
     value = json.loads(gzip.decompress(result.stdout))
     assert value["received_tokens"] == list(range(11))
-    assert value["contract"]["master"] == "10.0.0.1:50051"
     assert value["skip_last_n_tokens"] == 0
     assert (value["request"] is None) == legacy
     assert value["runtime"]["engine_options"]["model"] == "/model"
 
 
 @pytest.mark.parametrize("legacy", [False, True])
-def test_real_http_single_request_retains_seed_until_done(tmp_path, monkeypatch, legacy):
+def test_real_http_single_request_retains_source_until_done(tmp_path, monkeypatch, legacy):
     import threading
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -339,13 +282,13 @@ def test_real_http_single_request_retains_seed_until_done(tmp_path, monkeypatch,
     active, requests, failures = [], [], []
 
     @contextmanager
-    def seed(args, plan, output):
+    def file_server(args, plan, output):
         # The full main path must hand the legacy raw snapshot to the native
-        # seed's real metadata/layout validator, including the partial tail.
+        # source's real metadata/layout validator, including the partial tail.
         assert S.snapshot_metadata(plan)[0] == list(range(11))
-        active.append(plan["replay_tag"])
+        active.append("http://snapshot:1234/test")
         try:
-            yield NS(poll=lambda: None)
+            yield NS(poll=lambda: None, file_info=dict(file_url="http://snapshot:1234/test", role="D"))
         finally:
             active.clear()
 
@@ -362,8 +305,8 @@ def test_real_http_single_request_retains_seed_until_done(tmp_path, monkeypatch,
         def do_POST(self):
             requests.append(self.path)
             value = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            if not active or value["kv_transfer_params"]["lmcache.tag.decode_replay"] != active[0]:
-                failures.append("seed absent")
+            if not active or not value["kv_transfer_params"].get("lmcache.tag.file_replay"):
+                failures.append("source absent")
             if value["prompt"] != list(range(11)):
                 failures.append("tokens changed")
             event = dict(
@@ -379,13 +322,14 @@ def test_real_http_single_request_retains_seed_until_done(tmp_path, monkeypatch,
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     worker = threading.Thread(target=server.serve_forever, daemon=True)
     worker.start()
-    monkeypatch.setattr(R, "seeded", seed)
+    monkeypatch.setattr(R, "file_source", file_server)
+    monkeypatch.setattr(R, "source_stats", lambda *_: {"tested_elsewhere": True})
     try:
         assert (
             R.main(
                 [
-                    "--source",
-                    "mooncake",
+                    "--local-hostname",
+                    "127.0.0.1",
                     "--request-id",
                     "response-0",
                     "--d-url",
@@ -448,7 +392,7 @@ def test_legacy_missing_client_data_gives_existing_data_instruction(tmp_path):
         R.restore_legacy_request(R.metadata(options), tmp_path / "not-the-run", "response-0")
 
 
-def test_d_refusal_prevents_metadata_scan_and_seed(tmp_path, monkeypatch):
+def test_d_refusal_prevents_metadata_scan_and_source(tmp_path, monkeypatch):
     monkeypatch.setattr(R, "REPO", tmp_path)
 
     def unavailable(*_args, **_kwargs):
@@ -456,7 +400,7 @@ def test_d_refusal_prevents_metadata_scan_and_seed(tmp_path, monkeypatch):
 
     monkeypatch.setattr(R, "http_json", unavailable)
     monkeypatch.setattr(R, "collect_metadata", lambda *_: pytest.fail("scanned before checking D"))
-    monkeypatch.setattr(R, "seeded", lambda *_: pytest.fail("injected before checking D"))
+    monkeypatch.setattr(R, "file_source", lambda *_: pytest.fail("read before checking D"))
     with pytest.raises(ConnectionRefusedError):
         R.main(["--request-id", "response-0", "--d-url", "http://D:7920"])
     report = next((tmp_path / "decode-kv-replays").glob("*/report.json"))
@@ -466,12 +410,10 @@ def test_d_refusal_prevents_metadata_scan_and_seed(tmp_path, monkeypatch):
 def test_remote_metadata_uses_p_environment_and_preserves_failure(tmp_path, monkeypatch):
     import shlex
 
-    import prefill_kv_replay as P
-
     cli = R.parser().parse_args(
         [
-            "--source",
-            "mooncake",
+            "--local-hostname",
+            "127.0.0.1",
             "--request-id",
             "response-0",
             "--d-url",
@@ -490,9 +432,8 @@ def test_remote_metadata_uses_p_environment_and_preserves_failure(tmp_path, monk
     def ssh(args, host, command, *, stdout, stderr, timeout):
         assert host == "root@D"
         words = shlex.split(command[-1])
-        assert words[:6] == ["docker", "exec", "--", "serving", "bash", "-lc"]
-        assert words[6] == P.REMOTE_ENV_BOOTSTRAP
-        assert words[8:11] == [
+        assert words[:4] == ["docker", "exec", "--", "serving"]
+        assert words[4:7] == [
             "/usr/local/python3.11.14/bin/python3",
             "/work space/vllm-ascend/tools/decode_kv_replay.py",
             "--metadata-child",
@@ -505,22 +446,22 @@ def test_remote_metadata_uses_p_environment_and_preserves_failure(tmp_path, monk
         R.collect_metadata(cli, tmp_path)
 
 
-def test_failed_seed_never_submits_decode(tmp_path, monkeypatch):
+def test_failed_source_never_submits_decode(tmp_path, monkeypatch):
     options = source(tmp_path)
     meta = dict(R.metadata(options), snapshot_root=options["snapshot_root"])
     monkeypatch.setattr(R, "REPO", tmp_path)
     monkeypatch.setattr(R, "http_json", lambda *_a, **_k: {"data": [{"id": "glm", "root": "/model"}]})
     monkeypatch.setattr(R, "collect_metadata", lambda *_: meta)
-    monkeypatch.setattr(R, "Client", lambda *_: pytest.fail("submitted after failed injection"))
+    monkeypatch.setattr(R, "Client", lambda *_: pytest.fail("submitted after failed file setup"))
 
     @contextmanager
-    def failed_seed(*_):
-        raise RuntimeError("Native seed readback differs")
+    def failed_source(*_):
+        raise RuntimeError("Snapshot copies differ")
         yield  # pragma: no cover - retain contextmanager protocol
 
-    monkeypatch.setattr(R, "seeded", failed_seed)
-    with pytest.raises(RuntimeError, match="readback differs"):
-        R.main(["--source", "mooncake", "--request-id", "response-0", "--d-url", "http://D:7920"])
+    monkeypatch.setattr(R, "file_source", failed_source)
+    with pytest.raises(RuntimeError, match="copies differ"):
+        R.main(["--local-hostname", "127.0.0.1", "--request-id", "response-0", "--d-url", "http://D:7920"])
 
 
 def test_replay_client_modules_parse_as_python39():
@@ -531,8 +472,8 @@ def test_replay_client_modules_parse_as_python39():
         "decode_kv_live_replay",
         "decode_kv_compare",
         "prefill_kv_replay",
-        "prefill_kv_seed",
-        "kv_replay_transport",
+        "kv_replay_snapshot",
+        "kv_replay_files",
         "pd_tensor_collect",
         "multi_turn_kv_reuse_concurrent",
     ):

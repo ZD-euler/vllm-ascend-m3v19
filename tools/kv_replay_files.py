@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, build_opener
 
-from prefill_kv_seed import PREFIX, snapshot_metadata, validate_tp_copies
+from kv_replay_snapshot import PREFIX, snapshot_metadata, validate_tp_copies
 
 COPY_BYTES = 4 * 1024 * 1024
 TAG = "lmcache.tag.file_replay"
@@ -23,7 +23,7 @@ TAG = "lmcache.tag.file_replay"
 class SnapshotFiles:
     def __init__(self, plan: dict):
         self.tokens, self.rows, self.comparisons = snapshot_metadata(plan)
-        self.role = "D" if plan.get("seed_mode") == "decode_receive" else "PD"
+        self.role = "D" if plan.get("replay_mode") == "decode_receive" else "PD"
         schema = plan["contract"]["schema"]
         self.chunk = schema["chunk_size"]
         self.manifest = dict(
@@ -38,6 +38,8 @@ class SnapshotFiles:
         self.nonce = uuid.uuid4().hex
         self.completed = set()
         self.layer_completions = {}
+        self.readers = {}
+        self.role_completed = {"P": set(), "D": set()}
         self.bytes_sent = 0
         self.errors = []
         self.lock = threading.Lock()
@@ -66,6 +68,8 @@ class SnapshotFiles:
                 groups=sorted({group for group, _, _ in self.completed}),
                 bytes_sent=self.bytes_sent,
                 errors=list(self.errors),
+                role_completed_pages={role: len(pages) for role, pages in self.role_completed.items()},
+                readers=[dict(info, completed_pages=len(pages)) for info, pages in self.readers.values()],
             )
 
     def handler(self):
@@ -90,18 +94,36 @@ class SnapshotFiles:
                     if len(parts) not in (3, 4):
                         raise ValueError("Invalid acknowledgement")
                     source.page(group, start, end, layer)
-                except ValueError:
+                    length = int(self.headers.get("Content-Length", 0))
+                    if not 0 < length <= 1024:
+                        raise ValueError("Missing reader identity; update the LMCache file reader")
+                    reader = json.loads(self.rfile.read(length))
+                    if (
+                        reader.get("role") not in source.role
+                        or reader.get("role") not in ("P", "D")
+                        or not isinstance(reader.get("host"), str)
+                        or type(reader.get("pid")) is not int
+                        or type(reader.get("rank")) is not int
+                    ):
+                        raise ValueError("Invalid reader identity")
+                    reader["ip"] = self.client_address[0]
+                    reader_key = tuple(reader[k] for k in ("host", "ip", "pid", "role", "rank"))
+                except (ValueError, TypeError, AttributeError):
                     self.send_error(404)
                     return
                 with source.lock:
                     identity = (group, start, end)
+                    info, pages = source.readers.setdefault(reader_key, (reader, set()))
                     if layer is None:
-                        source.completed.add(identity)
+                        pages.add(identity)
                     else:
-                        done = source.layer_completions.setdefault(identity, set())
+                        done = source.layer_completions.setdefault((reader_key, identity), set())
                         done.add(layer)
                         if len(done) == source.manifest["groups"][group]:
-                            source.completed.add(identity)
+                            pages.add(identity)
+                    if identity in pages:
+                        source.completed.add(identity)
+                        source.role_completed[info["role"]].add(identity)
                 self.send_response(204)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
@@ -221,7 +243,6 @@ def attach_source(payload: dict, owner, output: Path) -> None:
     options = dict(url=info["file_url"], role=info["role"])
     tag = base64.urlsafe_b64encode(json.dumps(options, separators=(",", ":")).encode()).decode().rstrip("=")
     transfer = dict(payload.get("kv_transfer_params") or {})
-    transfer.pop("lmcache.tag.decode_replay", None)
     if any(k.startswith("lmcache.tag.") for k in transfer):
         raise ValueError("Original request carries extra cache tags; refusing a mismatched file replay")
     transfer[TAG] = tag
@@ -239,8 +260,15 @@ def source_stats(owner, output: Path) -> dict:
     with opener.open(owner.file_info["file_url"] + "/stats", timeout=30) as response:
         stats = json.load(response)
     save_json(output / "file_reads.json", stats)
-    if stats["errors"] or stats["completed_pages"] != stats["expected_pages"] or stats["groups"] != [0, 1]:
+    required_role = "P" if owner.file_info["role"] == "PD" else "D"
+    if (
+        stats["errors"]
+        or stats["role_completed_pages"][required_role] != stats["expected_pages"]
+        or stats["groups"] != [0, 1]
+    ):
         raise RuntimeError(f"File replay did not read the entire selected KV prefix: {stats}")
+    for reader in stats["readers"]:
+        print(PREFIX + json.dumps(dict(status="reader_completed", **reader)), flush=True)
     return stats
 
 

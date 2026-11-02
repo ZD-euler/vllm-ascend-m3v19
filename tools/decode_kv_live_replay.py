@@ -17,11 +17,11 @@ from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
 from decode_kv_compare import request_key
-from kv_replay_transport import read_transport_environment
+from kv_replay_files import attach_source, configure_plan, require_enabled, source_stats
+from kv_replay_snapshot import live_contract, token_digest
 from multi_turn_kv_reuse_concurrent import Client, save_json
 from pd_tensor_collect import password_auth, run_ssh
-from prefill_kv_replay import child_argv, format_failure, http_json, seeded, validate_response_counts
-from prefill_kv_seed import live_contract, token_digest
+from prefill_kv_replay import child_argv, file_source, format_failure, http_json, validate_response_counts
 
 REPO = Path(__file__).resolve().parents[1]
 PREFIX = "[D_KV_REPLAY]"
@@ -71,12 +71,7 @@ def metadata(options: dict) -> dict:
             skip_counts.update(int(v) for v in re.findall(r"skip_last_n_tokens[\"']?\s*[:=]\s*(\d+)", line))
     if len(skip_counts) > 1:
         raise ValueError("D logs contain different skip_last_n_tokens settings; select the current D logs")
-    file_mode = options.get("source") == "files"
-    if file_mode:
-        from kv_replay_files import require_enabled
-
-        require_enabled(paths, "D")
-    transport = None if file_mode else read_transport_environment(paths, Path(options.get("proc_root", "/proc")))
+    require_enabled(paths, "D")
     # The connector's default is zero when the extra setting is omitted.
     return dict(
         request=plan["request"],
@@ -87,7 +82,6 @@ def metadata(options: dict) -> dict:
         skip_last_n_tokens=next(iter(skip_counts), 0),
         logs=[str(p.resolve()) for p in paths],
         replay_metadata_source=plan["replay_metadata_source"],
-        transport=transport,
     )
 
 
@@ -99,7 +93,6 @@ def collect_metadata(args, output: Path) -> dict:
         request_id=request_key(args.request_id),
         snapshot_root=args.snapshot_root or str(remote_repo / "decode-kv-snapshots"),
         d_logs=args.d_logs or [str(remote_repo / "tp4_dp4_logs" / f"D_dp*_port{port}.log")],
-        source=getattr(args, "source", "mooncake"),
     )
     if not args.snapshot_host:
         result = metadata(options)
@@ -108,7 +101,9 @@ def collect_metadata(args, output: Path) -> dict:
         command = child_argv(args, "--metadata-child", encoded, script_name="decode_kv_replay.py")
         target = output / "metadata.json.gz"
         with target.open("wb") as stream, (output / "metadata.log").open("wb") as errors:
-            child = run_ssh(args, args.snapshot_host, command, stdout=stream, stderr=errors, timeout=args.seed_timeout)
+            child = run_ssh(
+                args, args.snapshot_host, command, stdout=stream, stderr=errors, timeout=args.source_timeout
+            )
         if child.returncode:
             lines = (output / "metadata.log").read_text(encoding="utf-8", errors="replace").splitlines()
             cause = next((line for line in reversed(lines) if "[D_KV_REPLAY] FAILED:" in line), None)
@@ -222,7 +217,6 @@ def request_payload(record: dict, model: str, tag: str, output_tokens: int | Non
         sampling["min_tokens"] = min(sampling.get("min_tokens", 0), output_tokens)
     if not isinstance(sampling.get("max_tokens"), int) or sampling["max_tokens"] < 1:
         raise ValueError("Saved request has no finite output limit; pass --output-tokens")
-    transfer["lmcache.tag.decode_replay"] = tag
     return dict(
         sampling,
         model=model,
@@ -255,10 +249,6 @@ def prepare(args, meta: dict, models: dict, output: Path) -> tuple[dict, dict, i
     contract = meta["contract"]
     if contract.get("tp_size") != meta["tp_size"]:
         raise ValueError("Current D logs and snapshot TP sizes differ")
-    master = args.master or contract.get("master")
-    file_mode = getattr(args, "source", "mooncake") == "files"
-    if not file_mode and (not master or (contract.get("master") and master != contract["master"])):
-        raise ValueError("Cannot determine the current D Mooncake master, or --master disagrees with D logs")
     received, prompt = meta["received_tokens"], meta["request"]["prompt_token_ids"]
     # A different D truncation policy changes the partial page's hash/key. Do
     # not turn that mismatch into a silent full-prefill replay.
@@ -277,30 +267,21 @@ def prepare(args, meta: dict, models: dict, output: Path) -> tuple[dict, dict, i
     plan = dict(
         contract=contract,
         model_path=saved_model,
-        master=master,
         tp_size=meta["tp_size"],
         previous=request_key(args.request_id),
         cached_tokens=len(received),
-        seed_mode="decode_receive",
-        replay_tag=tag,
+        replay_mode="decode_receive",
         prefix_digest=token_digest(received),
         previous_prompt_tokens=len(received),
         previous_prompt_digest=token_digest(received),
         snapshot_root=meta["snapshot_root"],
         workers=args.workers,
-        seed_device=args.seed_device,
-        transport=meta["transport"],
-        local_hostname=args.local_hostname,
-        store_bytes=None if args.store_gb is None else int(args.store_gb * 1024**3),
         release_file=str(remote_repo / "prefill-kv-replays" / "leases" / (tag + ".release")),
         hold_seconds=args.timeout + 120,
     )
-    if file_mode:
-        from kv_replay_files import configure_plan
-
-        configure_plan(args, plan)
+    configure_plan(args, plan)
     save_json(output / "request.json", payload)
-    save_json(output / "seed_plan.json", plan)
+    save_json(output / "file_plan.json", plan)
     save_json(output / "source.json", meta)
     return payload, plan, min(len(received), len(prompt) - 1)
 
@@ -308,7 +289,6 @@ def prepare(args, meta: dict, models: dict, output: Path) -> tuple[dict, dict, i
 def parser() -> argparse.ArgumentParser:
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("--request-id")
-    cli.add_argument("--source", choices=("files", "mooncake"), default="files")
     cli.add_argument("--file-port", type=int, default=0)
     cli.add_argument(
         "--run-dir",
@@ -326,7 +306,6 @@ def parser() -> argparse.ArgumentParser:
     )
     cli.add_argument("--container")
     cli.add_argument("--remote-python", default=sys.executable)
-    cli.add_argument("--master", help="Infer Mooncake master from current D logs")
     password = cli.add_mutually_exclusive_group()
     password.add_argument("--password", dest="ssh_password", help="Native OpenSSH askpass; no interactive prompt")
     password.add_argument("--password-env")
@@ -334,13 +313,13 @@ def parser() -> argparse.ArgumentParser:
     cli.add_argument("--ssh-port", type=int)
     cli.add_argument("--identity-file", type=Path)
     cli.add_argument("--workers", type=int, default=8)
-    cli.add_argument("--seed-device", type=int, default=0, help="Transport context only; no model is loaded")
-    cli.add_argument("--local-hostname", help="Snapshot host transport IP; infer via route to master")
-    cli.add_argument("--store-gb", type=float, help="Temporary seed CPU segment capacity; infer from full KV size")
+    cli.add_argument(
+        "--local-hostname", help="Snapshot file service IP reachable from all P/D nodes; default: snapshot-host"
+    )
     cli.add_argument("--timeout", type=float, default=7200)
-    cli.add_argument("--seed-timeout", type=float, default=7200)
+    cli.add_argument("--source-timeout", type=float, default=7200)
     cli.add_argument("--output-tokens", type=int, help="Keep saved D output limit unless overridden")
-    cli.add_argument("--prepare-only", action="store_true", help="Read metadata/check API, without injection/inference")
+    cli.add_argument("--prepare-only", action="store_true", help="Read metadata/check API, without KV reads/inference")
     cli.add_argument("--metadata-child", help=argparse.SUPPRESS)
     return cli
 
@@ -353,12 +332,10 @@ def main(argv=None) -> int:
         return 0
     if not args.request_id or not args.d_url:
         raise ValueError("--request-id and --d-url are required; use the existing D API endpoint")
-    if any(not math.isfinite(n) or n <= 0 for n in (args.timeout, args.seed_timeout, args.workers)):
+    if any(not math.isfinite(n) or n <= 0 for n in (args.timeout, args.source_timeout, args.workers)):
         raise ValueError("Timeouts and workers must be positive and finite")
     if args.output_tokens is not None and args.output_tokens <= 0:
         raise ValueError("output-tokens must be positive")
-    if args.store_gb is not None and (not math.isfinite(args.store_gb) or args.store_gb <= 0):
-        raise ValueError("store-gb must be positive and finite")
     args.hosts = [args.snapshot_host] if args.snapshot_host else []
     args.password = args.password_per_host = False
     parent = REPO / "decode-kv-replays"
@@ -373,7 +350,7 @@ def main(argv=None) -> int:
     )
     print(f"{PREFIX} artifacts={output}; using existing D; no model/server startup", flush=True)
     try:
-        # Check HTTP before touching the large snapshot or creating a seed segment.
+        # Check HTTP before touching the large snapshot or starting the file source.
         models = http_json(args.d_url, "/v1/models", timeout=min(args.timeout, 30))
         with password_auth(args):
             meta = collect_metadata(args, output)
@@ -389,20 +366,14 @@ def main(argv=None) -> int:
             if args.prepare_only:
                 report["status"] = "prepared_not_run"
                 return 0
-            with seeded(args, plan, output) as owner:
-                if args.source == "files":
-                    from kv_replay_files import attach_source
-
-                    attach_source(payload, owner, output)
+            with file_source(args, plan, output) as owner:
+                attach_source(payload, owner, output)
                 text, metrics = Client(args.d_url, args.timeout).complete(payload, output)
                 print(f"{PREFIX} OUTPUT BEGIN\n{text}\n{PREFIX} OUTPUT END", flush=True)
                 report.update(request_completed=True, metrics=metrics)
-                if args.source == "files":
-                    from kv_replay_files import source_stats
-
-                    report["file_reads"] = source_stats(owner, output)
+                report["file_reads"] = source_stats(owner, output)
                 if owner.poll() is not None:
-                    raise RuntimeError("Seed owner exited during D request; replay is invalid")
+                    raise RuntimeError("File source exited during D request; replay is invalid")
                 validation = validate_response_counts(metrics, len(payload["prompt"]), expected)
                 report.update(count_validation=validation)
                 report["status"] = "replay_unverified" if validation["missing"] else "replay_complete"
