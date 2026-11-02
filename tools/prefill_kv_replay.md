@@ -104,13 +104,20 @@ script does for `ascend_transport.so`, preserving existing toolkit paths. This
 is done before starting Python, for both local and remote injection processes.
 Torch, the NPU context, and cache-key dependencies are checked before raw-file scans;
 loader failures retain their underlying exception in both the log and terminal.
-Before importing the native libraries, P replay also reads live worker environments
-on the **snapshot/seed host** from `WORKSPACE/tp4_dp4_logs/[PD]_dp*.log`. It copies
+Before importing the native libraries, P replay finds live workers on the
+**snapshot/seed host** from `WORKSPACE/tp4_dp4_logs/[PD]_dp*.log`, follows their
+parent process chains and reads the original `vllm serve` launcher's environment. It copies
 the transport allowlist (including `HCCL_INTRA_ROCE_ENABLE`, `ASCEND_BUFFER_POOL`,
 and that host's `HCCL_IF_IP`/`HCCL_SOCKET_IFNAME`) and prints `transport_config`.
 It does not copy the remote P host's network address, rank, device visibility,
 credentials, or debug flags. Stopped workers in old logs are ignored; no live
-source or conflicting settings fails before scanning/injecting KV.
+source or conflicting settings fails before scanning/injecting KV. It does not
+read environment values from renamed workers: `setproctitle` can overwrite their
+`/proc/<pid>/environ` without changing their actual runtime settings. An intact
+service launcher must still be running; unrelated API processes are not used.
+`transport_config` records `source=service_launcher`, the source PIDs, and the
+worker PIDs separately. These are exported launch settings, not a live `getenv`
+query; launchers that change transport settings after exec are not supported.
 Use `--seed-logs` only for a nonstandard log location on the snapshot host.
 This configures the seed; its local readback does not test a cross-process or
 cross-host connection from a serving worker. D-only replay retains its separate

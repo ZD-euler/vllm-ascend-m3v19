@@ -82,8 +82,11 @@ tool checks the selected device against the target workers' device visibility
 before loading the native runtime or scanning the large archive.
 
 Before injection, metadata collection finds the current worker PIDs in the
-selected D logs and reads their `/proc/<pid>/environ` inside the serving
-container. It copies an allowlist of HCCL/Ascend transport settings into the
+selected D logs, follows their parent process chains to the original `vllm serve`
+launcher and reads that launcher's `/proc/<pid>/environ` inside the serving
+container. Renamed worker/EngineCore environments are not used: `setproctitle`
+can overwrite that `/proc` data even while the real environment remains valid.
+It copies an allowlist of HCCL/Ascend transport settings into the
 seed plan, including `HCCL_INTRA_ROCE_ENABLE`, `ASCEND_BUFFER_POOL`,
 `HCCL_IF_IP` and `HCCL_SOCKET_IFNAME`. Seed applies these **before importing
 torch_npu or initializing Mooncake**. Settings absent on D are also unset
@@ -91,9 +94,11 @@ on seed. Worker rank, device visibility, model/debug flags and credentials
 are not copied. This fixes seed silently using shell defaults while the
 server uses RDMA and a Host-memory transfer buffer pool.
 
-The first seed status line, `transport_config`, reports the source worker
-PIDs, the seed device and the effective transport settings. An unavailable
-worker environment or conflicting D configurations stops before injection.
+The first seed status line, `transport_config`, reports `source=service_launcher`,
+source launcher PIDs, worker PIDs, the seed device and effective transport settings.
+A missing intact launcher or conflicting D configurations stops before injection.
+These are the exported launch settings, not a live worker `getenv` query;
+launchers that change transport settings after exec are not supported.
 Update the client and snapshot-host tools together; custom log names require
 `--d-logs` pointing to the target D instance's current log.
 

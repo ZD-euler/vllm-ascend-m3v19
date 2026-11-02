@@ -16,7 +16,17 @@ import kv_replay_transport as T  # noqa: E402
 def worker(tmp_path, pid, values):
     folder = tmp_path / "proc" / str(pid)
     folder.mkdir(parents=True, exist_ok=True)
-    (folder / "environ").write_bytes(b"\0".join(f"{key}={value}".encode() for key, value in values.items()))
+    (folder / "cmdline").write_bytes(b"VLLM::Worker\0")
+    (folder / "status").write_text(f"Name:\tVLLM::Worker\nPPid:\t{pid + 1000}\n")
+    # Reproduce the real failure: the renamed worker has a partial environment,
+    # while its service launcher still has every setting used at exec time.
+    (folder / "environ").write_bytes(b"HCCL_IF_IP=7.150.3.60\0ASCEND_BUFFER_POOL=4:8\0")
+    launcher = tmp_path / "proc" / str(pid + 1000)
+    launcher.mkdir(parents=True, exist_ok=True)
+    (launcher / "cmdline").write_bytes(b"/usr/bin/python3\0/usr/local/bin/vllm\0serve\0/model\0")
+    (launcher / "environ").write_bytes(
+        b"\0".join(f"{key}={value}".encode() for key, value in dict(PATH="/usr/bin", **values).items())
+    )
 
 
 def test_captures_latest_workers_and_only_transport_fields(tmp_path):
@@ -38,7 +48,9 @@ def test_captures_latest_workers_and_only_transport_fields(tmp_path):
     for pid in (20, 21):
         worker(tmp_path, pid, values)
     result = T.read_transport_environment([log], tmp_path / "proc")
-    assert result["source_pids"] == [20, 21]  # old PID need not exist
+    assert result["source_pids"] == [1020, 1021]  # old PID need not exist
+    assert result["worker_pids"] == [20, 21]
+    assert result["source"] == "service_launcher"
     assert result["d_visible_devices"] == [0, 1, 2, 3]
     assert result["environment"] == {key: values.get(key) for key in T.TRANSPORT_ENV_KEYS}
     assert "PRIVATE_PASSWORD" not in json.dumps(result)
@@ -124,8 +136,8 @@ def test_prefill_discovery_ignores_stopped_workers_but_requires_live_source(tmp_
     )
     worker(tmp_path, 20, dict(HCCL_INTRA_ROCE_ENABLE="1"))
     result = T.read_transport_environment([log], tmp_path / "proc", skip_stopped=True)
-    assert result["source_pids"] == [20]
-    (tmp_path / "proc/20/environ").unlink()
+    assert result["source_pids"] == [1020]
+    (tmp_path / "proc/20/cmdline").unlink()
     with pytest.raises(ValueError, match="Cannot locate live"):
         T.read_transport_environment([log], tmp_path / "proc", skip_stopped=True)
 
@@ -174,7 +186,8 @@ def test_prefill_seed_inherits_on_snapshot_host_before_native_import(tmp_path, l
     assert "stop at native import" in child.stderr
     line = next(line for line in child.stdout.splitlines() if '"status": "transport_config"' in line)
     actual = json.loads(line.split("] ", 1)[1])
-    assert actual["source_pids"] == [20]
+    assert actual["source_pids"] == [1020]
+    assert actual["worker_pids"] == [20]
     assert actual["environment"] == dict(
         HCCL_INTRA_ROCE_ENABLE="1",
         ASCEND_BUFFER_POOL="4:8",
@@ -183,3 +196,49 @@ def test_prefill_seed_inherits_on_snapshot_host_before_native_import(tmp_path, l
     )
     assert actual["seed_physical_device"] == 0
     assert actual["seed_visibility"] is None
+
+
+def test_follows_engine_parent_and_does_not_choose_unrelated_service(tmp_path):
+    log = tmp_path / "D.log"
+    log.write_text("(Worker_DP0_TP0_EP0 pid=20) Mooncake payload layout:\n")
+    worker(tmp_path, 20, dict(HCCL_INTRA_ROCE_ENABLE="1"))
+    worker(tmp_path, 21, dict(HCCL_INTRA_ROCE_ENABLE="0"))  # unrelated service
+    engine = tmp_path / "proc/30"
+    engine.mkdir()
+    (engine / "cmdline").write_bytes(b"VLLM::EngineCore\0")
+    (engine / "status").write_text("PPid:\t1020\n")
+    (tmp_path / "proc/20/status").write_text("PPid:\t30\n")
+    result = T.read_transport_environment([log], tmp_path / "proc")
+    assert result["source_pids"] == [1020]
+    assert result["environment"]["HCCL_INTRA_ROCE_ENABLE"] == "1"
+
+
+@pytest.mark.parametrize("problem", ["renamed", "no_environment", "missing_parent", "cycle"])
+def test_never_falls_back_to_partial_worker_environment(tmp_path, problem):
+    log = tmp_path / "D.log"
+    log.write_text("(Worker_DP0_TP0_EP0 pid=20) Mooncake payload layout:\n")
+    worker(tmp_path, 20, dict(HCCL_INTRA_ROCE_ENABLE="1"))
+    launcher = tmp_path / "proc/1020"
+    (launcher / "status").write_text("PPid:\t0\n")
+    if problem in ("renamed", "cycle"):
+        (launcher / "cmdline").write_bytes(b"VLLM::APIServer\0")
+        if problem == "cycle":
+            (launcher / "status").write_text("PPid:\t20\n")
+    elif problem == "no_environment":
+        (launcher / "environ").write_bytes(b"\0" * 500)
+    else:
+        (launcher / "cmdline").unlink()
+    with pytest.raises((ValueError, FileNotFoundError)):
+        T.read_transport_environment([log], tmp_path / "proc", skip_stopped=True)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["/usr/bin/python3", "/usr/bin/vllm", "serve", "/model"],
+        ["python3", "-m", "vllm", "serve", "/model"],
+        ["python3", "-m", "vllm.entrypoints.openai.api_server"],
+    ],
+)
+def test_supported_unrenamed_launchers(argv):
+    assert T._is_service_launcher(argv)

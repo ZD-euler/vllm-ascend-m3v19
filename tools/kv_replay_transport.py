@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Copy only transport settings from live local workers to the replay seed."""
+"""Copy transport launch settings from the live local service to replay seed."""
 
 from __future__ import annotations
 
@@ -32,13 +32,57 @@ TRANSPORT_ENV_KEYS = (
 )
 
 
+def _is_service_launcher(argv: list[str]) -> bool:
+    # Renamed Worker/EngineCore/APIServer processes are NOT suitable sources:
+    # setproctitle can clobber /proc/PID/environ without changing os.environ.
+    for index, arg in enumerate(argv[:-1]):
+        if Path(arg).name == "vllm" and argv[index + 1] == "serve":
+            return True
+        if arg == "-m" and argv[index + 1] == "vllm.entrypoints.openai.api_server":
+            return True
+        if arg == "-m" and argv[index + 1] == "vllm" and argv[index + 2 : index + 3] == ["serve"]:
+            return True
+    return False
+
+
+def _launcher_environment(worker_pid: int, proc_root: Path) -> tuple[int, dict[str, str]]:
+    """Follow PPid to the unrenamed vllm launcher, never an unrelated API PID.
+
+    /proc exposes the exec-time environment, not live getenv(). The supported
+    serving launchers export transport settings before exec and pass them to
+    workers. Read that intact source instead of inferring 'unset' from missing
+    entries in a worker's overwritten environment area.
+    """
+    pid = worker_pid
+    visited = set()
+    while pid > 0 and pid not in visited:
+        visited.add(pid)
+        process = proc_root / str(pid)
+        argv = process.joinpath("cmdline").read_bytes().decode(errors="surrogateescape").split("\0")
+        if _is_service_launcher(argv):
+            raw = process.joinpath("environ").read_bytes()
+            env = dict(item.split("=", 1) for item in raw.decode(errors="surrogateescape").split("\0") if "=" in item)
+            if not env.get("PATH"):
+                raise ValueError(f"Service launcher {pid} has no intact launch environment; refusing partial settings")
+            return pid, env
+        status = process.joinpath("status").read_text(encoding="utf-8")
+        parent = re.search(r"^PPid:\s*(\d+)\s*$", status, re.MULTILINE)
+        if parent is None:
+            raise ValueError(f"Cannot determine parent of service process {pid}")
+        pid = int(parent[1])
+    raise ValueError(
+        f"Cannot locate the original vllm serve launcher for worker {worker_pid}; "
+        "refusing to inherit a renamed worker's partial /proc environment"
+    )
+
+
 def read_transport_environment(
     paths: list[Path], proc_root: Path = Path("/proc"), *, skip_stopped: bool = False
 ) -> dict:
     """Find the last cache-initializing worker per rank in the selected D logs.
 
-    Read /proc inside the same host/container as those logs. The source is the
-    currently running process, not shell defaults or a possibly stale template.
+    Read /proc inside the same host/container as those logs. Resolve each live
+    worker to its original service launcher, whose argv/environ are intact.
     """
     workers = {}
     for path in paths:
@@ -53,29 +97,31 @@ def read_transport_environment(
     settings = None
     visible_devices = set()
     pids = []
+    sources = set()
     for pid in sorted(set(workers.values())):
         try:
-            raw = (proc_root / str(pid) / "environ").read_bytes()
+            # Only a missing worker itself counts as stopped. A missing parent
+            # or unreadable source must not silently remove a running rank.
+            (proc_root / str(pid) / "cmdline").read_bytes()
         except FileNotFoundError as error:
             if skip_stopped:
                 continue
-            raise ValueError(
-                f"Cannot read live service worker {pid} environment; use the current startup logs"
-            ) from error
+            raise ValueError(f"Cannot read live service worker {pid}; use the current startup logs") from error
         except OSError as error:
             raise ValueError(
-                f"Cannot read live service worker {pid} environment; select current transport logs "
+                f"Cannot read live service worker {pid}; select current transport logs "
                 "and run metadata collection in the serving container"
             ) from error
-        env = dict(item.split("=", 1) for item in raw.decode(errors="surrogateescape").split("\0") if "=" in item)
+        source_pid, env = _launcher_environment(pid, proc_root)
         current = {key: env.get(key) for key in TRANSPORT_ENV_KEYS}
         if settings is not None and current != settings:
             different = [key for key in TRANSPORT_ENV_KEYS if current[key] != settings[key]]
             raise ValueError(
-                f"Service workers disagree on transport settings: {different}; select matching transport logs"
+                f"Service launchers disagree on transport settings: {different}; select matching transport logs"
             )
         settings = current
         pids.append(pid)
+        sources.add(source_pid)
         visible = env.get("ASCEND_RT_VISIBLE_DEVICES")
         if visible:
             try:
@@ -84,7 +130,13 @@ def read_transport_environment(
                 raise ValueError(f"Unsupported D device visibility: {visible!r}") from error
     if not pids:
         raise ValueError("Cannot locate live service workers in transport logs; run seed in the serving container")
-    return dict(environment=settings, source_pids=pids, d_visible_devices=sorted(visible_devices))
+    return dict(
+        environment=settings,
+        source="service_launcher",
+        source_pids=sorted(sources),
+        worker_pids=pids,
+        d_visible_devices=sorted(visible_devices),
+    )
 
 
 def read_prefill_seed_transport(patterns: list[str]) -> dict:
@@ -101,7 +153,7 @@ def read_prefill_seed_transport(patterns: list[str]) -> dict:
 def apply_transport_environment(config: dict, seed_device: int, *, check_device_overlap: bool = True) -> dict:
     """Apply the captured values before importing torch_npu or native Mooncake.
 
-    Null means unset on D: remove a stale shell value on seed as well. Preserve
+    Null means unset at service launch: remove a stale shell value on seed as well. Preserve
     seed's own device visibility; copying D's visibility can select the same
     physical device and cause an unsupported ADXL self-device connection.
     """
@@ -120,7 +172,7 @@ def apply_transport_environment(config: dict, seed_device: int, *, check_device_
         except (ValueError, IndexError) as error:
             raise ValueError(f"seed-device {seed_device} is outside seed visibility {visible!r}") from error
     # D replay reads from a known co-located D endpoint. P replay gets settings
-    # from local workers but they are not necessarily its consuming P/D workers;
+    # from local services but they are not necessarily its consuming P/D workers;
     # their visibility is not a valid device exclusion list for that route.
     if check_device_overlap and physical_device in config["d_visible_devices"]:
         raise ValueError(
@@ -133,7 +185,9 @@ def apply_transport_environment(config: dict, seed_device: int, *, check_device_
         else:
             os.environ[key] = value
     return dict(
+        source=config.get("source", "legacy_plan"),
         source_pids=config["source_pids"],
+        worker_pids=config.get("worker_pids", []),
         seed_device=seed_device,
         seed_physical_device=physical_device,
         seed_visibility=visible,

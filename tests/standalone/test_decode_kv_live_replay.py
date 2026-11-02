@@ -21,7 +21,13 @@ def source(tmp_path, tail_token=False):
     log_file(log)
     proc_root = tmp_path / "proc"
     (proc_root / "1").mkdir(parents=True)
-    (proc_root / "1/environ").write_bytes(
+    (proc_root / "1/cmdline").write_bytes(b"VLLM::Worker\0")
+    (proc_root / "1/status").write_text("PPid:\t11\n")
+    (proc_root / "1/environ").write_bytes(b"HCCL_IF_IP=7.150.3.60\0ASCEND_BUFFER_POOL=4:8\0")
+    (proc_root / "11").mkdir()
+    (proc_root / "11/cmdline").write_bytes(b"python3\0/usr/bin/vllm\0serve\0/model\0")
+    (proc_root / "11/environ").write_bytes(
+        b"PATH=/usr/bin\0"
         b"HCCL_INTRA_ROCE_ENABLE=1\0ASCEND_BUFFER_POOL=4:8\0"
         b"HCCL_IF_IP=7.150.3.60\0HCCL_SOCKET_IFNAME=enp67s0f5\0ASCEND_RT_VISIBLE_DEVICES=0,1,2,3\0"
     )
@@ -116,7 +122,8 @@ def test_metadata_prepare_uses_complete_receive_and_isolated_keys(tmp_path, monk
     assert plan["seed_mode"] == "decode_receive"
     assert plan["transport"]["environment"]["HCCL_INTRA_ROCE_ENABLE"] == "1"
     assert plan["transport"]["environment"]["ASCEND_BUFFER_POOL"] == "4:8"
-    assert plan["transport"]["source_pids"] == [1]
+    assert plan["transport"]["source_pids"] == [11]
+    assert plan["transport"]["worker_pids"] == [1]
     assert cached == (11 if tail_token else 10)
     assert payload["prompt"] == list(range(11)) + ([99] if tail_token else [])
     assert payload["kv_transfer_params"] == {"lmcache.tag.decode_replay": plan["replay_tag"]}
