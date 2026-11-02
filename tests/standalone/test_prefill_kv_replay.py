@@ -478,6 +478,7 @@ def test_real_case_frontier_recomputes_372_not_90(tmp_path, monkeypatch):
 @pytest.mark.parametrize("cached", [8, 0, None])
 def test_existing_pd_orchestration_and_cache_miss_verdict(tmp_path, monkeypatch, cached):
     make_run(tmp_path / "run")
+    snapshot(tmp_path / "snapshots")
     log_file(tmp_path / "p.log")
     monkeypatch.setattr(R, "REPO", tmp_path)
     active = []
@@ -526,6 +527,8 @@ def test_existing_pd_orchestration_and_cache_miss_verdict(tmp_path, monkeypatch,
         "127.0.0.1",
         "--run-dir",
         str(tmp_path / "run"),
+        "--snapshot-root",
+        str(tmp_path / "snapshots"),
         "--p-logs",
         str(tmp_path / "p.log"),
         "--base-url",

@@ -3,7 +3,7 @@
 """Read previous raw KV files and replay one turn through an existing PD service.
 
 No model/server is started. Replay requires the opt-in LMCache file reader. Run on the client/P host and use
---snapshot-host when raw KV lives on D.
+--snapshot-hosts to find the previous request's raw KV across D hosts.
 """
 
 from __future__ import annotations
@@ -24,10 +24,11 @@ import traceback
 import urllib.parse
 import urllib.request
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path, PurePosixPath
 
 from decode_kv_compare import request_key
+from kv_replay_discovery import candidate_hosts, select_snapshot
 from kv_replay_files import attach_source, configure_plan, require_enabled, source_stats
 from kv_replay_snapshot import PREFIX as FILE_PREFIX
 from kv_replay_snapshot import live_contract, token_digest
@@ -186,7 +187,8 @@ def prepare(args, output: Path) -> tuple[dict, dict]:
     save_json(output / "file_plan.json", plan)
     print(
         f"{PREFIX} session={args.session} round={args.round} prompt={len(tokens)} "
-        f"expected_cached={cached} recompute={len(tokens) - cached}",
+        f"expected_cached={cached} recompute={len(tokens) - cached} "
+        f"previous={restored['previous']} current={restored['current']}",
         flush=True,
     )
     return restored, plan
@@ -314,6 +316,12 @@ def parser() -> argparse.ArgumentParser:
     cli.add_argument("--p-url", help="Existing P API URL for tokenization, e.g. http://7.150.2.72:7910")
     cli.add_argument("--p-logs", nargs="+", default=[str(REPO / "tp4_dp4_logs" / "P_dp*.log")])
     cli.add_argument("--snapshot-host", help="SSH host containing the raw previous D snapshot; omit for local files")
+    cli.add_argument(
+        "--snapshot-hosts",
+        nargs="+",
+        default=[],
+        help="Search these D hosts for the previous request's complete snapshot",
+    )
     cli.add_argument("--snapshot-root", help="Snapshot root on its host; default: WORKSPACE/decode-kv-snapshots")
     cli.add_argument("--workspace", default=str(REPO), help="vllm-ascend path on the snapshot host/container")
     cli.add_argument("--container", help="Optional Docker container on the snapshot host")
@@ -339,7 +347,7 @@ def parser() -> argparse.ArgumentParser:
     cli.add_argument(
         "--prepare-only",
         action="store_true",
-        help="Check request/tokenization and write plan; do not read KV or generate",
+        help="Check request/tokenization and locate complete snapshot files; do not read KV bytes or generate",
     )
     cli.add_argument("--release-child", help=argparse.SUPPRESS)
     return cli
@@ -363,7 +371,9 @@ def main(argv=None) -> int:
         raise ValueError("session must be nonnegative and tp-size must be positive")
     if not all(math.isfinite(t) for t in (args.timeout, args.source_timeout)):
         raise ValueError("Timeouts must be finite")
-    args.hosts = [args.snapshot_host] if args.snapshot_host else []
+    args.hosts = candidate_hosts(args)
+    if args.hosts:
+        args.snapshot_host = args.hosts[0]
     args.password = args.password_per_host = False
     parent = REPO / "prefill-kv-replays"
     parent.mkdir(exist_ok=True)
@@ -385,10 +395,13 @@ def main(argv=None) -> int:
         report.update(
             previous=restored["previous"], current=restored["current"], expected_cached_tokens=plan["cached_tokens"]
         )
-        if args.prepare_only:
-            report["status"] = "prepared_not_run"
-            return 0
-        with password_auth(args), file_source(args, plan, output) as owner:
+        with password_auth(args), ExitStack() as stack:
+            selected = select_snapshot(args, plan, output)
+            report["snapshot_host"] = selected["host"]
+            if args.prepare_only:
+                report["status"] = "prepared_not_run"
+                return 0
+            owner = stack.enter_context(file_source(args, plan, output))
             attach_source(restored["payload"], owner, output)
             client = Client(args.base_url, args.timeout)
             print(f"{PREFIX} source=files ready; submitting original turn to {args.base_url}", flush=True)

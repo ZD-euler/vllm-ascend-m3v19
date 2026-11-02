@@ -24,7 +24,7 @@ python3 tools/prefill_kv_replay.py \
   --run-dir ./multi-turn-concurrent --session 11 --round 1 \
   --base-url http://7.150.2.72:8080 \
   --p-url http://7.150.2.72:7910 \
-  --snapshot-host root@7.150.3.60 \
+  --snapshot-hosts root@7.150.3.60 root@7.150.6.177 \
   --container vllm-ascend-v0.18.0rc1-lmcache-ascend-v0.4.3-fsi-sqh \
   --workspace /workspace/sqh/vllm-ascend \
   --remote-python /usr/local/python3.11.14/bin/python3 \
@@ -51,6 +51,22 @@ Update the tools on the client and snapshot host together. `--workspace` is the
 path inside the container; the default source is `WORKSPACE/decode-kv-snapshots`.
 Legacy snapshots without `replay.json` remain supported using the original
 `multi-turn-concurrent` directory. Source files are never overwritten.
+
+For P replay, pass **all possible D snapshot hosts** via `--snapshot-hosts`.
+The tool resolves the previous request ID from the selected run/session/round,
+then probes each host in parallel using only manifests, token metadata and file
+sizes. It selects the host with the complete matching snapshot before starting
+the file server or submitting inference. `--snapshot-host` remains available
+when the source host is already known. Do not assume a new run used the same D
+host as an earlier run, even when its session and round numbers are identical.
+
+`snapshot_discovery.json` records each host's result: `missing_directory`,
+`request_not_found`, `invalid_snapshot`, `probe_failed`, or `ready`. A missing
+request is distinct from failed SSH or a truncated/incomplete capture. If no
+host has a complete capture, replay stops without sending a completion request;
+it does not substitute another request or regenerate the prefix. If multiple
+hosts have complete copies, select one explicitly with `--snapshot-host`.
+`--prepare-only` also performs this metadata check, without reading KV payloads.
 
 ## File transport
 
