@@ -6,17 +6,17 @@
 `plot_multi_turn_overlap_concurrent.py`，详见 [并发测试说明](multi_turn_kv_reuse_concurrent.md)。
 
 向已经启动的 vLLM 服务或 PD proxy 发送一条预先写好的约 500k-token 输入，
-取得真实模型输出，再继续 50 轮短问题。每轮严格使用：
-
-```text
-本轮输入 = 上轮完整输入 + 上轮模型实际输出 + 本轮预先写好的问题及角色分隔符
-```
+取得真实模型输出，再继续 50 轮短问题。默认 `--prompt-format native`：文章作为
+第一条 user 消息，之后累积原始 assistant 回答和新的 user 问题，使用服务端实际加载
+的 chat template。模板参数 `enable_thinking=false, clear_thinking=false`。
+不硬编码角色 token，不通过“用户：”字符串截断回答。
 
 默认是 **1 次初始化 + 50 次追加，共 51 次请求**，全部串行。
-使用 `/v1/completions` 直接追加文本，保留回答中的空格、换行和思考文本，
-不重新构造 chat template，不做摘要、截断、随机采样或运行时补长前缀。
-文本前缀保持不变；重新分词时，拼接边界附近的少量 token 仍可能变化，
-不能仅凭字符相同就断言 token 或服务端缓存命中数完全相同。
+原生模板由 `/tokenize` 渲染，生成请求仍经 `/v1/completions`，直接发送渲染后的 token ID。
+每轮检查上一轮完整 prompt token 是否原样保留；失败时在生成前停止并保留检查结果。
+原始输出完整保存，模板自身可能处理首尾空白；不承诺解码后的输出再分词与生成 token
+逐个一致。`--prompt-format legacy` 恢复原来的纯文本追加模式。
+切换格式会改变初始 token，native 模式应重新预热。
 
 ## 固定输入
 
@@ -29,7 +29,8 @@
 在开发时计数，`add_special_tokens=False` 时为 **499964 token**。
 这个参考计数不代表部署的 GLM-5.3 tokenizer 必然相同。
 脚本运行时直接读取这份完整文本，实际长度以服务端返回的 `usage.prompt_tokens` 为准；
-不下载 tokenizer，不调用模型生成测试资料，也不会为凑长度而改写文件。
+不下载 tokenizer，不调用模型生成测试资料，也不会为凑长度而改写文章。
+原生模式仅去掉旧文件末尾手写的“助手：”提示，由模板提供真正的角色标记。
 
 ## 运行
 
@@ -38,6 +39,7 @@
 ```bash
 python3 tools/multi_turn_kv_reuse.py \
   --base-url http://7.150.4.174:8000 \
+  --tokenizer-url http://7.150.4.174:7910 \
   --model-name GLM-5.3-falcon \
   --rounds 50 \
   --max-tokens 128 \
@@ -45,7 +47,12 @@ python3 tools/multi_turn_kv_reuse.py \
   2>&1 | tee multi-turn-on.log
 ```
 
-`--base-url` 填实际服务地址；若走 PD proxy，填 proxy 的 IP 和端口。
+`--base-url` 填实际生成服务地址；若走 PD proxy，填 proxy 的 IP 和端口。
+`--tokenizer-url` 指向提供 `/tokenize` 的直接 P 服务；不填时使用 `--base-url`。
+proxy 不提供 `/tokenize` 时需显式填写 P 地址。短消息模板预检查先于长请求，
+每轮模板渲染和 token 校验不计入生成请求的 TTFT。
+本次同时修正 enhanced proxy 对整数 token 列表的长度统计；使用该 proxy 时更新并重启
+proxy，使负载分配使用正确的输入长度，P/D 模型进程不需要为模板改动重启。
 末尾带 `/v1` 也可以。`--model-name` 对应服务的 `--served-model-name`，
 省略时取 `/v1/models` 返回的第一个模型。
 默认每次最多输出 128 token，适合测试长历史、短增量；需要长回答可改为 `--max-tokens 4000`。
@@ -82,15 +89,18 @@ metrics.csv             逐轮指标
 summary.json            状态、运行参数、全部已完成轮次的指标
 turns/000/              初始化请求
 turns/001/ ... 050/     后续每轮
-  added_input.txt       本轮追加的问题及角色分隔符；初始化为空
+  added_input.txt       本轮追加的问题（legacy 还含角色分隔符）；初始化为空
   output.txt            本轮实际输出，保留空白
-  request.json          请求参数、request ID、输入字符数；不重复保存完整前缀
+  request.json          请求参数、request ID、格式、原生 token 数
+  prompt_token_delta.json 首轮完整 token；后续只保存追加 token
+  prefix_check.json      token 前缀检查结果
   response.json         合并后的回答和 usage
   events.jsonl          服务端原始流式 JSON 事件
 ```
 
-要重建第 N 轮输入，从 `initial_prompt.txt` 开始，按顺序追加第 0 至 N-1 轮的
-`output.txt` 和其后一轮的 `added_input.txt` 即可。
+native 模式按各轮 `prompt_token_delta.json` 恢复精确的 token 输入。
+legacy 模式仍从初始文本开始追加回答和问题。
+正文字符数不包含原生模板控制标记，真实输入长度看 `prompt_tokens`。
 初始化轮编号为 0，50 个后续问题编号为 1 至 50。
 失败轮的部分输出和已收到的事件会保留，但不会用于发送下一轮。
 同一份固定前缀与问题可用于分别开启、关闭 layerwise 后运行；

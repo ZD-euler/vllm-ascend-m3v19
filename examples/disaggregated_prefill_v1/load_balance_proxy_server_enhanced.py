@@ -565,6 +565,8 @@ class TokenizerAnalyzer:
         if isinstance(prompt, str):
             return len(self.tokenizer.encode(prompt, add_special_tokens=True))
         elif isinstance(prompt, list):
+            if all(type(token) is int for token in prompt):
+                return len(prompt)
             if all(isinstance(p, str) for p in prompt):
                 return sum(len(self.tokenizer.encode(p, add_special_tokens=True)) for p in prompt)
             elif all(isinstance(p, dict) for p in prompt):
@@ -2619,6 +2621,12 @@ async def _handle_completions(api: str, request: Request):
         else:
             if analysis:
                 request_length = analysis.prompt_tokens
+            elif isinstance(req_data.get("prompt"), list) and all(
+                type(token) is int for token in req_data["prompt"]
+            ):
+                # Token IDs from native chat rendering already have an exact
+                # length, even with tokenizer analysis disabled.
+                request_length = len(req_data["prompt"])
             else:
                 # Rough estimate: character count / 4 for text content
                 # This is much closer to token count than raw byte length

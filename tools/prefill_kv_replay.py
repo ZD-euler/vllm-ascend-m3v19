@@ -32,6 +32,7 @@ from kv_replay_discovery import candidate_hosts, select_snapshot
 from kv_replay_files import attach_source, configure_plan, require_enabled, source_stats
 from kv_replay_snapshot import PREFIX as FILE_PREFIX
 from kv_replay_snapshot import live_contract, token_digest
+from multi_turn_chat import NATIVE_FORMAT, TEMPLATE_KWARGS, restore_native_tokens
 from multi_turn_kv_reuse_concurrent import Client, read_text, save_json
 from pd_tensor_collect import ASKPASS_PASSWORD_ENV, password_auth, remote_command, run_ssh
 
@@ -52,6 +53,8 @@ def restore_turn(root: Path, session: int, turn: int) -> dict:
     if not directory.is_relative_to(root.resolve()):
         raise ValueError("Session directory is outside the run")
     history = read_text(directory / "session_prefix.txt") + read_text(root / "initial_prompt.txt")
+    messages = [dict(role="user", content=history)]
+    previous_messages = None
     measurements = {(r["session_id"], r["round"]): r for r in summary["warmups"] + summary["rounds"]}
     previous_text = None
     for current in range(turn + 1):
@@ -59,8 +62,11 @@ def restore_turn(root: Path, session: int, turn: int) -> dict:
         request = json.loads((folder / "request.json").read_text(encoding="utf-8"))
         if current:
             previous_text = history
-            history += read_text(directory / "turns" / f"{current - 1:03d}" / "output.txt")
-            history += read_text(folder / "added_input.txt")
+            answer = read_text(directory / "turns" / f"{current - 1:03d}" / "output.txt")
+            question = read_text(folder / "added_input.txt")
+            history += answer + question
+            previous_messages = list(messages)
+            messages.extend((dict(role="assistant", content=answer), dict(role="user", content=question)))
         if len(history) != request["prompt_chars"]:
             raise ValueError(f"Reconstructed prompt length differs at round {current}; run files changed")
         row = measurements[session, current]
@@ -73,12 +79,18 @@ def restore_turn(root: Path, session: int, turn: int) -> dict:
     payload = {
         key: value
         for key, value in request.items()
-        if key not in ("session_id", "round", "prompt_chars", "prompt_source")
+        if key not in ("session_id", "round", "prompt_chars", "prompt_source", "prompt_format", "prompt_token_count")
     }
     payload.update(prompt=history, request_id="replay-" + uuid.uuid4().hex)
+    native = request.get("prompt_format") == NATIVE_FORMAT
+    if native:
+        payload["prompt"] = restore_native_tokens(directory, turn)
     return dict(
         payload=payload,
         previous_text=previous_text,
+        native_messages=messages if native else None,
+        previous_messages=previous_messages if native else None,
+        previous_tokens=restore_native_tokens(directory, turn - 1) if native else None,
         previous=request_key(previous["response_id"]),
         current=request_key(row["response_id"]),
         original_metrics=row,
@@ -148,8 +160,30 @@ def prepare(args, output: Path) -> tuple[dict, dict]:
     selected = next((m for m in models if m["id"] == model), None)
     if not selected or not selected.get("root"):
         raise ValueError(f"Live P does not serve the original model alias {model!r}")
-    tokens = http_json(args.p_url, "/tokenize", dict(model=model, prompt=restored["payload"]["prompt"]))["tokens"]
-    previous_tokens = http_json(args.p_url, "/tokenize", dict(model=model, prompt=restored["previous_text"]))["tokens"]
+    if restored["native_messages"] is not None:
+
+        def tokenize_messages(messages):
+            return http_json(
+                args.p_url,
+                "/tokenize",
+                dict(
+                    model=model,
+                    messages=messages,
+                    add_generation_prompt=True,
+                    add_special_tokens=False,
+                    chat_template_kwargs=dict(TEMPLATE_KWARGS),
+                ),
+            )["tokens"]
+
+        tokens = tokenize_messages(restored["native_messages"])
+        previous_tokens = tokenize_messages(restored["previous_messages"])
+        if tokens != restored["payload"]["prompt"] or previous_tokens != restored["previous_tokens"]:
+            raise ValueError("Live native template/tokenizer differs from the archived input token IDs")
+    else:
+        tokens = http_json(args.p_url, "/tokenize", dict(model=model, prompt=restored["payload"]["prompt"]))["tokens"]
+        previous_tokens = http_json(args.p_url, "/tokenize", dict(model=model, prompt=restored["previous_text"]))[
+            "tokens"
+        ]
     for ids, metrics in ((tokens, restored["original_metrics"]), (previous_tokens, restored["previous_metrics"])):
         if len(ids) != metrics["prompt_tokens"]:
             raise ValueError(
@@ -165,7 +199,21 @@ def prepare(args, output: Path) -> tuple[dict, dict]:
         restored["payload"]["max_tokens"] = args.output_tokens
     save_json(output / "request.json", restored["payload"])
     save_json(output / "input_tail_tokens.json", dict(start=cached, end=len(tokens), token_ids=tokens[cached:]))
-    save_json(output / "original.json", {k: v for k, v in restored.items() if k not in ("payload", "previous_text")})
+    save_json(
+        output / "original.json",
+        {
+            k: v
+            for k, v in restored.items()
+            if k
+            not in (
+                "payload",
+                "previous_text",
+                "native_messages",
+                "previous_messages",
+                "previous_tokens",
+            )
+        },
+    )
     remote_repo = PurePosixPath(args.workspace) if args.snapshot_host else REPO
     snapshot_root = args.snapshot_root or str(remote_repo / "decode-kv-snapshots")
     lease = uuid.uuid4().hex

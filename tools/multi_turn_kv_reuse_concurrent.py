@@ -27,6 +27,8 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from multi_turn_chat import ChatRenderer, NativeDialogue, add_chat_arguments, complete_native, initial_user_text
+
 QUESTION_PREFIX = "\n\n用户："
 QUESTION_SUFFIX = "\n助手：\n"
 DEFAULT_ROUNDS = 50
@@ -235,7 +237,12 @@ def run(args: argparse.Namespace, root: Path, initial_prompt: str, questions: li
         "total_requests": args.concurrency * (args.rounds + 1),
         "max_tokens": args.max_tokens,
         "initial_prompt_chars": len(initial_prompt),
-        "composition": "next_prompt = previous_prompt + previous_actual_output + added_input.txt",
+        "prompt_format": args.prompt_format,
+        "composition": (
+            "native template over cumulative user/assistant messages"
+            if args.prompt_format == "native"
+            else "next_prompt = previous_prompt + previous_actual_output + added_input.txt"
+        ),
         "timing_scope": "Client stream timing includes HTTP transfer and queueing; token gaps are estimates.",
         "context": args.context_metadata,
         "warmups": [],
@@ -249,6 +256,11 @@ def run(args: argparse.Namespace, root: Path, initial_prompt: str, questions: li
     try:
         model = args.model or client.model_name()
         summary["model"] = model
+        renderer = None
+        if args.prompt_format == "native":
+            renderer = ChatRenderer(args.tokenizer_url or args.base_url, model, args.timeout)
+            renderer.preflight(root)
+            print("[MULTI_TURN] Native chat template; thinking disabled; each prompt prefix is verified.", flush=True)
         print(
             f"[MULTI_TURN] model={model} concurrency={args.concurrency} "
             f"warmups={args.concurrency} measured={args.concurrency * args.rounds} artifacts={root.resolve()}",
@@ -281,6 +293,7 @@ def run(args: argparse.Namespace, root: Path, initial_prompt: str, questions: li
                     client=Client(args.base_url, args.timeout),
                     directory=directory,
                     history=marker + initial_prompt,
+                    dialogue=NativeDialogue(renderer, marker + initial_prompt) if renderer else None,
                     previous_output="",
                     previous_prompt_chars=0,
                 )
@@ -298,9 +311,12 @@ def run(args: argparse.Namespace, root: Path, initial_prompt: str, questions: li
                 current_session, current_round = session_id, turn
                 session = sessions[session_id]
                 question = questions[turn - 1] if turn else ""
-                added = QUESTION_PREFIX + question + QUESTION_SUFFIX if turn else ""
+                dialogue = session["dialogue"]
+                added = (question if dialogue else QUESTION_PREFIX + question + QUESTION_SUFFIX) if turn else ""
                 if turn:
                     session["history"] += session["previous_output"] + added
+                    if dialogue:
+                        dialogue.append(session["previous_output"], question)
                 history = session["history"]
                 directory = session["directory"] / "turns" / f"{turn:03d}"
                 directory.mkdir(parents=True)
@@ -330,7 +346,11 @@ def run(args: argparse.Namespace, root: Path, initial_prompt: str, questions: li
                     f"begin request_id={request_id} chars={len(history)}",
                     flush=True,
                 )
-                future = executor.submit(session["client"].complete, payload, directory)
+                future = (
+                    executor.submit(complete_native, session["client"], dialogue, payload, directory)
+                    if dialogue
+                    else executor.submit(session["client"].complete, payload, directory)
+                )
                 pending[future] = (
                     session_id,
                     {
@@ -414,6 +434,7 @@ def run(args: argparse.Namespace, root: Path, initial_prompt: str, questions: li
 def main(argv: list[str] | None = None) -> int:
     assets = Path(__file__).resolve().parent / "multi_turn_kv_assets"
     parser = argparse.ArgumentParser(description=__doc__)
+    add_chat_arguments(parser)
     parser.add_argument("--base-url", default="http://127.0.0.1:8000", help="Service or PD proxy address")
     parser.add_argument("--model-name", "--model", dest="model", help="Served model name; default: /v1/models")
     parser.add_argument("--prefix-file", type=Path, default=assets / "prefix_500k.txt")
@@ -444,6 +465,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("rounds must be nonnegative; concurrency, max-tokens and timeout must be positive")
     try:
         initial_prompt = read_text(args.prefix_file)
+        if args.prompt_format == "native":
+            initial_prompt = initial_user_text(initial_prompt)
         questions_text = read_text(args.questions_file)
         questions = [line.strip() for line in questions_text.splitlines() if line.strip()]
         if not initial_prompt.strip():
@@ -451,6 +474,11 @@ def main(argv: list[str] | None = None) -> int:
         if len(questions) < args.rounds:
             raise ValueError(f"Need {args.rounds} prewritten questions, found {len(questions)}")
         initial_prompt, args.context_metadata = truncate_prefix(initial_prompt, args.context_tokens, args.tokenizer)
+        if args.prompt_format == "native":
+            initial_prompt = initial_user_text(initial_prompt)
+            initial_prompt = initial_prompt.replace(
+                "\n\n用户：请解读以上资料，简述主要结论和依据。", "\n\n请解读以上资料，简述主要结论和依据。"
+            )
         root = args.output_dir or Path(
             f"multi-turn-kv-concurrent-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
         )

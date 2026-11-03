@@ -22,6 +22,8 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from multi_turn_chat import ChatRenderer, NativeDialogue, add_chat_arguments, complete_native, initial_user_text
+
 QUESTION_PREFIX = "\n\n用户："
 QUESTION_SUFFIX = "\n助手：\n"
 DEFAULT_ROUNDS = 50
@@ -182,7 +184,12 @@ def run(args: argparse.Namespace, root: Path, initial_prompt: str, questions: li
         "total_requests": args.rounds + 1,
         "max_tokens": args.max_tokens,
         "initial_prompt_chars": len(initial_prompt),
-        "composition": "next_prompt = previous_prompt + previous_actual_output + added_input.txt",
+        "prompt_format": args.prompt_format,
+        "composition": (
+            "native template over cumulative user/assistant messages"
+            if args.prompt_format == "native"
+            else "next_prompt = previous_prompt + previous_actual_output + added_input.txt"
+        ),
         "timing_scope": "Client stream timing includes HTTP transfer and queueing; token gaps are estimates.",
         "rounds": [],
     }
@@ -191,18 +198,28 @@ def run(args: argparse.Namespace, root: Path, initial_prompt: str, questions: li
     try:
         model = args.model or client.model_name()
         summary["model"] = model
+        renderer = None
+        if args.prompt_format == "native":
+            renderer = ChatRenderer(args.tokenizer_url or args.base_url, model, args.timeout)
+            renderer.preflight(root)
+            print("[MULTI_TURN] Native chat template; thinking disabled; each prompt prefix is verified.", flush=True)
         print(f"[MULTI_TURN] model={model} requests={args.rounds + 1} artifacts={root.resolve()}", flush=True)
         print("[MULTI_TURN] Fixed text is unchanged; actual token count comes from server usage.", flush=True)
         print("[MULTI_TURN] cached_tokens=null means not reported; it does not mean a cache miss.", flush=True)
         history, previous_output, previous_prompt_chars = initial_prompt, "", 0
+        dialogue = NativeDialogue(renderer, initial_prompt) if renderer else None
         with root.joinpath("metrics.csv").open("w", newline="", encoding="utf-8") as metrics_file:
             metrics = csv.DictWriter(metrics_file, fieldnames=METRIC_FIELDS)
             metrics.writeheader()
             for current_round in range(args.rounds + 1):
                 question = questions[current_round - 1] if current_round else ""
-                added = QUESTION_PREFIX + question + QUESTION_SUFFIX if current_round else ""
+                added = (
+                    (question if dialogue else QUESTION_PREFIX + question + QUESTION_SUFFIX) if current_round else ""
+                )
                 if current_round:
                     history += previous_output + added
+                    if dialogue:
+                        dialogue.append(previous_output, question)
                 directory = root / "turns" / f"{current_round:03d}"
                 directory.mkdir(parents=True)
                 directory.joinpath("added_input.txt").write_bytes(added.encode("utf-8"))
@@ -230,7 +247,11 @@ def run(args: argparse.Namespace, root: Path, initial_prompt: str, questions: li
                     f"[MULTI_TURN] round={current_round:02d} begin request_id={request_id} chars={len(history)}",
                     flush=True,
                 )
-                previous_output, stats = client.complete(payload, directory)
+                previous_output, stats = (
+                    complete_native(client, dialogue, payload, directory)
+                    if dialogue
+                    else client.complete(payload, directory)
+                )
                 row = {
                     "round": current_round,
                     "phase": "followup" if current_round else "initial",
@@ -261,6 +282,7 @@ def run(args: argparse.Namespace, root: Path, initial_prompt: str, questions: li
 def main(argv: list[str] | None = None) -> int:
     assets = Path(__file__).resolve().parent / "multi_turn_kv_assets"
     parser = argparse.ArgumentParser(description=__doc__)
+    add_chat_arguments(parser)
     parser.add_argument("--base-url", default="http://127.0.0.1:8000", help="Service or PD proxy address")
     parser.add_argument("--model-name", "--model", dest="model", help="Served model name; default: /v1/models")
     parser.add_argument("--prefix-file", type=Path, default=assets / "prefix_500k.txt")
@@ -274,6 +296,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("rounds must be nonnegative; max-tokens and timeout must be positive")
     try:
         initial_prompt = read_text(args.prefix_file)
+        if args.prompt_format == "native":
+            initial_prompt = initial_user_text(initial_prompt)
         questions_text = read_text(args.questions_file)
         questions = [line.strip() for line in questions_text.splitlines() if line.strip()]
         if not initial_prompt.strip():

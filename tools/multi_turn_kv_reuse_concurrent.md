@@ -9,22 +9,30 @@
 自己的完整回答，就发送自己的下一轮，不等待其他会话。每个会话最多一个在途请求，
 可同时出现会话 0 在第 2 轮、会话 1 在第 5 轮；只有预热阶段有全局屏障。
 
-每个会话自己的输入始终是：
+默认使用 `--prompt-format native`：首轮文章放进 user 消息，之后追加上一轮原始
+assistant 回答和本轮预写 user 问题。由服务端 `/tokenize` 应用其实际加载的原生
+chat template；不硬编码 GLM 的角色 token，不添加“用户：”文本停止条件。
+模板参数为 `enable_thinking=false, clear_thinking=false`，适用于本测试的简短回答，
+避免历史思考内容被清理后改写前缀。
 
-```text
-本轮输入 = 上轮完整输入 + 上轮实际输出 + 本轮预写问题及角色分隔符
-```
+每一轮都逐 token 检查：上一轮完整 prompt 必须是本轮 prompt 的前缀。
+检查失败会保留 `prefix_check.json` 并在发送模型请求前报错。
+模板可能按其自身规则处理回答首尾空白；原始回答仍完整保存在 `output.txt`。
+这里校验的是上一轮 prompt 的 token 前缀，不把“模型生成 token 经文本解码后
+再次分词”声明为逐 token 相同，也不保证服务端一定保留了这些 KV。
 
-会话开头加入固定的 `session=编号; timestamp_ns=时间戳; run=运行编号`。
-不同会话、不同运行的前缀不同，防止互相复用整篇文章的缓存；同一会话的标记
-在所有轮次保持不变，不会为隔离会话而破坏它自己的历史 KV 复用。
-使用 `/v1/completions`，保留回答的原始空白，不重新套 chat template、摘要或截断历史。
+会话第一条 user 消息开头加入固定的 `session=编号; timestamp_ns=时间戳; run=运行编号`。
+不同会话、不同运行的前缀不同；同一会话所有轮次使用同一个标记。
+生成仍经原来的 `/v1/completions` 和 PD proxy，prompt 改为原生模板渲染后的 token ID。
+使用 `--prompt-format legacy` 可恢复原来的纯文本追加方式，旧模式不会访问 `/tokenize`。
+新旧格式的初始 token 不同，切换到 native 后需要重新预热。
 
 ## 运行
 
 ```bash
 python3 tools/multi_turn_kv_reuse_concurrent.py \
   --base-url http://7.150.4.174:8000 \
+  --tokenizer-url http://7.150.4.174:7910 \
   --model-name GLM-5.3-falcon \
   --concurrency 4 \
   --context-tokens 200k \
@@ -35,7 +43,13 @@ python3 tools/multi_turn_kv_reuse_concurrent.py \
   2>&1 | tee multi-turn-c4-200k.log
 ```
 
-- `--base-url` 是服务或 PD proxy 地址，末尾带 `/v1` 也可。
+- `--base-url` 是生成服务或 PD proxy 地址，末尾带 `/v1` 也可。
+- `--tokenizer-url` 指向直接 P 服务，提供原生模板 `/tokenize`；不填时使用 `--base-url`。
+  proxy 没有该接口时必须填直接 P 地址。此接口只分词，不运行模型；P/D 应使用相同 tokenizer。
+- 本次同时修正 enhanced proxy 对整数 token 列表的长度统计；更新后重启 proxy，
+  使负载分配使用正确输入长度。P/D 模型进程不需要为模板改动重启。
+- 正式预热前先用短消息检查模板的追加特性。每轮分词在各会话自己的线程执行，
+  不阻塞其他会话；TTFT 从随后发送生成请求开始计时，不包含这次准备时间。
 - `--model-name` 对应服务的 `--served-model-name`；省略时通过 `/v1/models` 发现模型。
 - `--concurrency` 默认 1；4 表示 4 个独立会话。默认每个会话先预热一次，再测 50 轮，
   共发出 `4 × (1 + 50)` 个请求，指标中只有 `4 × 50` 个后续请求。
@@ -45,7 +59,8 @@ python3 tools/multi_turn_kv_reuse_concurrent.py \
 - 截短文章后追加固定阅读问题；会话标记和阅读问题会增加少量 token。
   真实初始长度以预热响应的 `prompt_tokens` 为准。文章不足目标长度时不补长。
 - 该长度只控制初始文章。后续保留全部历史，随着回答和问题逐轮增长，不反复截断到 200k。
-- 不传 `--context-tokens` 时使用完整预写文章，约 500k token，不需要 tokenizer。
+- 不传 `--context-tokens` 时使用完整预写文章，约 500k token，不需要本地 tokenizer 文件；
+  native 模式仍通过服务端 `/tokenize` 渲染模板。
 - `--rounds` 是预热后的测量轮数，默认 50；`--rounds 0` 只预热。
 - `--max-tokens` 默认 128，需要长回答可改为 4000。HTTP socket timeout 默认 3600 秒，
   可用 `--timeout` 修改。服务上下文上限需容纳文章、所有历史以及当前回答预算。
@@ -88,14 +103,18 @@ sessions/000/                并发大于 1 时，每会话独立目录
   turns/001/ ... 050/        后续轮次
     added_input.txt          本轮增加的问题
     output.txt               本轮实际输出
-    request.json             请求元数据，不重复保存整篇文章
+    request.json             请求元数据、格式和原生 token 数
+    prompt_token_delta.json  首轮完整 token，后续仅保存相对上一轮追加的 token
+    prefix_check.json        上轮 token 数、共同前缀长度、是否保持不变
     response.json            完整响应及 usage
     events.jsonl             原始流式事件
 ```
 
 并发为 1 时，`session_prefix.txt`、`turns/` 直接放在输出根目录。
-重建任一会话输入：固定会话标记 + 公共初始文章 + 此会话之前的实际回答和追加问题。
-重新分词时拼接边界附近少量 token 可能变化，字符相同不保证 token 前缀完全相同。
+native 模式按 `prompt_token_delta.json` 顺序重建精确 token 输入；
+`prefill_kv_replay.py` 自动识别新格式，并在 replay 前用正在运行的 P 模板再验证一次。
+文章、问题和原始回答仍保留用于检查。`prompt_chars` / `new_input_chars` 在 native 模式
+表示消息正文字符数，不含模板添加的控制标记。原来的 legacy 文件仍按文本拼接恢复。
 
 ## 只画 TTFT，不读服务端日志
 
