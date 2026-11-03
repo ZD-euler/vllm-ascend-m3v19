@@ -510,6 +510,8 @@ class RecomputeScheduler(Scheduler):
                         )
 
                         if ext_tokens is None:
+                            if self._reject_kv_admission_error(request):
+                                continue
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
