@@ -18,7 +18,8 @@ from examples.disaggregated_prefill_v1.vllm_token_counter import VLLMTokenCounte
 @pytest.mark.parametrize("p_rank,d_rank", [(0, 0), (0, 1), (1, 0), (1, 1)])
 @pytest.mark.parametrize("file_mode", [False, True])
 @pytest.mark.parametrize("prompt", ["original prompt", [151331, 151333, 42, 43]])
-def test_source_survives_every_proxy_route(monkeypatch, proxy, p_rank, d_rank, file_mode, prompt):
+@pytest.mark.parametrize("chat", [False, True])
+def test_source_survives_every_proxy_route(monkeypatch, proxy, p_rank, d_rank, file_mode, prompt, chat):
     tag = base64.urlsafe_b64encode(json.dumps(dict(url="http://7.150.3.60:18080/random", role="PD")).encode()).decode()
     transfer = {"remote_host": "caller-must-not-override-transport"}
     if file_mode:
@@ -31,6 +32,15 @@ def test_source_survives_every_proxy_route(monkeypatch, proxy, p_rank, d_rank, f
         cache_salt="same-salt-for-p-and-d",
         kv_transfer_params=transfer,
     )
+    messages = [
+        dict(role="user", content="original prompt"),
+        dict(role="assistant", content="", reasoning="unfinished thought"),
+        dict(role="user", content="next question"),
+    ]
+    if chat:
+        request.pop("prompt")
+        request.pop("add_special_tokens")
+        request.update(messages=messages, chat_template_kwargs=dict(clear_thinking=False))
     sent = []
 
     async def post(endpoint, **kwargs):
@@ -60,12 +70,18 @@ def test_source_survives_every_proxy_route(monkeypatch, proxy, p_rank, d_rank, f
     monkeypatch.setattr(
         proxy, "global_args", NS(max_retries=1, retry_delay=0, backend_request_timeout=5), raising=False
     )
-    result = asyncio.run(proxy._handle_select_instance("/completions", request, 100))
+    api = "/chat/completions" if chat else "/completions"
+    result = asyncio.run(proxy._handle_select_instance(api, request, 100))
     assert (result.prefiller_idx, result.decoder_idx) == (p_rank, d_rank)
     assert len(sent) == 1
     for body in (sent[0], request):
-        assert body["prompt"] == prompt
-        assert body["add_special_tokens"] is False
+        if chat:
+            assert body["messages"] == messages
+            assert body["chat_template_kwargs"] == dict(clear_thinking=False)
+            assert "prompt" not in body
+        else:
+            assert body["prompt"] == prompt
+            assert body["add_special_tokens"] is False
         assert body["cache_salt"] == "same-salt-for-p-and-d"
         assert body["kv_transfer_params"].get("lmcache.tag.file_replay") == (tag if file_mode else None)
         assert body["kv_transfer_params"].get("remote_host") != "caller-must-not-override-transport"

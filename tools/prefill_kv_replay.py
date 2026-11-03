@@ -32,7 +32,7 @@ from kv_replay_discovery import candidate_hosts, select_snapshot
 from kv_replay_files import attach_source, configure_plan, require_enabled, source_stats
 from kv_replay_snapshot import PREFIX as FILE_PREFIX
 from kv_replay_snapshot import live_contract, token_digest
-from multi_turn_chat import NATIVE_FORMAT, TEMPLATE_KWARGS, restore_native_tokens
+from multi_turn_chat import CHAT_FORMAT, NATIVE_FORMAT, TEMPLATE_KWARGS, read_assistant, restore_native_tokens
 from multi_turn_kv_reuse_concurrent import Client, read_text, save_json
 from pd_tensor_collect import ASKPASS_PASSWORD_ENV, password_auth, remote_command, run_ssh
 
@@ -66,7 +66,12 @@ def restore_turn(root: Path, session: int, turn: int) -> dict:
             question = read_text(folder / "added_input.txt")
             history += answer + question
             previous_messages = list(messages)
-            messages.extend((dict(role="assistant", content=answer), dict(role="user", content=question)))
+            assistant = (
+                read_assistant(directory / "turns" / f"{current - 1:03d}")
+                if request.get("prompt_format") == CHAT_FORMAT
+                else dict(role="assistant", content=answer)
+            )
+            messages.extend((assistant, dict(role="user", content=question)))
         if len(history) != request["prompt_chars"]:
             raise ValueError(f"Reconstructed prompt length differs at round {current}; run files changed")
         row = measurements[session, current]
@@ -83,13 +88,17 @@ def restore_turn(root: Path, session: int, turn: int) -> dict:
     }
     payload.update(prompt=history, request_id="replay-" + uuid.uuid4().hex)
     native = request.get("prompt_format") == NATIVE_FORMAT
+    chat = request.get("prompt_format") == CHAT_FORMAT
     if native:
         payload["prompt"] = restore_native_tokens(directory, turn)
+    elif chat:
+        del payload["prompt"]
+        payload["messages"] = messages
     return dict(
         payload=payload,
         previous_text=previous_text,
-        native_messages=messages if native else None,
-        previous_messages=previous_messages if native else None,
+        native_messages=messages if native or chat else None,
+        previous_messages=previous_messages if native or chat else None,
         previous_tokens=restore_native_tokens(directory, turn - 1) if native else None,
         previous=request_key(previous["response_id"]),
         current=request_key(row["response_id"]),
@@ -171,13 +180,15 @@ def prepare(args, output: Path) -> tuple[dict, dict]:
                     messages=messages,
                     add_generation_prompt=True,
                     add_special_tokens=False,
-                    chat_template_kwargs=dict(TEMPLATE_KWARGS),
+                    chat_template_kwargs=restored["payload"].get("chat_template_kwargs", dict(TEMPLATE_KWARGS)),
                 ),
             )["tokens"]
 
         tokens = tokenize_messages(restored["native_messages"])
         previous_tokens = tokenize_messages(restored["previous_messages"])
-        if tokens != restored["payload"]["prompt"] or previous_tokens != restored["previous_tokens"]:
+        if restored["previous_tokens"] is not None and (
+            tokens != restored["payload"]["prompt"] or previous_tokens != restored["previous_tokens"]
+        ):
             raise ValueError("Live native template/tokenizer differs from the archived input token IDs")
     else:
         tokens = http_json(args.p_url, "/tokenize", dict(model=model, prompt=restored["payload"]["prompt"]))["tokens"]
@@ -466,9 +477,10 @@ def main(argv=None) -> int:
             )
             report["count_validation"] = validation
             report["status"] = "replay_unverified" if validation["missing"] else "replay_complete"
+            ttft_label = f"{metrics['ttft_s']:.3f}s" if metrics["ttft_s"] is not None else "n/a"
             print(
                 f"{PREFIX} cached={metrics['cached_tokens']} uncached={metrics['uncached_prompt_tokens']} "
-                f"ttft={metrics['ttft_s']:.3f}s response_id={metrics['response_id']}",
+                f"ttft={ttft_label} response_id={metrics['response_id']}",
                 flush=True,
             )
             if validation["missing"]:

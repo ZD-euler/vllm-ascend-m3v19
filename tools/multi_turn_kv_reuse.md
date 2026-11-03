@@ -6,17 +6,17 @@
 `plot_multi_turn_overlap_concurrent.py`，详见 [并发测试说明](multi_turn_kv_reuse_concurrent.md)。
 
 向已经启动的 vLLM 服务或 PD proxy 发送一条预先写好的约 500k-token 输入，
-取得真实模型输出，再继续 50 轮短问题。默认 `--prompt-format native`：文章作为
-第一条 user 消息，之后累积原始 assistant 回答和新的 user 问题，使用服务端实际加载
-的 chat template。模板参数 `enable_thinking=false, clear_thinking=false`。
-不硬编码角色 token，不通过“用户：”字符串截断回答。
+取得真实模型输出，再继续 50 轮短问题。默认 `--prompt-format native`，直接调用
+`/v1/chat/completions`：文章作为第一条 user 消息，后续只追加实际 assistant 消息和
+新的 user 问题，由服务端正常应用模型原生模板。已有历史消息不修改、不删减。
 
 默认是 **1 次初始化 + 50 次追加，共 51 次请求**，全部串行。
-原生模板由 `/tokenize` 渲染，生成请求仍经 `/v1/completions`，直接发送渲染后的 token ID。
-每轮检查上一轮完整 prompt token 是否原样保留；失败时在生成前停止并保留检查结果。
-原始输出完整保存，模板自身可能处理首尾空白；不承诺解码后的输出再分词与生成 token
-逐个一致。`--prompt-format legacy` 恢复原来的纯文本追加模式。
-切换格式会改变初始 token，native 模式应重新预热。
+客户端不额外调用 `/tokenize`，不自行拼角色标记，不强制关闭思考。
+`chat_template_kwargs` 只设置 `clear_thinking=false`，保留历史思考。
+流式的 `reasoning`（兼容 `reasoning_content`）与 `content` 都保存并带入下一轮。
+只有思考、正常结束的空回复、或输出达到长度上限均继续下一轮。
+`--prompt-format legacy` 保留原来的 `/v1/completions` 纯文本追加测试。
+切换消息格式会改变初始 token，需要重新预热。
 
 ## 固定输入
 
@@ -39,7 +39,6 @@
 ```bash
 python3 tools/multi_turn_kv_reuse.py \
   --base-url http://7.150.4.174:8000 \
-  --tokenizer-url http://7.150.4.174:7910 \
   --model-name GLM-5.3-falcon \
   --rounds 50 \
   --max-tokens 128 \
@@ -48,11 +47,7 @@ python3 tools/multi_turn_kv_reuse.py \
 ```
 
 `--base-url` 填实际生成服务地址；若走 PD proxy，填 proxy 的 IP 和端口。
-`--tokenizer-url` 指向提供 `/tokenize` 的直接 P 服务；不填时使用 `--base-url`。
-proxy 不提供 `/tokenize` 时需显式填写 P 地址。短消息模板预检查先于长请求，
-每轮模板渲染和 token 校验不计入生成请求的 TTFT。
-本次同时修正 enhanced proxy 对整数 token 列表的长度统计；使用该 proxy 时更新并重启
-proxy，使负载分配使用正确的输入长度，P/D 模型进程不需要为模板改动重启。
+native 模式只需要 proxy 地址，旧参数 `--tokenizer-url` 已不再使用。
 末尾带 `/v1` 也可以。`--model-name` 对应服务的 `--served-model-name`，
 省略时取 `/v1/models` 返回的第一个模型。
 默认每次最多输出 128 token，适合测试长历史、短增量；需要长回答可改为 `--max-tokens 4000`。
@@ -73,7 +68,7 @@ proxy，使负载分配使用正确的输入长度，P/D 模型进程不需要�
 - TTFT、请求总耗时和近似平均 token 间隔；
 - 输入字符数、本轮增加的字符数、结束原因。
 
-TTFT 从开始发送 HTTP 请求到收到第一个非空文本增量，包含上传、排队等时间。
+TTFT 从开始发送 HTTP 请求到收到第一个非空思考或正文增量，包含上传、排队等时间。
 平均 token 间隔按首末文本增量时间差除以 `completion_tokens - 1` 估计；
 MTP 或网络缓冲可能在一个增量里返回多个 token，因此它不是逐 token 的设备计时。
 客户端不把流式消息数当成 token 数。
@@ -91,14 +86,14 @@ turns/000/              初始化请求
 turns/001/ ... 050/     后续每轮
   added_input.txt       本轮追加的问题（legacy 还含角色分隔符）；初始化为空
   output.txt            本轮实际输出，保留空白
-  request.json          请求参数、request ID、格式、原生 token 数
-  prompt_token_delta.json 首轮完整 token；后续只保存追加 token
-  prefix_check.json      token 前缀检查结果
+  request.json          请求参数、request ID、消息格式、模板参数
+  assistant_message.json 原始 assistant 正文和思考，供下一轮及 replay 使用
   response.json         合并后的回答和 usage
   events.jsonl          服务端原始流式 JSON 事件
 ```
 
-native 模式按各轮 `prompt_token_delta.json` 恢复精确的 token 输入。
+native 模式按初始文章、各轮 `assistant_message.json` 和问题恢复标准 messages。
+`output.txt` 保留按流式顺序接收的思考与正文，结构化字段以 `assistant_message.json` 为准。
 legacy 模式仍从初始文本开始追加回答和问题。
 正文字符数不包含原生模板控制标记，真实输入长度看 `prompt_tokens`。
 初始化轮编号为 0，50 个后续问题编号为 1 至 50。
@@ -128,7 +123,7 @@ python3 tools/plot_multi_turn_overlap.py \
 生成白底的逐轮 TTFT 曲线，点旁标注秒数，同时输出同名 `.csv`。
 读取 `summary.json`，没有该文件时读取 `metrics.csv`；仅使用已完成轮次，
 中断的测试也可绘图，缺失 TTFT 留空。可加 `--start-round 1 --end-round 10`
-只看第 1 至 10 轮。TTFT 是从开始发送请求到收到第一个非空文本增量的客户端
+只看第 1 至 10 轮。TTFT 是从开始发送请求到收到第一个非空思考或正文增量的客户端
 耗时，包含上传、排队、PD 交接和网络时间，不能用它单独拆分服务端各阶段耗时。
 绘图需要 matplotlib，不需要开启服务端 overlap 统计。
 
