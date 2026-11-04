@@ -80,6 +80,7 @@ public:
             RoundUp<uint64_t>(m0 * k0 * sizeof(InDtype), CONST_256UL));
         l0a_base = buf.template GetBuffer<BufferType::ASCEND_L0A, InDtype>(0);
         l0b_base = buf.template GetBuffer<BufferType::ASCEND_L0B, InDtype>(0);
+        l0c_buf = buf.template GetBuffer<BufferType::ASCEND_L0C, float>(0);
         num_core = AscendC::GetBlockNum();
         core_idx = AscendC::GetBlockIdx();
         ping_flag = 1;
