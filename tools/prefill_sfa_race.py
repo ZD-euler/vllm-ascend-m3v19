@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Exercise real SFA + production bank handoffs without loading model weights.
+"""Exercise real SFA, V-up and production bank handoffs without model weights.
 
-Fixed synthetic top-k deliberately excludes the indexer and model arithmetic.
+Fixed synthetic top-k deliberately excludes the indexer and full model.
 Zero queries give an independent oracle: attention must return the mean of
 the selected BF16 values. Layer/request/position-dependent payloads distinguish
 stale banks, wrong request mappings and damaged rows. No payload is read on CPU
-until the whole submission loop has finished. Run on an idle NPU.
+until the whole submission loop has finished. V-up uses the serving method and
+fixed one-hot weights, so its expected output needs no reference matmul. Run on
+an idle NPU.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from types import SimpleNamespace
 
 BLOCK = 128
 WIDTH = 512
+V_WIDTH = 128
 ROPE = 64
 PERIOD = 257
 LAYER_SHIFT = 17
@@ -43,12 +46,15 @@ def memory_plan(args):
     source_rows = rows + (args.layers - 1) * LAYER_SHIFT
     pinned = (requests * source_rows * WIDTH + args.history * ROPE + args.layers * (total_q + requests * 8) * WIDTH) * 2
     banks = args.banks * requests * rows * (WIDTH + ROPE) * 2
-    outputs = args.layers * total_q * args.heads * WIDTH * 2
-    audit = args.layers * (requests * (args.topk - 1) * 3 + total_q * 2) * WIDTH * 2 + outputs
+    outputs = args.layers * total_q * args.heads * V_WIDTH * 2
+    sfa_output = total_q * args.heads * WIDTH * 2
+    weights = args.heads * WIDTH * V_WIDTH * 2
+    audit = args.layers * (requests * (args.topk - 1) * 3 + total_q * 2) * WIDTH * 2
     return dict(
         pinned_gib=round(pinned / 2**30, 2),
-        device_gib_without_workspace=round((banks + outputs) / 2**30, 2),
+        device_gib_without_workspace=round((banks + outputs + sfa_output + weights) / 2**30, 2),
         audit_extra_device_gib=round(audit / 2**30, 2),
+        hold_sfa_extra_device_gib=round(args.layers * sfa_output / 2**30, 2),
     )
 
 
@@ -82,6 +88,17 @@ def expected_attention(torch, indices, layer, request, column_count=WIDTH):
     prefix = values(torch, indices[0, :-1].long() + layer * LAYER_SHIFT, request, column_count)
     tail = values(torch, indices[:, -1].long() + layer * LAYER_SHIFT, request, column_count)
     return (prefix.float().sum(0)[None, :] + tail.float()) / indices.shape[1]
+
+
+def projection_columns(torch):
+    return torch.arange(V_WIDTH) * 3 % WIDTH
+
+
+def expected_projected(torch, attention, heads):
+    """Account for the SFA output cast, then evaluate the one-hot projection."""
+    selected = attention.to(torch.bfloat16)[:, projection_columns(torch)]
+    signs = 1 - 2 * (torch.arange(heads) % 2)
+    return (selected[:, None, :].float() * signs[None, :, None]).reshape(attention.shape[0], heads * V_WIDTH)
 
 
 def compare(torch, actual, expected, *, exact=False):
@@ -137,12 +154,21 @@ class Fixture:
         self.b = t.ones((128, args.heads * WIDTH), dtype=t.bfloat16, device=runtime.device)
         self.b[64:].fill_(-1)  # Real matmul, exactly zero output.
         self.q_rope = t.zeros((self.total_q, args.heads, ROPE), dtype=t.bfloat16, device=runtime.device)
+        weight = t.zeros((args.heads, WIDTH, V_WIDTH), dtype=t.bfloat16)
+        weight[:, projection_columns(t), t.arange(V_WIDTH)] = (1 - 2 * (t.arange(args.heads) % 2))[:, None].to(
+            t.bfloat16
+        )
+        self.v_up_weight = weight.to(runtime.device)
         runtime.npu.synchronize()
 
     def physical_request(self, request):
         return self.requests - 1 - request
 
     def run(self, mode, observe=False):
+        with self.rt.torch.inference_mode():
+            return self._run(mode, observe)
+
+    def _run(self, mode, observe=False):
         rt, args = self.rt, self.args
         t, npu = rt.torch, rt.npu
         compute = npu.current_stream()
@@ -156,13 +182,14 @@ class Fixture:
         connector._layerwise_prefill_dma_streams = {(0, b): s for b, s in enumerate(streams)}
         connector.load_stream = streams[0]
         connector.fence_debug = (
-            rt.fence_cls("P", 0, {"LMCACHE_PREFILL_FENCE_DEBUG": mode}) if mode in ("p_sfa", "p_use") else None
+            rt.fence_cls("P", 0, {"LMCACHE_PREFILL_FENCE_DEBUG": mode}) if mode in ("p_sfa", "p_use", "p_vup") else None
         )
         _, _, _, loads = connector._layerwise_prefill_transfer_state()
         request_ids = tuple(f"r{r}" for r in range(self.requests))
         host = {"dtype": t.bfloat16, "pin_memory": rt.device != "cpu"}
         saved = [t.full((args.layers, q + len(self.probes), WIDTH), -9, **host) for q in self.queries]
         outputs, observations, events = [], [], []
+        held_sfa = []
         loaded_samples = {}
         npu.synchronize()  # Finish poison/constant setup before any H2D.
 
@@ -245,16 +272,31 @@ class Fixture:
                     layout_kv="PA_BSND",
                     sparse_mode=3,
                 )
-                outputs.append(result)
+                if mode == "hold_sfa":
+                    # Deliberately change only this tensor's lifetime; do not
+                    # insert a copy or device fence into the control run.
+                    held_sfa.append(result)
                 if mode == "serial":
                     compute.synchronize()
                 if observe:
                     observations.append((before, snapshot(b), query.clone()))
                 used = npu.Event()
                 used.record(compute)
-                events.append(used)
                 connector.record_layerwise_prefill_bank_use(layer, 0, used)
-            save_and_advance(args.layers - 1)
+                if mode == "after_bank_wait":
+                    # Distinguish p_use's wait-before-enqueue from waiting for
+                    # the identical event immediately after the bank handoff.
+                    used.synchronize()
+                if layer == args.layers - 1:
+                    # The final layer has no following entry callback. Serving
+                    # submits its save before V-up, after the last-use event.
+                    save_and_advance(layer)
+                # Assignment releases the original SFA output as in serving.
+                # Do not keep it in outputs or another local in ordinary modes.
+                result = rt.projection(result, self.v_up_weight)
+                if mode == "p_vup":
+                    connector.synchronize_prefill_vup_output(layer, 0)
+                outputs.append(result)
         finally:
             # Also retain raw-pointer owners until partial submissions finish on error.
             npu.synchronize()
@@ -280,7 +322,9 @@ class Fixture:
             row = 0
             for r, q in enumerate(self.queries):
                 expected = expected_attention(t, self.indices_cpu[row : row + q], layer, r)
-                check("sfa_output", output[row : row + q].cpu(), expected[:, None, :], layer, r)
+                check("vup_output", output[row : row + q].cpu(), expected_projected(t, expected, args.heads), layer, r)
+                if held_sfa:
+                    check("sfa_output", held_sfa[layer][row : row + q].cpu(), expected[:, None, :], layer, r)
                 tail_pos = t.arange(args.history, args.history + q) + layer * LAYER_SHIFT
                 check("save_new_kv", saved[r][layer, :q], values(t, tail_pos, r), layer, r, True)
                 history = values(t, self.probes + layer * LAYER_SHIFT, r)
@@ -299,6 +343,11 @@ class Fixture:
             first_by_stage.setdefault(failure["stage"], failure)
         return dict(
             mode=mode,
+            projection_branch=getattr(rt, "projection_branch", "injected"),
+            sfa_shape=[self.total_q, args.heads, WIDTH],
+            vup_shape=[self.total_q, args.heads * V_WIDTH],
+            output_stage="vup_output",
+            retain_sfa_output=mode == "hold_sfa",
             observe_inputs=observe,
             passed=not failures,
             seconds=round(time.perf_counter() - started, 3),
@@ -319,6 +368,12 @@ def main():
     parser.add_argument("--heads", type=int, default=16)
     parser.add_argument("--topk", type=int, default=2048)
     parser.add_argument("--repeat", type=int, default=2)
+    parser.add_argument(
+        "--modes",
+        nargs="+",
+        choices=("event", "p_sfa", "p_use", "after_bank_wait", "p_vup", "hold_sfa"),
+        default=["event", "p_sfa", "p_use", "after_bank_wait", "p_vup", "hold_sfa"],
+    )
     parser.add_argument("--output", default="prefill-sfa-race.json")
     args = parser.parse_args()
     if min(args.history, args.layers, args.banks, args.heads, args.repeat, *args.queries) <= 0:
@@ -341,6 +396,27 @@ def main():
     from lmcache_ascend.v1.kv_fence_debug import KVFenceDebug
     from lmcache_ascend.v1.npu_connector.npu_connectors import VLLMPagedMemLayerwiseNPUConnector
 
+    from vllm_ascend.attention.sfa_v1 import BMM_TRANS_MAX_SUPPORTED_TOKENS, AscendSFAImpl
+
+    # The serving method only needs these dimensions and W_UV; no model or
+    # alternate implementation of the projection is constructed here.
+    projection_state = SimpleNamespace(
+        local_num_heads=args.heads,
+        kv_lora_rank=WIDTH,
+        v_head_dim=V_WIDTH,
+    )
+
+    def projection(x, weight):
+        projection_state.W_UV = weight
+        return AscendSFAImpl._v_up_proj(projection_state, x)
+
+    projection_branch = (
+        "custom_batch_matmul_transpose"
+        if sum(args.queries) <= BMM_TRANS_MAX_SUPPORTED_TOKENS
+        and hasattr(torch.ops._C_ascend, "batch_matmul_transpose")
+        else "native_torch_bmm"
+    )
+
     rt = SimpleNamespace(
         torch=torch,
         npu=torch.npu,
@@ -349,6 +425,8 @@ def main():
         connector_cls=VLLMPagedMemLayerwiseNPUConnector,
         fence_cls=KVFenceDebug,
         sfa=torch.ops._C_ascend.npu_sparse_flash_attention,
+        projection=projection,
+        projection_branch=projection_branch,
     )
     emit(
         event="setup",
@@ -357,7 +435,11 @@ def main():
         torch_npu=torch_npu.__version__,
         task_queue=os.getenv("TASK_QUEUE_ENABLE"),
         memory=memory_plan(args),
-        scope="real SFA + bank DMA; synthetic Q/KV/topk, no indexer/model/PD transport",
+        projection_branch=projection_branch,
+        scope=(
+            "real SFA + serving V-up + bank DMA; synthetic Q/KV/topk/weights; "
+            "no indexer, FFN, TP communication, graph capture/replay or PD transport"
+        ),
     )
     fixture = Fixture(rt, args)
     results = []
@@ -371,7 +453,7 @@ def main():
         emit(event="control_failed", message="Serial control failed; stop, do not classify as an overlap race.")
         return 2
     for repeat in range(args.repeat):
-        for mode in ("event", "p_sfa", "p_use"):
+        for mode in args.modes:
             emit(event="running", repeat=repeat, mode=mode)
             result = fixture.run(mode)
             result["repeat"] = repeat
@@ -384,12 +466,24 @@ def main():
                 results.append(observed)
                 emit_result(observed)
                 output.write_text(json.dumps(results, indent=2), encoding="utf-8")
-    reproduced = any(not r["passed"] for r in results if r["mode"] == "event" and not r["observe_inputs"])
+    tested_modes = {r["mode"] for r in results if r["mode"] != "serial" and not r["observe_inputs"]}
+    failed_modes = sorted({r["mode"] for r in results if not r["passed"] and not r["observe_inputs"]})
+    status = (
+        "reproduced"
+        if "event" in failed_modes
+        else "selected_modes_failed"
+        if failed_modes
+        else "not_reproduced"
+        if "event" in tested_modes
+        else "selected_modes_passed"
+    )
     emit(
         event="complete",
-        status="reproduced" if reproduced else "not_reproduced",
+        status=status,
+        event_tested="event" in tested_modes,
+        failed_modes=failed_modes,
         report=str(output.resolve()),
-        scope="SFA + bank handoff only; not_reproduced does not certify full serving correctness",
+        scope="SFA + serving V-up + bank handoff; not_reproduced does not certify full serving correctness",
     )
     return int(not all(r["passed"] for r in results))
 
