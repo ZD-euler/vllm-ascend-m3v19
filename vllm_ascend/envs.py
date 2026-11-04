@@ -40,6 +40,10 @@ def _strict_bool_env(name: str, default: bool = False) -> bool:
 # begin-env-vars-definition
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Mirror LMCache's existing non-secret diagnostic selector; default off.
+    # p_sfa opts into a P-only current-stream fence before latent SFA. Other
+    # stages are handled by LMCache; the model caches this selector at startup.
+    "LMCACHE_PREFILL_FENCE_DEBUG": lambda: os.getenv("LMCACHE_PREFILL_FENCE_DEBUG", "").strip().lower(),
     # Raw tensors for real PD diagnostics. Empty (default) disables all hooks.
     # Otherwise an absolute run directory, e.g. /repo/pd-tensor-dump/case-on.
     # Non-secret setting; files contain request/model data. Requires eager,

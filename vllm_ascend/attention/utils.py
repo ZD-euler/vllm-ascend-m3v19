@@ -784,6 +784,18 @@ def layerwise_prefill_transfer_window_supported() -> bool:
     return capability is True and callable(submit_load) and callable(finish_save)
 
 
+def synchronize_prefill_sfa_inputs(layer_name: str | None) -> None:
+    """Route the selected pre-SFA diagnostic fence through the live connector."""
+    connector = get_kv_transfer_group()
+    synchronize = getattr(connector, "synchronize_prefill_sfa_inputs", None)
+    if layer_name is None or not callable(synchronize):
+        raise RuntimeError(
+            "p_sfa requires a registered layer and the diagnostic connector API; "
+            "update LMCache and LMCache-Ascend together with vllm-ascend"
+        )
+    synchronize(layer_name)
+
+
 def record_layerwise_prefill_bank_use(layer_name: str) -> None:
     """Record a P bank's final access and order its next DMA after that event."""
     connector = get_kv_transfer_group()

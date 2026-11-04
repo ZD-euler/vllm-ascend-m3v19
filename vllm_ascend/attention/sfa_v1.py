@@ -78,6 +78,7 @@ from vllm_ascend.attention.utils import (
     maybe_submit_layerwise_prefill_load,
     record_layerwise_prefill_bank_use,
     staged_sfa_connector_supports_sparse_load,
+    synchronize_prefill_sfa_inputs,
     trace_layerwise_kv,
     trans_rope_weight,
     transdata,
@@ -2089,6 +2090,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         self._layerwise_prefill_p_node = bool(
             self.is_kv_producer and envs.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
         )
+        self._prefill_sfa_input_fence = (
+            self._layerwise_prefill_p_node and "p_sfa" in envs.LMCACHE_PREFILL_FENCE_DEBUG.split(",")
+        )
         self.layer_name = kwargs.get("layer_name")
         if self._layerwise_prefill_p_node:
             self._layerwise_prefill_mtp = bool(
@@ -3039,6 +3043,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                     f"{tuple(decode_req_indices.shape) if decode_req_indices is not None else None} "
                     f"decode_req_indices_sample={decode_req_indices_sample}"
                 )
+        # Complete Q/KV/top-k preparation and queued bank waits at this exact
+        # point. p_sfa does not wait for SFA or alter the later bank-use event.
+        if getattr(self, "_prefill_sfa_input_fence", False):
+            synchronize_prefill_sfa_inputs(layer_name)
         attn_output = torch.ops._C_ascend.npu_sparse_flash_attention(
             query=ql_nope,
             key=kv,
