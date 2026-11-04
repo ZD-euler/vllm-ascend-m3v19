@@ -79,6 +79,7 @@ from vllm_ascend.attention.utils import (
     record_layerwise_prefill_bank_use,
     staged_sfa_connector_supports_sparse_load,
     synchronize_prefill_sfa_inputs,
+    synchronize_prefill_vup_output,
     trace_layerwise_kv,
     trans_rope_weight,
     transdata,
@@ -2092,6 +2093,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         self._prefill_sfa_input_fence = (
             self._layerwise_prefill_p_node and "p_sfa" in envs.LMCACHE_PREFILL_FENCE_DEBUG.split(",")
+        )
+        self._prefill_vup_output_fence = (
+            self._layerwise_prefill_p_node and "p_vup" in envs.LMCACHE_PREFILL_FENCE_DEBUG.split(",")
         )
         self.layer_name = kwargs.get("layer_name")
         if self._layerwise_prefill_p_node:
@@ -6611,6 +6615,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
 
         attn_output = self._v_up_proj(attn_output)
+        # Keep the bank-use event at the end of SFA. This optional diagnostic
+        # waits later, after v_up, before weight prefetch and o_proj submission.
+        if self._prefill_vup_output_fence:
+            synchronize_prefill_vup_output(layer_name)
         weight_prefetch_method = get_weight_prefetch_method()
         weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
             inputs=self.o_proj.weight,
