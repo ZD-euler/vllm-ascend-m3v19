@@ -2717,37 +2717,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             x = x.transpose(0, 1).reshape(-1, self.local_num_heads * self.v_head_dim)
         return x
 
-    def _sfa_preprocess_with_mlapo_after_layerwise_wait(
-        self,
-        layer_name: str,
-        attn_metadata: M,
-        hidden_states: torch.Tensor,
-        kv_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        slot_mapping: torch.Tensor,
-        num_input_tokens: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Fence the current bank before MLAPO writes latent KV into it."""
-        if not (
-            self.dsa_shrink_latent
-            and attn_metadata.num_decode_tokens > 0
-        ):
-            wait_for_kv_layer_from_connector(layer_name)
-        if layerwise_kv_trace_enabled():
-            trace_layerwise_kv(
-                layer_name, group=0, stage="P_LOAD", planes=kv_cache[:2],
-                table=attn_metadata.block_table, metadata=attn_metadata,
-            )
-        return self._sfa_preprocess_with_mlapo(
-            hidden_states=hidden_states,
-            kv_cache=kv_cache,
-            cos=cos,
-            sin=sin,
-            slot_mapping=slot_mapping,
-            num_input_tokens=num_input_tokens,
-        )
-
     def _sfa_preprocess_with_mlapo(
         self,
         hidden_states: torch.Tensor,
@@ -5373,28 +5342,33 @@ class AscendSFAImpl(MLAAttentionImpl):
             AscendAttentionState.SpecDecoding,
         }
 
+        # Join both layer banks before native or fused QKV preparation. Each
+        # connector call waits for every request's load on the compute stream.
+        if self._layerwise_prefill_p_node:
+            wait_for_kv_layer_from_connector(layer_name)
+            if kv_cache is not None and index_lmcache_enabled:
+                with _dsa_prof.section("lmc_index_retrieve"):
+                    wait_for_kv_layer_from_connector(index_layer_name)
+            if kv_hash_trace and kv_cache is not None:
+                trace_layerwise_kv(
+                    layer_name,
+                    group=0,
+                    stage="P_LOAD",
+                    planes=kv_cache[:2],
+                    table=attn_metadata.block_table,
+                    metadata=attn_metadata,
+                )
+
         # run mlapo ops when dsa-cp is disabled, and ensure that num_tokens satisfies the count limitation
         if self.enable_mlapo and num_input_tokens <= MLAPO_MAX_SUPPORTED_TOKENS:
-            if self._layerwise_prefill_p_node:
-                hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_with_mlapo_after_layerwise_wait(
-                    layer_name=layer_name,
-                    attn_metadata=attn_metadata,
-                    hidden_states=hidden_states,
-                    kv_cache=kv_cache,
-                    cos=cos,
-                    sin=sin,
-                    slot_mapping=slot_mapping,
-                    num_input_tokens=num_input_tokens,
-                )
-            else:
-                hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_with_mlapo(
-                    hidden_states=hidden_states,
-                    kv_cache=kv_cache,
-                    cos=cos,
-                    sin=sin,
-                    slot_mapping=slot_mapping,
-                    num_input_tokens=num_input_tokens,
-                )
+            hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_with_mlapo(
+                hidden_states=hidden_states,
+                kv_cache=kv_cache,
+                cos=cos,
+                sin=sin,
+                slot_mapping=slot_mapping,
+                num_input_tokens=num_input_tokens,
+            )
             if self.has_indexer:
                 k_li, k_li_scale = self.indexer_select_pre_process(x=hidden_states, cos=cos, sin=sin)
             else:
@@ -5424,14 +5398,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             # would advance the per-request layerwise retriever TWICE per layer
             # (this one with a dense arange) and desync it — skip whenever the
             # batch has decode rows (mixed steps included).
-            if not (self.dsa_shrink_latent and attn_metadata.num_decode_tokens > 0):
+            if not self._layerwise_prefill_p_node and not (
+                self.dsa_shrink_latent and attn_metadata.num_decode_tokens > 0
+            ):
                 wait_for_kv_layer_from_connector(layer_name)
-
-            if kv_hash_trace and kv_cache is not None:
-                trace_layerwise_kv(
-                    layer_name, group=0, stage="P_LOAD", planes=kv_cache[:2],
-                    table=attn_metadata.block_table, metadata=attn_metadata,
-                )
 
             if self.enable_dsa_cp:
                 assert slot_mapping_cp is not None
@@ -5603,7 +5573,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         if kv_cache is not None and self.has_indexer:
             assert k_li is not None
-            if index_lmcache_enabled:
+            if index_lmcache_enabled and not self._layerwise_prefill_p_node:
                 # A cold shared-cache decode needs prompt index rows before
                 # top-k selection. The group-1 wait is a no-op when resident
                 # and does not advance the group-0 latent-layer cursor.

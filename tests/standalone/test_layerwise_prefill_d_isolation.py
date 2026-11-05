@@ -2,6 +2,7 @@
 """Exercise production P gates without loading the Ascend runtime."""
 
 import ast
+from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -67,55 +68,104 @@ def test_compact_scratch_policy_excludes_only_banked_p(builder, p_node, unbundle
     assert obj.dsa_shrink_latent == (configured if unbundle and not p_node else 0)
 
 
+@pytest.mark.parametrize("p_node", [False, True])
 @pytest.mark.parametrize("mlapo", [False, True])
-@pytest.mark.parametrize("decode_rows", [1, 2, 4])
-def test_p_short_tail_waits_before_reading_and_writing_bank(mlapo, decode_rows):
-    # A 500k prompt's last token, or a P-side MTP batch, can be classified as
-    # decode. Inherit the deployment's SHRINK_LATENT=2, with diagnostics off.
-    obj = initialized_shrink(True, 2)
-    metadata = NS(num_decode_tokens=decode_rows)
-    bank = {"history": "stale", "current": "old"}
+@pytest.mark.parametrize("has_indexer", [False, True])
+@pytest.mark.parametrize("decode_rows", [0, 1, 2, 4])
+def test_bank_waits_precede_p_qkv_and_preserve_d_order(p_node, mlapo, has_indexer, decode_rows):
+    # Single-token prefill tails and P-side MTP can be classified as decode.
+    # Execute the shared wait gate, actual QKV dispatch and both old wait sites.
+    forward = method("attention/sfa_v1.py", "AscendSFAImpl", "forward")
+    dispatch_index = next(
+        i
+        for i, node in enumerate(forward.body)
+        if isinstance(node, ast.If) and "self.enable_mlapo" in ast.unparse(node.test)
+    )
+    early_wait = forward.body[dispatch_index - 1]
+    assert ast.unparse(early_wait.test) == "self._layerwise_prefill_p_node"
+    dispatch = deepcopy(forward.body[dispatch_index])
+    first_cache_write = next(i for i, node in enumerate(dispatch.orelse) if calls(node, "exec_kv"))
+    dispatch.orelse = dispatch.orelse[:first_cache_write]
+    index_write = next(
+        node
+        for node in forward.body
+        if isinstance(node, ast.If) and ast.unparse(node.test) == "kv_cache is not None and self.has_indexer"
+    )
+    late_index_wait = deepcopy(index_write)
+    late_index_wait.body = [
+        next(
+            node
+            for node in index_write.body
+            if isinstance(node, ast.If) and "wait_for_kv_layer_from_connector" in ast.unparse(node)
+        )
+    ]
+
+    obj = initialized_shrink(p_node, 2)
+    obj.enable_mlapo = mlapo
+    obj.has_indexer = has_indexer
+    obj.q_lora_rank = 1
+    obj.kv_lora_rank = 1
+    obj.qk_rope_head_dim = 1
+    obj.q_a_layernorm = lambda tensor: tensor
     operations = []
 
     def wait(layer_name):
-        assert layer_name == "layer.4"
-        operations.append("wait_for_load")
-        bank["history"] = "loaded"
+        assert layer_name not in operations, "Duplicate wait advances a retriever twice"
+        operations.append(layer_name)
 
-    def cache_write_and_read(**kwargs):
-        # Model the consumer after its device dependency has completed.
-        assert bank["history"] == "loaded", "P consumed its bank before H2D completion"
-        bank["current"] = "new"
-        operations.append("cache_write_and_read")
+    def prepare_qkv(kind):
+        if p_node:
+            assert operations == (["latent", "indexer"] if has_indexer else ["latent"])
+        operations.append(kind)
+
+    def project(tensor):
+        prepare_qkv("native_qkv")
+        return (NS(split=lambda *args, **kwargs: (object(), object())),)
+
+    project.weight = object()
+    obj.fused_qkv_a_proj = project
+
+    def preprocess(**kwargs):
+        prepare_qkv("mlapo_qkv")
         return 1, 2, 3, 4
 
+    obj._sfa_preprocess_with_mlapo = preprocess
+
+    def indexer_preprocess(**kwargs):
+        operations.append("indexer_qkv")
+        return object(), None
+
+    obj.indexer_select_pre_process = indexer_preprocess
     namespace = dict(
         self=obj,
-        attn_metadata=metadata,
-        layer_name="layer.4",
+        attn_metadata=NS(num_decode_tokens=decode_rows),
+        layer_name="latent",
+        index_layer_name="indexer",
+        index_lmcache_enabled=has_indexer,
+        hidden_states=object(),
+        kv_cache=object(),
+        cos=object(),
+        sin=object(),
+        slot_mapping=object(),
+        num_input_tokens=4,
+        MLAPO_MAX_SUPPORTED_TOKENS=16,
+        kv_hash_trace=False,
+        _dsa_prof=NS(section=lambda name: nullcontext()),
+        get_weight_prefetch_method=lambda: NS(maybe_prefetch_mla_or_sla_weight_in_current_stream=lambda **kwargs: None),
         wait_for_kv_layer_from_connector=wait,
-        layerwise_kv_trace_enabled=lambda: False,
     )
-    if mlapo:
-        wrapper = method("attention/sfa_v1.py", "AscendSFAImpl", "_sfa_preprocess_with_mlapo_after_layerwise_wait")
-        execute([wrapper], namespace)
-        obj._sfa_preprocess_with_mlapo = cache_write_and_read
-        namespace[wrapper.name](obj, "layer.4", metadata, None, None, None, None, None, decode_rows)
+    execute([early_wait, dispatch, late_index_wait], namespace)
+    expected = ["mlapo_qkv" if mlapo else "native_qkv"]
+    if has_indexer:
+        expected.append("indexer_qkv")
+    if p_node:
+        expected = (["latent", "indexer"] if has_indexer else ["latent"]) + expected
     else:
-        forward = method("attention/sfa_v1.py", "AscendSFAImpl", "forward")
-        native = next(
-            node for node in forward.body if isinstance(node, ast.If) and "self.enable_mlapo" in ast.unparse(node.test)
-        )
-        wait_gate = next(
-            node
-            for node in native.orelse
-            if isinstance(node, ast.If)
-            and any(isinstance(n, ast.Name) and n.id == "wait_for_kv_layer_from_connector" for n in ast.walk(node))
-        )
-        execute([wait_gate], namespace)
-        cache_write_and_read()
-    assert operations == ["wait_for_load", "cache_write_and_read"]
-    assert bank["current"] == "new"
+        if not mlapo and decode_rows == 0:
+            expected.append("latent")
+        if has_indexer:
+            expected.append("indexer")
+    assert operations == expected
 
 
 @pytest.mark.parametrize("p_node,remaps", [(False, True), (True, False)])
@@ -147,7 +197,7 @@ def test_p_does_not_remap_full_bank_topk_to_decode_scratch(p_node, remaps):
 
 
 @pytest.mark.parametrize("p_node", [False, True])
-def test_mlapo_only_p_enters_the_added_bank_wait_wrapper(p_node):
+def test_mlapo_uses_same_preprocessing_after_shared_wait_gate(p_node):
     forward = method("attention/sfa_v1.py", "AscendSFAImpl", "forward")
     outer = next(n for n in forward.body if isinstance(n, ast.If) and "self.enable_mlapo" in ast.unparse(n.test))
     dispatch = outer.body[0]
@@ -158,10 +208,6 @@ def test_mlapo_only_p_enters_the_added_bank_wait_wrapper(p_node):
         return 1, 2, 3, 4
 
     obj = NS(_layerwise_prefill_p_node=p_node, _sfa_preprocess_with_mlapo=preprocess)
-    if p_node:
-        obj._sfa_preprocess_with_mlapo_after_layerwise_wait = lambda **kwargs: (
-            seen.append(("bank_wait", kwargs)) or (1, 2, 3, 4)
-        )
     ns = dict(
         self=obj,
         hidden_states=object(),
@@ -174,9 +220,9 @@ def test_mlapo_only_p_enters_the_added_bank_wait_wrapper(p_node):
         attn_metadata=object(),
     )
     execute([dispatch], ns)
-    assert [entry[0] for entry in seen] == (["bank_wait"] if p_node else ["legacy"])
+    assert [entry[0] for entry in seen] == ["legacy"]
     assert ns["ql_nope"] == 2
-    assert ("layer_name" in seen[0][1]) is p_node
+    assert "layer_name" not in seen[0][1]
 
 
 @pytest.mark.parametrize("p_node", [False, True])
