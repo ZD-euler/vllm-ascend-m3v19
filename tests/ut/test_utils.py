@@ -19,10 +19,9 @@ from unittest import mock
 
 import pytest
 import torch
-from vllm.config import CompilationConfig, ModelConfig, ParallelConfig, VllmConfig
+from vllm.config import CompilationConfig, CUDAGraphMode, ModelConfig, ParallelConfig, VllmConfig
 
 from tests.ut.base import TestBase
-from tests.ut.conftest import _npu_available
 from vllm_ascend import utils
 from vllm_ascend.utils import REGISTERED_ASCEND_OPS
 
@@ -34,8 +33,6 @@ class TestUtils(TestBase):
         from vllm_ascend import platform
 
         importlib.reload(platform)
-        utils.enable_dsa_cp_with_layer_shard.cache_clear()
-        utils.enable_dsa_cp_with_o_proj_tp.cache_clear()
 
     def test_nd_to_nz_2d(self):
         # can be divided by 16
@@ -136,82 +133,6 @@ class TestUtils(TestBase):
         with mock.patch("torch.npu.current_stream") as mock_current_stream:
             self.assertEqual(utils.current_stream(), mock_current_stream())
 
-    def test_enable_dsa_cp_with_layer_shard_accepts_kv_producer(self):
-        mock_vllm_config = mock.MagicMock()
-        mock_vllm_config.kv_transfer_config = mock.MagicMock(
-            kv_role="kv_producer", is_kv_producer=True, is_kv_consumer=False
-        )
-
-        with (
-            mock.patch("vllm.config.get_current_vllm_config", return_value=mock_vllm_config),
-            mock.patch("vllm_ascend.utils.enable_dsa_cp", return_value=True),
-        ):
-            self.assertTrue(utils.enable_dsa_cp_with_layer_shard())
-
-    def test_enable_dsa_cp_with_layer_shard_rejects_kv_both(self):
-        mock_vllm_config = mock.MagicMock()
-        mock_vllm_config.kv_transfer_config = mock.MagicMock(
-            kv_role="kv_both", is_kv_producer=True, is_kv_consumer=True
-        )
-
-        with (
-            mock.patch("vllm.config.get_current_vllm_config", return_value=mock_vllm_config),
-            mock.patch("vllm_ascend.utils.enable_dsa_cp", return_value=True),
-        ):
-            self.assertFalse(utils.enable_dsa_cp_with_layer_shard())
-
-    def test_enable_dsa_cp_with_layer_shard_rejects_missing_kv_transfer(self):
-        mock_vllm_config = mock.MagicMock()
-        mock_vllm_config.kv_transfer_config = None
-
-        with (
-            mock.patch("vllm.config.get_current_vllm_config", return_value=mock_vllm_config),
-            mock.patch("vllm_ascend.utils.enable_dsa_cp", return_value=True),
-        ):
-            self.assertFalse(utils.enable_dsa_cp_with_layer_shard())
-
-    def test_enable_dsa_cp_with_layer_shard_rejects_when_dsa_cp_disabled(self):
-        with mock.patch("vllm_ascend.utils.enable_dsa_cp", return_value=False):
-            self.assertFalse(utils.enable_dsa_cp_with_layer_shard())
-
-    def test_enable_dsa_cp_with_o_proj_tp_accepts_missing_kv_transfer(self):
-        mock_vllm_config = mock.MagicMock()
-        mock_vllm_config.kv_transfer_config = None
-
-        with (
-            mock.patch("vllm.config.get_current_vllm_config", return_value=mock_vllm_config),
-            mock.patch("vllm_ascend.utils.enable_dsa_cp", return_value=True),
-        ):
-            self.assertTrue(utils.enable_dsa_cp_with_o_proj_tp())
-
-    def test_enable_dsa_cp_with_o_proj_tp_accepts_kv_both(self):
-        mock_vllm_config = mock.MagicMock()
-        mock_vllm_config.kv_transfer_config = mock.MagicMock(
-            kv_role="kv_both", is_kv_producer=True, is_kv_consumer=True
-        )
-
-        with (
-            mock.patch("vllm.config.get_current_vllm_config", return_value=mock_vllm_config),
-            mock.patch("vllm_ascend.utils.enable_dsa_cp", return_value=True),
-        ):
-            self.assertTrue(utils.enable_dsa_cp_with_o_proj_tp())
-
-    def test_enable_dsa_cp_with_o_proj_tp_rejects_single_role_pd(self):
-        mock_vllm_config = mock.MagicMock()
-        mock_vllm_config.kv_transfer_config = mock.MagicMock(
-            kv_role="kv_producer", is_kv_producer=True, is_kv_consumer=False
-        )
-
-        with (
-            mock.patch("vllm.config.get_current_vllm_config", return_value=mock_vllm_config),
-            mock.patch("vllm_ascend.utils.enable_dsa_cp", return_value=True),
-        ):
-            self.assertFalse(utils.enable_dsa_cp_with_o_proj_tp())
-
-    def test_enable_dsa_cp_with_o_proj_tp_rejects_when_dsa_cp_disabled(self):
-        with mock.patch("vllm_ascend.utils.enable_dsa_cp", return_value=False):
-            self.assertFalse(utils.enable_dsa_cp_with_o_proj_tp())
-
     def test_vllm_version_is(self):
         with mock.patch.dict(os.environ, {"VLLM_VERSION": "1.0.0"}):
             with mock.patch("vllm.__version__", "1.0.0"):
@@ -276,11 +197,9 @@ class TestUtils(TestBase):
             utils.get_max_hidden_layers(NoLayerConfig())
         self.assertIn("num_hidden_layers", str(context.exception))
 
-    @mock.patch.dict(os.environ, {"VLLM_ASCEND_ENABLE_FLASHCOMM1": "0"})
-    @pytest.mark.skipif(not _npu_available, reason="Requires real NPU (ModelConfig inspection)")
     def test_update_aclgraph_sizes(self):
         test_compilation_config = CompilationConfig(cudagraph_capture_sizes=[i for i in range(150)])
-        model_path = os.path.join(os.path.dirname(__file__), "_fake_weight")
+        model_path = os.path.join(os.path.dirname(__file__), "fake_weight")
         test_model_config = ModelConfig(model=model_path, enforce_eager=True)
         test_parallel_config = ParallelConfig()
         test_vllm_config = VllmConfig(
@@ -294,6 +213,627 @@ class TestUtils(TestBase):
         del os.environ["HCCL_OP_EXPANSION_MODE"]
 
         self.assertEqual(0, len(test_vllm_config.compilation_config.cudagraph_capture_sizes))
+
+    def test_staged_sfa_graph_capture_sizes_accepts_exact_q1_batches(self):
+        vllm_config = mock.MagicMock()
+        vllm_config.scheduler_config.max_num_seqs = 64
+        vllm_config.scheduler_config.max_num_batched_tokens = 128
+
+        with (
+            mock.patch.object(
+                utils,
+                "staged_sfa_graph_configured",
+                return_value=True,
+            ),
+            mock.patch.dict(
+                os.environ,
+                {"VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES": " 4,1,4,2 "},
+            ),
+        ):
+            capture_sizes = utils.staged_sfa_graph_capture_sizes(vllm_config)
+
+        self.assertEqual(capture_sizes, (1, 2, 4))
+
+    def test_staged_sfa_graph_capture_sizes_scale_request_buckets_for_mtp(self):
+        vllm_config = mock.MagicMock()
+        vllm_config.speculative_config.num_speculative_tokens = 2
+        vllm_config.scheduler_config.max_num_seqs = 64
+        vllm_config.scheduler_config.max_num_batched_tokens = 128
+        with (
+            mock.patch.object(
+                utils,
+                "staged_sfa_graph_configured",
+                return_value=True,
+            ),
+            mock.patch.dict(
+                os.environ,
+                {"VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES": "1,2,4"},
+            ),
+        ):
+            self.assertEqual(
+                utils.staged_sfa_graph_capture_sizes(vllm_config),
+                (3, 6, 12),
+            )
+
+    def test_staged_sfa_configuration_accepts_model_specific_mtp_method(self):
+        vllm_config = mock.MagicMock()
+        vllm_config.speculative_config.method = "glm4_moe_mtp"
+        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+        vllm_config.model_config.use_mla = True
+        vllm_config.model_config.hf_text_config.index_topk = 2048
+        vllm_config.kv_transfer_config = mock.MagicMock()
+        vllm_config.lora_config = None
+        vllm_config.parallel_config.data_parallel_size = 1
+        vllm_config.parallel_config.pipeline_parallel_size = 1
+        vllm_config.parallel_config.prefill_context_parallel_size = 1
+        vllm_config.parallel_config.decode_context_parallel_size = 1
+        with (
+            mock.patch.multiple(
+                utils.envs_ascend,
+                VLLM_ASCEND_DSA_UNBUNDLE=True,
+                VLLM_ASCEND_DSA_TWO_GROUPS=True,
+                VLLM_ASCEND_DSA_SHRINK_LATENT=2,
+                VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD=False,
+                VLLM_ASCEND_DSA_USE_ADAPTER_CACHE=False,
+            ),
+            mock.patch.dict(os.environ, {"HCCL_OP_EXPANSION_MODE": ""}),
+        ):
+            reasons = utils.staged_sfa_graph_configuration_reasons(
+                vllm_config
+            )
+        self.assertNotIn(
+            utils.StagedSFAConfigReason.SPECULATIVE_DECODE,
+            reasons,
+        )
+
+    def test_staged_sfa_graph_capture_sizes_ignored_when_disabled(self):
+        with (
+            mock.patch.object(
+                utils,
+                "staged_sfa_graph_configured",
+                return_value=False,
+            ),
+            mock.patch.dict(
+                os.environ,
+                {"VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES": "not-an-integer"},
+            ),
+        ):
+            capture_sizes = utils.staged_sfa_graph_capture_sizes(mock.MagicMock())
+
+        self.assertEqual(capture_sizes, ())
+
+    def test_staged_sfa_graph_capture_sizes_rejects_invalid_values(self):
+        vllm_config = mock.MagicMock()
+        vllm_config.scheduler_config.max_num_seqs = 64
+        vllm_config.scheduler_config.max_num_batched_tokens = 128
+        invalid_values = (
+            ("", "must contain positive integers"),
+            ("1,not-an-integer", "comma-separated list"),
+            ("0,1", "must contain positive integers"),
+        )
+
+        with mock.patch.object(
+            utils,
+            "staged_sfa_graph_configured",
+            return_value=True,
+        ):
+            for raw_sizes, expected_message in invalid_values:
+                with (
+                    self.subTest(raw_sizes=raw_sizes),
+                    mock.patch.dict(
+                        os.environ,
+                        {"VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES": raw_sizes},
+                    ),
+                    self.assertRaisesRegex(ValueError, expected_message),
+                ):
+                    utils.staged_sfa_graph_capture_sizes(vllm_config)
+
+    def test_staged_sfa_graph_capture_sizes_respects_q1_capacity(self):
+        for max_num_seqs, max_num_batched_tokens in ((16, 64), (64, 16)):
+            vllm_config = mock.MagicMock()
+            vllm_config.scheduler_config.max_num_seqs = max_num_seqs
+            vllm_config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens
+
+            with (
+                self.subTest(
+                    max_num_seqs=max_num_seqs,
+                    max_num_batched_tokens=max_num_batched_tokens,
+                ),
+                mock.patch.object(
+                    utils,
+                    "staged_sfa_graph_configured",
+                    return_value=True,
+                ),
+                mock.patch.dict(
+                    os.environ,
+                    {"VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES": "1,16,32"},
+                ),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "scheduler capacity.*\\[32\\]",
+                ),
+            ):
+                utils.staged_sfa_graph_capture_sizes(vllm_config)
+
+    def test_update_aclgraph_sizes_restricts_cross_layer_capture(self):
+        compilation_config = mock.MagicMock()
+        compilation_config.cudagraph_capture_sizes = list(range(1, 101))
+        compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+        model_config = mock.MagicMock()
+        model_config.hf_text_config.num_hidden_layers = 80
+        model_config.hf_text_config.index_topk = 2048
+        model_config.use_mla = True
+        model_config.architecture = "StagedSFAResourceTest"
+        parallel_config = mock.MagicMock()
+        parallel_config.data_parallel_size = 1
+        parallel_config.tensor_parallel_size = 8
+        parallel_config.prefill_context_parallel_size = 1
+        parallel_config.decode_context_parallel_size = 1
+        vllm_config = mock.MagicMock()
+        vllm_config.compilation_config = compilation_config
+        vllm_config.model_config = model_config
+        vllm_config.parallel_config = parallel_config
+        vllm_config.speculative_config = None
+
+        vllm_config.kv_transfer_config = mock.MagicMock()
+        vllm_config.lora_config = None
+
+        def apply_capture_sizes(config, capture_sizes):
+            config.compilation_config.cudagraph_capture_sizes = capture_sizes
+
+        with (
+            mock.patch.object(
+                utils,
+                "staged_sfa_graph_configured",
+                return_value=True,
+            ),
+            mock.patch.dict(
+                os.environ,
+                {"HCCL_OP_EXPANSION_MODE": ""},
+            ),
+            mock.patch.object(
+                utils,
+                "update_cudagraph_capture_sizes",
+                side_effect=apply_capture_sizes,
+            ) as update_sizes,
+        ):
+            utils.update_aclgraph_sizes(vllm_config)
+
+        sampled_sizes = update_sizes.call_args.args[1]
+        self.assertEqual(sampled_sizes, [1])
+
+    def test_staged_sfa_resource_budget_keeps_size_one(self):
+        compilation_config = mock.MagicMock()
+        compilation_config.cudagraph_capture_sizes = list(range(1, 101))
+        model_config = mock.MagicMock()
+        model_config.hf_text_config.num_hidden_layers = 170
+        model_config.hf_text_config.index_topk = 2048
+        model_config.use_mla = True
+        model_config.architecture = "DeepStagedSFAResourceTest"
+        compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+        parallel_config = mock.MagicMock()
+        parallel_config.data_parallel_size = 1
+        parallel_config.tensor_parallel_size = 8
+        parallel_config.prefill_context_parallel_size = 1
+        parallel_config.decode_context_parallel_size = 1
+        vllm_config = mock.MagicMock()
+        vllm_config.compilation_config = compilation_config
+        vllm_config.model_config = model_config
+        vllm_config.parallel_config = parallel_config
+        vllm_config.speculative_config = None
+
+        def apply_capture_sizes(config, capture_sizes):
+            config.compilation_config.cudagraph_capture_sizes = capture_sizes
+
+        vllm_config.kv_transfer_config = mock.MagicMock()
+        vllm_config.lora_config = None
+        with (
+            mock.patch.object(
+                utils,
+                "staged_sfa_graph_configured",
+                return_value=True,
+            ),
+            mock.patch.dict(
+                os.environ,
+                {"HCCL_OP_EXPANSION_MODE": ""},
+            ),
+            mock.patch.object(
+                utils,
+                "update_cudagraph_capture_sizes",
+                side_effect=apply_capture_sizes,
+            ) as update_sizes,
+        ):
+            utils.update_aclgraph_sizes(vllm_config)
+
+        update_sizes.assert_called_once()
+        self.assertEqual(update_sizes.call_args.args[1], [1])
+
+    def test_staged_sfa_cross_layer_capture_uses_requested_key(self):
+        compilation_config = mock.MagicMock()
+        compilation_config.cudagraph_capture_sizes = list(range(1, 101))
+        compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+        model_config = mock.MagicMock()
+        model_config.hf_text_config.num_hidden_layers = 90
+        model_config.hf_text_config.index_topk = 2048
+        model_config.use_mla = True
+        model_config.architecture = "TwoKeyStagedSFAResourceTest"
+        parallel_config = mock.MagicMock()
+        parallel_config.data_parallel_size = 1
+        parallel_config.tensor_parallel_size = 8
+        parallel_config.prefill_context_parallel_size = 1
+        parallel_config.decode_context_parallel_size = 1
+        vllm_config = mock.MagicMock()
+        vllm_config.compilation_config = compilation_config
+        vllm_config.model_config = model_config
+        vllm_config.parallel_config = parallel_config
+        vllm_config.speculative_config = None
+        vllm_config.kv_transfer_config = mock.MagicMock()
+        vllm_config.lora_config = None
+
+        def apply_capture_sizes(config, capture_sizes):
+            config.compilation_config.cudagraph_capture_sizes = capture_sizes
+
+        with (
+            mock.patch.object(
+                utils,
+                "staged_sfa_graph_configured",
+                return_value=True,
+            ),
+            mock.patch.object(
+                utils,
+                "staged_sfa_graph_capture_sizes",
+                return_value=(1, 32),
+            ),
+            mock.patch.dict(
+                os.environ,
+                {"HCCL_OP_EXPANSION_MODE": ""},
+            ),
+            mock.patch.object(
+                utils,
+                "update_cudagraph_capture_sizes",
+                side_effect=apply_capture_sizes,
+            ) as update_sizes,
+        ):
+            utils.update_aclgraph_sizes(vllm_config)
+
+        update_sizes.assert_called_once()
+        self.assertEqual(update_sizes.call_args.args[1], [1, 32])
+
+    def test_staged_sfa_capture_rejects_graph_entry_overcommit(self):
+        compilation_config = mock.MagicMock(
+            cudagraph_mode=CUDAGraphMode.PIECEWISE,
+        )
+        model_config = mock.MagicMock()
+        model_config.hf_text_config.num_hidden_layers = 80
+        parallel_config = mock.MagicMock()
+        parallel_config.data_parallel_size = 1
+        parallel_config.tensor_parallel_size = 8
+        parallel_config.prefill_context_parallel_size = 1
+        parallel_config.decode_context_parallel_size = 1
+        vllm_config = mock.MagicMock(
+            compilation_config=compilation_config,
+            model_config=model_config,
+            parallel_config=parallel_config,
+            speculative_config=None,
+        )
+
+        with (
+            mock.patch.object(
+                utils,
+                "staged_sfa_graph_configured",
+                return_value=True,
+            ),
+            mock.patch.object(
+                utils,
+                "staged_sfa_graph_capture_sizes",
+                return_value=tuple(range(1, 33)),
+            ),
+            mock.patch.dict(
+                os.environ,
+                {"HCCL_OP_EXPANSION_MODE": ""},
+            ),
+            self.assertRaisesRegex(
+                ValueError,
+                "exceeding the device quota",
+            ),
+        ):
+            utils.update_aclgraph_sizes(vllm_config)
+
+    def test_staged_sfa_capture_uses_aiv_resource_budget(self):
+        compilation_config = mock.MagicMock(
+            cudagraph_capture_sizes=[1],
+            cudagraph_mode=CUDAGraphMode.PIECEWISE,
+        )
+        model_config = mock.MagicMock()
+        model_config.hf_text_config.num_hidden_layers = 78
+        model_config.architecture = "StagedSFAAIVResourceTest"
+        parallel_config = mock.MagicMock(
+            data_parallel_size=2,
+            tensor_parallel_size=2,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+            enable_expert_parallel=False,
+        )
+        vllm_config = mock.MagicMock(
+            compilation_config=compilation_config,
+            model_config=model_config,
+            parallel_config=parallel_config,
+            speculative_config=None,
+            additional_config={},
+        )
+
+        for key_count, should_fail in ((5, False), (6, True)):
+            compilation_config.cudagraph_capture_sizes = [1]
+            capture_sizes = tuple(range(1, key_count + 1))
+            with (
+                self.subTest(key_count=key_count),
+                mock.patch.object(
+                    utils,
+                    "staged_sfa_graph_configured",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    utils,
+                    "staged_sfa_graph_capture_sizes",
+                    return_value=capture_sizes,
+                ),
+                mock.patch.object(
+                    utils,
+                    "is_moe_model",
+                    return_value=True,
+                ),
+                mock.patch.dict(
+                    os.environ,
+                    {"HCCL_OP_EXPANSION_MODE": "AIV"},
+                ),
+                mock.patch.object(
+                    utils,
+                    "update_cudagraph_capture_sizes",
+                ) as update_sizes,
+            ):
+                if should_fail:
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "device quota of 5 keys",
+                    ):
+                        utils.update_aclgraph_sizes(vllm_config)
+                    update_sizes.assert_not_called()
+                else:
+                    utils.update_aclgraph_sizes(vllm_config)
+                    update_sizes.assert_called_once_with(
+                        vllm_config,
+                        list(capture_sizes),
+                    )
+
+    def test_staged_sfa_cross_layer_capture_drops_native_buckets(self):
+        compilation_config = mock.MagicMock()
+        compilation_config.cudagraph_capture_sizes = list(range(1, 101))
+        compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+        model_config = mock.MagicMock()
+        model_config.hf_text_config.num_hidden_layers = 80
+        model_config.hf_text_config.index_topk = 2048
+        model_config.use_mla = True
+        model_config.architecture = "StagedSFAMaximumBucketTest"
+        parallel_config = mock.MagicMock()
+        parallel_config.data_parallel_size = 1
+        parallel_config.tensor_parallel_size = 8
+        parallel_config.prefill_context_parallel_size = 1
+        parallel_config.decode_context_parallel_size = 1
+        vllm_config = mock.MagicMock()
+        vllm_config.compilation_config = compilation_config
+        vllm_config.model_config = model_config
+        vllm_config.parallel_config = parallel_config
+        vllm_config.speculative_config = None
+        vllm_config.kv_transfer_config = mock.MagicMock()
+        vllm_config.lora_config = None
+
+        def apply_capture_sizes(config, capture_sizes):
+            config.compilation_config.cudagraph_capture_sizes = capture_sizes
+
+        with (
+            mock.patch.object(
+                utils,
+                "staged_sfa_graph_configured",
+                return_value=True,
+            ),
+            mock.patch.object(
+                utils,
+                "staged_sfa_graph_capture_sizes",
+                return_value=(1, 32),
+            ),
+            mock.patch.dict(
+                os.environ,
+                {"HCCL_OP_EXPANSION_MODE": ""},
+            ),
+            mock.patch.object(
+                utils,
+                "update_cudagraph_capture_sizes",
+                side_effect=apply_capture_sizes,
+            ) as update_sizes,
+        ):
+            utils.update_aclgraph_sizes(vllm_config)
+
+        update_sizes.assert_called_once()
+        self.assertEqual(update_sizes.call_args.args[1], [1, 32])
+
+    def test_staged_sfa_no_sampling_updates_derived_maximum(self):
+        compilation_config = mock.MagicMock()
+        compilation_config.cudagraph_capture_sizes = [1, 8]
+        compilation_config.max_cudagraph_capture_size = 8
+        compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+        compilation_config.post_init_cudagraph_sizes = mock.Mock()
+        model_config = mock.MagicMock()
+        model_config.hf_text_config.num_hidden_layers = 1
+        model_config.hf_text_config.index_topk = 2048
+        model_config.use_mla = True
+        model_config.architecture = "StagedSFADerivedMaximumTest"
+        parallel_config = mock.MagicMock()
+        parallel_config.data_parallel_size = 1
+        parallel_config.tensor_parallel_size = 1
+        parallel_config.prefill_context_parallel_size = 1
+        parallel_config.decode_context_parallel_size = 1
+        vllm_config = mock.MagicMock()
+        vllm_config.compilation_config = compilation_config
+        vllm_config.model_config = model_config
+        vllm_config.parallel_config = parallel_config
+        vllm_config.speculative_config = None
+        vllm_config.kv_transfer_config = mock.MagicMock()
+        vllm_config.lora_config = None
+
+        with (
+            mock.patch.object(
+                utils,
+                "staged_sfa_graph_configured",
+                return_value=True,
+            ),
+            mock.patch.object(
+                utils,
+                "staged_sfa_graph_capture_sizes",
+                return_value=(1, 32),
+            ),
+            mock.patch.dict(
+                os.environ,
+                {"HCCL_OP_EXPANSION_MODE": ""},
+            ),
+        ):
+            utils.update_aclgraph_sizes(vllm_config)
+
+        self.assertEqual(compilation_config.cudagraph_capture_sizes, [1, 32])
+        self.assertEqual(
+            compilation_config.max_cudagraph_capture_size,
+            32,
+        )
+        compilation_config.post_init_cudagraph_sizes.assert_called_once_with()
+
+    def test_staged_sfa_graph_configured_prerequisites(self):
+        compilation_config = mock.MagicMock()
+        compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+        model_config = mock.MagicMock()
+        model_config.use_mla = True
+        model_config.hf_text_config.index_topk = 2048
+        vllm_config = mock.MagicMock()
+        vllm_config.compilation_config = compilation_config
+        vllm_config.model_config = model_config
+        vllm_config.kv_transfer_config = mock.MagicMock()
+        vllm_config.speculative_config = None
+        vllm_config.lora_config = None
+
+        with (
+            mock.patch.multiple(
+                utils.envs_ascend,
+                VLLM_ASCEND_SFA_STAGED_GRAPH=True,
+                VLLM_ASCEND_DSA_UNBUNDLE=True,
+                VLLM_ASCEND_DSA_TWO_GROUPS=True,
+                VLLM_ASCEND_DSA_SHRINK_LATENT=2,
+                VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD=False,
+                VLLM_ASCEND_DSA_USE_ADAPTER_CACHE=False,
+            ),
+            mock.patch.dict(
+                os.environ,
+                {"HCCL_OP_EXPANSION_MODE": "AIV"},
+            ),
+        ):
+            self.assertTrue(utils.staged_sfa_graph_configured(vllm_config))
+
+            with mock.patch.object(
+                utils.envs_ascend,
+                "VLLM_ASCEND_DSA_SHRINK_LATENT",
+                0,
+            ):
+                self.assertFalse(utils.staged_sfa_graph_configured(vllm_config))
+
+            compilation_config.cudagraph_mode = CUDAGraphMode.FULL
+            self.assertFalse(utils.staged_sfa_graph_configured(vllm_config))
+
+            compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+            vllm_config.kv_transfer_config = None
+            self.assertFalse(utils.staged_sfa_graph_configured(vllm_config))
+
+    def test_staged_sfa_configuration_errors_report_unsupported_modes(self):
+        vllm_config = mock.MagicMock()
+        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+        vllm_config.model_config.use_mla = True
+        vllm_config.model_config.hf_text_config.index_topk = 2048
+        vllm_config.kv_transfer_config = mock.MagicMock()
+        vllm_config.speculative_config = mock.MagicMock()
+        vllm_config.lora_config = mock.MagicMock()
+        vllm_config.parallel_config.data_parallel_size = 2
+        vllm_config.parallel_config.distributed_executor_backend = "external_launcher"
+        vllm_config.parallel_config.pipeline_parallel_size = 2
+        vllm_config.parallel_config.prefill_context_parallel_size = 2
+        vllm_config.parallel_config.decode_context_parallel_size = 1
+
+        with (
+            mock.patch.multiple(
+                utils.envs_ascend,
+                VLLM_ASCEND_DSA_UNBUNDLE=True,
+                VLLM_ASCEND_DSA_TWO_GROUPS=True,
+                VLLM_ASCEND_DSA_SHRINK_LATENT=2,
+                VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD=False,
+                VLLM_ASCEND_DSA_USE_ADAPTER_CACHE=False,
+            ),
+            mock.patch.dict(
+                os.environ,
+                {"HCCL_OP_EXPANSION_MODE": ""},
+            ),
+        ):
+            reasons = utils.staged_sfa_graph_configuration_reasons(vllm_config)
+            errors = utils.staged_sfa_graph_configuration_errors(vllm_config)
+
+        self.assertIn(utils.StagedSFAConfigReason.SPECULATIVE_DECODE, reasons)
+        self.assertIn(utils.StagedSFAConfigReason.DATA_PARALLEL, reasons)
+        self.assertIn(
+            "only fixed-width MTP speculative decoding is supported",
+            errors,
+        )
+        self.assertIn("LoRA is not implemented", errors)
+        self.assertIn(
+            "external-launcher data parallel staged graphs are not implemented",
+            errors,
+        )
+        self.assertIn("pipeline parallel staged graphs are not implemented", errors)
+        self.assertIn("context parallel staged graphs are not implemented", errors)
+
+        vllm_config.parallel_config.distributed_executor_backend = "mp"
+        reasons = utils.staged_sfa_graph_configuration_reasons(vllm_config)
+        self.assertNotIn(utils.StagedSFAConfigReason.DATA_PARALLEL, reasons)
+
+    def test_staged_sfa_aiv_keeps_other_profiling_guards(self):
+        vllm_config = mock.MagicMock()
+        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+        vllm_config.model_config.use_mla = True
+        vllm_config.model_config.hf_text_config.index_topk = 2048
+        vllm_config.kv_transfer_config = mock.MagicMock()
+        vllm_config.speculative_config = None
+        vllm_config.lora_config = None
+        vllm_config.parallel_config.data_parallel_size = 1
+        vllm_config.parallel_config.pipeline_parallel_size = 1
+        vllm_config.parallel_config.prefill_context_parallel_size = 1
+        vllm_config.parallel_config.decode_context_parallel_size = 1
+
+        with (
+            mock.patch.multiple(
+                utils.envs_ascend,
+                VLLM_ASCEND_DSA_UNBUNDLE=True,
+                VLLM_ASCEND_DSA_TWO_GROUPS=True,
+                VLLM_ASCEND_DSA_SHRINK_LATENT=2,
+                VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD=True,
+                VLLM_ASCEND_DSA_USE_ADAPTER_CACHE=True,
+            ),
+            mock.patch.dict(
+                os.environ,
+                {"HCCL_OP_EXPANSION_MODE": "AIV"},
+            ),
+        ):
+            reasons = utils.staged_sfa_graph_configuration_reasons(
+                vllm_config
+            )
+
+        self.assertIn(
+            utils.StagedSFAConfigReason.LEGACY_DSA_OFFLOAD,
+            reasons,
+        )
+        self.assertIn(utils.StagedSFAConfigReason.ADAPTER_CACHE, reasons)
 
     @mock.patch("vllm.model_executor.custom_op.CustomOp")
     @mock.patch("vllm_ascend.ops.activation.AscendQuickGELU")
@@ -327,10 +867,8 @@ class TestUtils(TestBase):
             self.assertEqual(kwargs, {})
 
         # Test case 1: non-310P, NZ is disabled
-        mock_config = mock.MagicMock()
-        mock_config.weight_nz_mode = 0
         with (
-            mock.patch("vllm_ascend.utils.get_ascend_config", return_value=mock_config),
+            mock.patch.dict(os.environ, {"VLLM_ASCEND_ENABLE_NZ": "0"}),
             mock.patch("vllm_ascend.utils.is_310p", return_value=False),
         ):
             weight = torch.randn(32, 64, dtype=torch.float16)
@@ -340,9 +878,8 @@ class TestUtils(TestBase):
 
         # Test case 2: 310P always converts non-fp32 weights, even when NZ=0
         mock_npu_format_cast.reset_mock()
-        mock_config.weight_nz_mode = 0
         with (
-            mock.patch("vllm_ascend.utils.get_ascend_config", return_value=mock_config),
+            mock.patch.dict(os.environ, {"VLLM_ASCEND_ENABLE_NZ": "0"}),
             mock.patch("vllm_ascend.utils.is_310p", return_value=True),
         ):
             weight = torch.randn(32, 64, dtype=torch.float16)
@@ -352,9 +889,8 @@ class TestUtils(TestBase):
 
         # Test case 3: fp32 never converts, including on 310P
         mock_npu_format_cast.reset_mock()
-        mock_config.weight_nz_mode = 1
         with (
-            mock.patch("vllm_ascend.utils.get_ascend_config", return_value=mock_config),
+            mock.patch.dict(os.environ, {"VLLM_ASCEND_ENABLE_NZ": "1"}),
             mock.patch("vllm_ascend.utils.is_310p", return_value=True),
         ):
             weight = torch.randn(32, 64, dtype=torch.float32)
@@ -364,9 +900,8 @@ class TestUtils(TestBase):
 
         # Test case 4: non-310P fp16 converts only when NZ=2
         mock_npu_format_cast.reset_mock()
-        mock_config.weight_nz_mode = 1
         with (
-            mock.patch("vllm_ascend.utils.get_ascend_config", return_value=mock_config),
+            mock.patch.dict(os.environ, {"VLLM_ASCEND_ENABLE_NZ": "1"}),
             mock.patch("vllm_ascend.utils.is_310p", return_value=False),
         ):
             weight = torch.randn(32, 64, dtype=torch.float16)
@@ -376,9 +911,8 @@ class TestUtils(TestBase):
 
         # Test case 5: non-310P fp16 converts when NZ=2
         mock_npu_format_cast.reset_mock()
-        mock_config.weight_nz_mode = 2
         with (
-            mock.patch("vllm_ascend.utils.get_ascend_config", return_value=mock_config),
+            mock.patch.dict(os.environ, {"VLLM_ASCEND_ENABLE_NZ": "2"}),
             mock.patch("vllm_ascend.utils.is_310p", return_value=False),
         ):
             weight = torch.randn(32, 64, dtype=torch.float16)
@@ -388,9 +922,8 @@ class TestUtils(TestBase):
 
         # Test case 6: non-310P bf16 converts when NZ=2
         mock_npu_format_cast.reset_mock()
-        mock_config.weight_nz_mode = 2
         with (
-            mock.patch("vllm_ascend.utils.get_ascend_config", return_value=mock_config),
+            mock.patch.dict(os.environ, {"VLLM_ASCEND_ENABLE_NZ": "2"}),
             mock.patch("vllm_ascend.utils.is_310p", return_value=False),
         ):
             weight = torch.randn(32, 64, dtype=torch.bfloat16)
@@ -400,9 +933,8 @@ class TestUtils(TestBase):
 
         # Test case 7: non-310P quantized weights still convert by default
         mock_npu_format_cast.reset_mock()
-        mock_config.weight_nz_mode = 1
         with (
-            mock.patch("vllm_ascend.utils.get_ascend_config", return_value=mock_config),
+            mock.patch.dict(os.environ, {"VLLM_ASCEND_ENABLE_NZ": "1"}),
             mock.patch("vllm_ascend.utils.is_310p", return_value=False),
         ):
             weight = torch.zeros(32, 64, dtype=torch.int8)

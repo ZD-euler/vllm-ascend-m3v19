@@ -1,0 +1,1095 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from typing import Any, Dict, List, Optional, Tuple
+from unittest.mock import MagicMock, patch
+
+import torch
+from vllm.config import (CacheConfig, KVTransferConfig, ModelConfig,
+                         SchedulerConfig, SpeculativeConfig, VllmConfig)
+from vllm.multimodal.inputs import (MultiModalFeatureSpec,
+                                    MultiModalKwargsItem, PlaceholderRange)
+from vllm.sampling_params import SamplingParams
+from vllm.utils.hashing import sha256
+from vllm.v1.core.kv_cache_utils import (get_request_block_hasher,
+                                         init_none_hash)
+from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
+                                        KVCacheGroupSpec)
+from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.request import Request, RequestStatus
+from vllm.v1.structured_output import StructuredOutputManager
+
+from tests.ut.base import TestBase
+from vllm_ascend.core.recompute_scheduler import AsyncRecomputeScheduler, RecomputeScheduler
+from vllm_ascend.core.scheduler_dynamic_batch import SchedulerDynamicBatch
+
+EOS_TOKEN_ID = 50256
+MODEL = "Qwen3-0.6B"
+ENABLE_PREFIX_CACHING = None
+PROMPT_LOGPROBS = None
+ENABLE_CHUNKED_PREFILL = False
+MAX_NUM_BATCHED_TOKENS = 10000
+LONG_PREFILL_TOKEN_THRESHOLD = 0
+NUM_SPECULATIVE_TOKENS = None
+MAX_NUM_SEQS = 16
+
+
+def create_requests(
+    num_requests: int,
+    num_tokens: int = 10,
+    mm_positions: Optional[list[PlaceholderRange]] = None,
+    max_tokens: int = 16,
+    stop_token_ids: Optional[list[int]] = None,
+    block_size: int = 3,
+    hash_fn=sha256,
+):
+    init_none_hash(hash_fn)
+    prompt_logprobs = PROMPT_LOGPROBS
+    sampling_params = SamplingParams(ignore_eos=False,
+                                     max_tokens=max_tokens,
+                                     stop_token_ids=stop_token_ids,
+                                     prompt_logprobs=prompt_logprobs)
+    requests = []
+    for i in range(num_requests):
+        mm_features = []
+        if mm_positions is not None:
+            mm_position = mm_positions[i]
+            for j, position in enumerate(mm_position):
+                identifier = f"hash{i}_{j}"
+                mm_feature = MultiModalFeatureSpec(
+                    data=MultiModalKwargsItem.dummy(),
+                    mm_position=position,
+                    identifier=identifier,
+                    modality="image")
+                mm_features.append(mm_feature)
+        request = Request(request_id=f"{i}",
+                          prompt_token_ids=[i] * num_tokens,
+                          sampling_params=sampling_params,
+                          pooling_params=None,
+                          mm_features=mm_features if mm_features else None,
+                          block_hasher=get_request_block_hasher(
+                              block_size, hash_fn))
+        requests.append(request)
+    return requests
+
+
+def make_output(scheduler):
+    req_ids = [req.request_id for req in scheduler.running]
+    req_id_to_index = {
+        req.request_id: i
+        for i, req in enumerate(scheduler.running)
+    }
+    sampled_token_ids = [[1000]] * len(scheduler.running)
+
+    logprobs = None
+
+    modelrunner_output = ModelRunnerOutput(
+        req_ids=req_ids,
+        req_id_to_index=req_id_to_index,
+        sampled_token_ids=sampled_token_ids,
+        logprobs=logprobs,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    return modelrunner_output
+
+
+class TestSchedulerDynamicBatch(TestBase):
+
+    @patch("vllm.config.ModelConfig.__post_init__", MagicMock())
+    @patch("vllm.config.VllmConfig.__post_init__", MagicMock())
+    def create_scheduler(
+        self,
+        *,
+        multimodal: bool = True,
+        scheduler_cls=SchedulerDynamicBatch,
+    ):
+        use_kv_connector = False
+        block_size = 16
+
+        scheduler_config = SchedulerConfig(
+            max_num_seqs=16,
+            max_model_len=MAX_NUM_BATCHED_TOKENS,
+            long_prefill_token_threshold=LONG_PREFILL_TOKEN_THRESHOLD,
+            disable_chunked_mm_input=False,
+            enable_chunked_prefill=True,
+            max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
+            is_encoder_decoder=False,
+        )
+
+        scheduler_config.max_num_encoder_input_tokens = 10000
+        scheduler_config.encoder_cache_size = 10000
+        scheduler_config.chunked_prefill_enabled = True
+        scheduler_config.SLO_limits_for_dynamic_batch = 0
+
+        model_config = ModelConfig(
+            model=MODEL,
+            tokenizer=MODEL,
+            tokenizer_mode="auto",
+            trust_remote_code=True,
+            dtype="float16",
+            seed=42,
+            max_model_len=MAX_NUM_BATCHED_TOKENS,
+        )
+        model_config.pooler_config = MagicMock()
+        model_config.multimodal_config = MagicMock() if multimodal else None
+        model_config.hf_config = MagicMock()
+        model_config.hf_config.is_encoder_decoder = False
+        model_config.hf_config.get_text_config.return_value = (
+            model_config.hf_config
+        )
+        model_config.hf_text_config = model_config.hf_config
+        # Cache config, optionally force APC
+        kwargs_cache: Dict[str,
+                           Any] = ({} if ENABLE_PREFIX_CACHING is None else {
+                               'enable_prefix_caching':
+                               ENABLE_PREFIX_CACHING
+                           })
+        cache_config = CacheConfig(
+            block_size=block_size,
+            gpu_memory_utilization=0.9,
+            cache_dtype="auto",
+            **kwargs_cache,
+        )
+
+        kv_transfer_config = KVTransferConfig(
+            kv_connector="SharedStorageConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={"shared_storage_path": "local_storage"},
+        ) if use_kv_connector else None
+
+        speculative_config: Optional[SpeculativeConfig] = None
+        if NUM_SPECULATIVE_TOKENS is not None:
+            speculative_config = SpeculativeConfig(
+                model="ngram", num_speculative_tokens=NUM_SPECULATIVE_TOKENS)
+
+        vllm_config = VllmConfig(
+            scheduler_config=scheduler_config,
+            model_config=model_config,
+            cache_config=cache_config,
+            kv_transfer_config=kv_transfer_config,
+            speculative_config=speculative_config,
+        )
+
+        kv_cache_config = KVCacheConfig(
+            num_blocks=10000,  # A large number of blocks to hold all requests
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(['layer'],
+                                 FullAttentionSpec(block_size=block_size,
+                                                   num_kv_heads=1,
+                                                   head_size=1,
+                                                   dtype=torch.float32))
+            ],
+        )
+        kv_cache_config.hash_block_size = block_size
+        cache_config.num_gpu_blocks = 10000
+
+        scheduler = scheduler_cls(
+            vllm_config=vllm_config,
+            kv_cache_config=kv_cache_config,
+            block_size=block_size,
+            log_stats=True,
+            structured_output_manager=MagicMock(spec=StructuredOutputManager),
+        )
+
+        should_advance = MagicMock()
+        should_advance.return_value = False
+        scheduler.structured_output_manager.should_advance = should_advance
+
+        return scheduler
+
+    def test_add_requests(self):
+        scheduler = self.create_scheduler()
+        requests = create_requests(num_requests=10)
+
+        for i, request in enumerate(requests):
+            scheduler.add_request(request)
+            self.assertIn(request.request_id, scheduler.requests)
+            self.assertEqual(len(scheduler.waiting), i + 1)
+
+    def test_finish_request(self):
+        scheduler = self.create_scheduler()
+        requests = create_requests(num_requests=10)
+        for request in requests:
+            scheduler.add_request(request)
+
+        for i, request in enumerate(requests):
+            scheduler.finish_requests(request.request_id,
+                                      RequestStatus.FINISHED_ABORTED)
+            self.assertNotIn(request.request_id, scheduler.requests)
+            self.assertEqual(len(scheduler.waiting), 9 - i)
+
+    def test_get_num_unfinished_requests(self):
+        scheduler = self.create_scheduler()
+        requests = create_requests(num_requests=10)
+        for request in requests:
+            scheduler.add_request(request)
+
+        for i, request in enumerate(requests):
+            scheduler.finish_requests(request.request_id,
+                                      RequestStatus.FINISHED_STOPPED)
+            self.assertEqual(scheduler.get_num_unfinished_requests(),
+                             len(requests) - i - 1)
+
+    def test_schedule(self):
+        '''Test scheduling.
+        Two cases: default APC/no prompt logprobs; APC=True + prompt logprobs
+        '''
+        scheduler = self.create_scheduler()
+        scheduler.scheduler_config.chunked_prefill_enabled = True
+        requests = create_requests(num_requests=10)
+        for request in requests:
+            scheduler.add_request(request)
+
+        # Test initial scheduling
+        output = scheduler.schedule()
+        self.assertEqual(len(output.scheduled_new_reqs), len(requests))
+        self.assertEqual(output.scheduled_cached_reqs.num_reqs, 0)
+        self.assertEqual(len(output.finished_req_ids), 0)
+        # Verify all requests are scheduled.
+        for req_id, num_tokens in output.num_scheduled_tokens.items():
+            self.assertEqual(num_tokens,
+                             len(requests[int(req_id)].prompt_token_ids))
+
+        # Verify requests moved from waiting to running
+        self.assertEqual(len(scheduler.waiting), 0)
+        self.assertEqual(len(scheduler.running), len(requests))
+        for i, request in enumerate(requests):
+            self.assertEqual(scheduler.running[i], request)
+
+    def test_async_external_load_forwards_compact_allocation(self):
+        scheduler = self.create_scheduler(multimodal=False)
+        request = create_requests(num_requests=1)[0]
+        scheduler.add_request(request)
+        scheduler.connector = MagicMock()
+        external_tokens = request.num_tokens - 1
+        scheduler.connector.get_num_new_matched_tokens.return_value = (
+            external_tokens,
+            True,
+        )
+        scheduler.connector.supports_dsa_compact_external_load = True
+
+        with patch.object(
+            scheduler.kv_cache_manager,
+            "allocate_slots",
+            wraps=scheduler.kv_cache_manager.allocate_slots,
+        ) as allocate_slots:
+            scheduler.schedule()
+
+        args, kwargs = allocate_slots.call_args
+        self.assertEqual(args[1], 0)
+        self.assertEqual(
+            kwargs["num_external_computed_tokens"], external_tokens
+        )
+        self.assertTrue(kwargs["delay_cache_blocks"])
+        self.assertTrue(kwargs["dsa_compact_external_load"])
+        published_blocks = scheduler.connector.update_state_after_alloc.call_args.args[1]
+        self.assertEqual(
+            published_blocks.get_block_ids(),
+            scheduler.kv_cache_manager.get_blocks(request.request_id).get_block_ids(),
+        )
+        self.assertTrue(any(published_blocks.get_block_ids()))
+        self.assertEqual(request.status, RequestStatus.WAITING_FOR_REMOTE_KVS)
+        self.assertEqual(request.num_external_computed_tokens, external_tokens)
+        self.assertEqual(request.num_computed_tokens, external_tokens)
+
+    def test_recompute_remote_load_preserves_admitted_frontier(self):
+        scheduler = self.create_scheduler(
+            multimodal=False, scheduler_cls=RecomputeScheduler
+        )
+        request = create_requests(num_requests=1, num_tokens=20)[0]
+        admitted_tokens = 13
+        request.num_computed_tokens = admitted_tokens
+        request.num_external_computed_tokens = admitted_tokens
+        request.num_cached_tokens = 4
+        request.num_preemptions = 1
+        request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+        scheduler.connector = MagicMock()
+        scheduler.finished_recving_kv_req_ids.add(request.request_id)
+
+        with (
+            patch.object(
+                scheduler.kv_cache_manager, "cache_blocks"
+            ) as cache_blocks,
+            patch.object(
+                scheduler.kv_cache_manager,
+                "get_block_ids",
+                return_value=([1, 2], [3, 4]),
+            ) as get_block_ids,
+        ):
+            promoted = scheduler._try_promote_blocked_waiting_request(request)
+
+        self.assertTrue(promoted)
+        cache_blocks.assert_called_once_with(request, admitted_tokens)
+        get_block_ids.assert_not_called()
+        self.assertNotIn(
+            request.request_id, scheduler.finished_recving_kv_req_ids
+        )
+        self.assertEqual(request.status, RequestStatus.PREEMPTED)
+        self.assertEqual(request.num_computed_tokens, admitted_tokens)
+        self.assertEqual(request.num_cached_tokens, admitted_tokens)
+
+    def create_mtp_recompute_scheduler(self, *, async_scheduling=True,
+                                     num_spec_tokens=1):
+        scheduler_cls = (AsyncRecomputeScheduler if async_scheduling
+                         else RecomputeScheduler)
+        with patch(f"{__name__}.NUM_SPECULATIVE_TOKENS", num_spec_tokens):
+            scheduler = self.create_scheduler(multimodal=False,
+                                              scheduler_cls=scheduler_cls)
+        scheduler.scheduler_config.async_scheduling = async_scheduling
+        scheduler.is_mtp_kv_consumer = True
+        scheduler.connector = MagicMock()
+        scheduler.connector.get_num_new_matched_tokens.return_value = (130,
+                                                                       False)
+        scheduler.connector.take_events.return_value = []
+        scheduler.connector.request_finished.return_value = (False, None)
+        scheduler.connector.request_finished_all_groups.return_value = (False, None)
+        return scheduler
+
+    def test_recompute_sync_prefix_hit_marks_scheduled_draft(self):
+        for async_scheduling in (False, True):
+            with self.subTest(async_scheduling=async_scheduling):
+                scheduler = self.create_mtp_recompute_scheduler(
+                    async_scheduling=async_scheduling)
+                request = create_requests(num_requests=1, num_tokens=131)[0]
+                scheduler.add_request(request)
+                initial_drafts = request.spec_token_ids.copy()
+
+                output = scheduler.schedule()
+
+                self.assertEqual(output.num_scheduled_tokens,
+                                 {request.request_id: 2})
+                self.assertEqual(output.scheduled_spec_decode_tokens,
+                                 {request.request_id: initial_drafts})
+                self.assertEqual(
+                    output.scheduled_new_reqs[0].num_computed_tokens, 130)
+                self.assertEqual(request.num_computed_tokens, 132)
+                if async_scheduling:
+                    self.assertEqual(request.num_output_placeholders, 2)
+
+    def test_recompute_sync_hit_keeps_next_async_batch_uniform(self):
+        scheduler = self.create_mtp_recompute_scheduler()
+        resumed = create_requests(num_requests=1, num_tokens=4096)[0]
+        resumed.request_id = "cold-resume"
+        scheduler.connector.get_num_new_matched_tokens.return_value = (4095,
+                                                                       True)
+        scheduler.add_request(resumed)
+        self.assertEqual(scheduler.schedule().num_scheduled_tokens, {})
+        self.assertEqual(resumed.status, RequestStatus.WAITING_FOR_REMOTE_KVS)
+
+        scheduler.connector.get_num_new_matched_tokens.return_value = (130,
+                                                                       False)
+        request = create_requests(num_requests=1, num_tokens=131)[0]
+        scheduler.add_request(request)
+        scheduler.schedule()
+
+        # Complete the asynchronous load before the short request's first
+        # output returns. Both requests need a target token plus one draft.
+        scheduler.finished_recving_kv_req_ids.add(resumed.request_id)
+
+        output = scheduler.schedule()
+
+        self.assertEqual(output.num_scheduled_tokens,
+                         {request.request_id: 2, resumed.request_id: 2})
+        self.assertEqual(output.total_num_scheduled_tokens, 4)
+        for req_id in output.num_scheduled_tokens:
+            self.assertEqual(len(output.scheduled_spec_decode_tokens[req_id]),
+                             1)
+        self.assertEqual(request.num_output_placeholders, 4)
+        self.assertEqual(resumed.num_output_placeholders, 2)
+
+    def test_recompute_sync_hit_does_not_mark_unscheduled_draft(self):
+        scheduler = self.create_mtp_recompute_scheduler()
+        scheduler.max_num_scheduled_tokens = 1
+        request = create_requests(num_requests=1, num_tokens=131)[0]
+        scheduler.add_request(request)
+
+        output = scheduler.schedule()
+
+        self.assertEqual(output.num_scheduled_tokens, {request.request_id: 1})
+        self.assertEqual(output.scheduled_spec_decode_tokens, {})
+        self.assertEqual(request.num_computed_tokens, 131)
+        self.assertEqual(request.num_output_placeholders, 1)
+
+    def test_recompute_async_prefix_load_keeps_draft_until_admission(self):
+        scheduler = self.create_mtp_recompute_scheduler()
+        scheduler.connector.get_num_new_matched_tokens.return_value = (130,
+                                                                       True)
+        request = create_requests(num_requests=1, num_tokens=131)[0]
+        scheduler.add_request(request)
+        initial_drafts = request.spec_token_ids.copy()
+
+        pending = scheduler.schedule()
+
+        self.assertEqual(pending.num_scheduled_tokens, {})
+        self.assertEqual(request.status, RequestStatus.WAITING_FOR_REMOTE_KVS)
+        self.assertEqual(request.spec_token_ids, initial_drafts)
+        scheduler.finished_recving_kv_req_ids.add(request.request_id)
+
+        ready = scheduler.schedule()
+
+        self.assertEqual(ready.num_scheduled_tokens, {request.request_id: 2})
+        self.assertEqual(ready.scheduled_spec_decode_tokens,
+                         {request.request_id: initial_drafts})
+        self.assertEqual(request.num_output_placeholders, 2)
+
+    def test_recompute_admission_covers_only_scheduled_draft_positions(self):
+        # (cached tokens, budget, draft count): miss, partial/full prefix,
+        # partial prefill, exact prompt boundary and partial draft coverage.
+        cases = [(0, 64, 1), (0, 132, 1), (64, 32, 1), (64, 67, 1),
+                 (64, 68, 1), (130, 1, 3), (130, 2, 3), (130, 4, 3)]
+        for async_scheduling in (False, True):
+            for cached, budget, draft_count in cases:
+                with self.subTest(async_scheduling=async_scheduling,
+                                  cached=cached, budget=budget,
+                                  draft_count=draft_count):
+                    scheduler = self.create_mtp_recompute_scheduler(
+                        async_scheduling=async_scheduling,
+                        num_spec_tokens=draft_count)
+                    scheduler.max_num_scheduled_tokens = budget
+                    scheduler.connector.get_num_new_matched_tokens.return_value = (
+                        cached, False)
+                    request = create_requests(num_requests=1, num_tokens=131)[0]
+                    scheduler.add_request(request)
+                    initial_drafts = request.spec_token_ids.copy()
+
+                    output = scheduler.schedule()
+
+                    scheduled = output.num_scheduled_tokens[request.request_id]
+                    self.assertEqual(scheduled, min(budget, 131 + draft_count - cached))
+                    draft_positions = [p for p in range(cached, cached + scheduled)
+                                       if 131 <= p < 131 + draft_count]
+                    self.assertEqual(
+                        output.scheduled_spec_decode_tokens.get(request.request_id, []),
+                        initial_drafts[:len(draft_positions)])
+                    self.assertEqual(request.num_computed_tokens, cached + scheduled)
+                    expected_pending = (1 + len(draft_positions)
+                                        if async_scheduling and cached + scheduled >= 131
+                                        else 0)
+                    self.assertEqual(request.num_output_placeholders, expected_pending)
+
+    def test_recompute_admission_allocation_failure_keeps_drafts(self):
+        scheduler = self.create_mtp_recompute_scheduler()
+        request = create_requests(num_requests=1, num_tokens=131)[0]
+        scheduler.add_request(request)
+        initial_drafts = request.spec_token_ids.copy()
+        with patch.object(scheduler.kv_cache_manager, "allocate_slots", return_value=None):
+            output = scheduler.schedule()
+        self.assertEqual(output.num_scheduled_tokens, {})
+        self.assertEqual(request.status, RequestStatus.WAITING)
+        self.assertEqual(request.num_computed_tokens, 0)
+        self.assertEqual(request.num_output_placeholders, 0)
+        self.assertEqual(request.spec_token_ids, initial_drafts)
+        retry = scheduler.schedule()
+        self.assertEqual(retry.scheduled_spec_decode_tokens,
+                         {request.request_id: initial_drafts})
+
+    def test_recompute_admission_rejection_with_output_in_flight(self):
+        for accepted_later in (0, 1):
+            with self.subTest(accepted_later=accepted_later):
+                scheduler = self.create_mtp_recompute_scheduler()
+                request = create_requests(num_requests=1, num_tokens=131)[0]
+                scheduler.add_request(request)
+                first = scheduler.schedule()
+                second = scheduler.schedule()
+
+                # The initial -1 draft is rejected. Its result arrives after
+                # another step has already reserved output placeholders.
+                result = make_output(scheduler)
+                result.sampled_token_ids = [[10]]
+                scheduler.update_from_output(first, result)
+                self.assertEqual(request.num_computed_tokens, 133)
+                self.assertEqual(request.num_output_placeholders, 2)
+                self.assertEqual(list(request.output_token_ids), [10])
+
+                result.sampled_token_ids = [[11, 12][:1 + accepted_later]]
+                scheduler.update_from_output(second, result)
+                self.assertEqual(request.num_output_placeholders, 0)
+                self.assertEqual(request.num_computed_tokens, request.num_tokens - 1)
+                self.assertEqual(list(request.output_token_ids),
+                                 [10, 11, 12][:2 + accepted_later])
+                self.assertEqual(scheduler.schedule().num_scheduled_tokens,
+                                 {request.request_id: 2})
+
+    def test_recompute_admission_rejection_obeys_stop_limits(self):
+        for stop in ("eos", "length"):
+            with self.subTest(stop=stop):
+                scheduler = self.create_mtp_recompute_scheduler()
+                request = create_requests(num_requests=1, num_tokens=131,
+                                          max_tokens=1 if stop == "length" else 16)[0]
+                if stop == "eos":
+                    request.sampling_params.eos_token_id = 10
+                scheduler.add_request(request)
+                scheduled = scheduler.schedule()
+                result = make_output(scheduler)
+                result.sampled_token_ids = [[10]]
+
+                scheduler.update_from_output(scheduled, result)
+
+                self.assertTrue(request.is_finished())
+                self.assertEqual(list(request.output_token_ids), [10])
+                self.assertEqual(request.num_output_placeholders, 0)
+                self.assertEqual(scheduler.schedule().num_scheduled_tokens, {})
+
+    def test_recompute_preemption_clears_admission_drafts(self):
+        scheduler = self.create_mtp_recompute_scheduler()
+        request = create_requests(num_requests=1, num_tokens=131)[0]
+        scheduler.add_request(request)
+        first = scheduler.schedule()
+        result = make_output(scheduler)
+        result.sampled_token_ids = [[10]]
+        scheduler.update_from_output(first, result)
+
+        scheduler.running.remove(request)
+        scheduler._preempt_request(request, 0.0)
+        self.assertEqual(request.spec_token_ids, [])
+        self.assertEqual(request.num_computed_tokens, 0)
+        self.assertEqual(request.num_preemptions, 1)
+        scheduler.connector.get_num_new_matched_tokens.return_value = (64, False)
+        # A preempted request is not also resumed in its preemption step.
+        budget = scheduler.max_num_scheduled_tokens
+        scheduler.max_num_scheduled_tokens = 0
+        scheduler.schedule()
+        scheduler.max_num_scheduled_tokens = budget
+
+        resumed = scheduler.schedule()
+
+        self.assertEqual(resumed.num_scheduled_tokens, {request.request_id: 68})
+        self.assertEqual(resumed.scheduled_spec_decode_tokens, {})
+
+    def test_schedule_multimodal_requests(self):
+        scheduler = self.create_scheduler()
+        scheduler.scheduler_config.chunked_prefill_enabled = True
+        mm_positions = [[PlaceholderRange(offset=i, length=10)]
+                        for i in range(10)]
+        requests = create_requests(
+            num_requests=10,
+            mm_positions=mm_positions,
+        )
+        for request in requests:
+            scheduler.add_request(request)
+
+        output = scheduler.schedule()
+        self.assertEqual(len(output.scheduled_new_reqs), len(requests))
+        self.assertEqual(output.scheduled_cached_reqs.num_reqs, 0)
+        self.assertEqual(len(output.finished_req_ids), 0)
+        for req_id, num_tokens in output.num_scheduled_tokens.items():
+            assert num_tokens == len(requests[int(req_id)].prompt_token_ids)
+
+        # Verify all requests are scheduled.
+        for req_id, num_tokens in output.num_scheduled_tokens.items():
+            self.assertEqual(num_tokens,
+                             len(requests[int(req_id)].prompt_token_ids))
+        self.assertEqual(len(output.scheduled_encoder_inputs), len(requests))
+        for req_id, encoder_input in output.scheduled_encoder_inputs.items():
+            assert len(encoder_input) == 1
+
+        # Verify requests moved from waiting to running
+        self.assertEqual(len(scheduler.waiting), 0)
+        self.assertEqual(len(scheduler.running), len(requests))
+        for i, request in enumerate(requests):
+            self.assertEqual(scheduler.running[i], request)
+
+    def test_schedule_enable_prefix_caching(self):
+        '''Test scheduling.
+        Two cases: default APC/no prompt logprobs; APC=True + prompt logprobs
+        '''
+        global ENABLE_PREFIX_CACHING
+        ENABLE_PREFIX_CACHING = True
+        global PROMPT_LOGPROBS
+        PROMPT_LOGPROBS = 5
+        scheduler = self.create_scheduler()
+        scheduler.scheduler_config.chunked_prefill_enabled = False
+        requests = create_requests(num_requests=10)
+        for request in requests:
+            scheduler.add_request(request)
+
+        # Test initial scheduling
+        output = scheduler.schedule()
+        self.assertEqual(len(output.scheduled_new_reqs), len(requests))
+        self.assertEqual(output.scheduled_cached_reqs.num_reqs, 0)
+        self.assertEqual(len(output.finished_req_ids), 0)
+        # Verify all requests are scheduled.
+        for req_id, num_tokens in output.num_scheduled_tokens.items():
+            self.assertEqual(num_tokens,
+                             len(requests[int(req_id)].prompt_token_ids))
+
+        # Verify requests moved from waiting to running
+        self.assertEqual(len(scheduler.waiting), 0)
+        self.assertEqual(len(scheduler.running), len(requests))
+        for i, request in enumerate(requests):
+            self.assertEqual(scheduler.running[i], request)
+
+    def test_stop_via_update_from_output(self):
+        """Test stopping behavior through update_from_output"""
+        global NUM_SPECULATIVE_TOKENS
+        NUM_SPECULATIVE_TOKENS = 1
+        scheduler = self.create_scheduler()
+
+        # Test case 1: Stop on EOS token
+        requests = create_requests(num_requests=2, max_tokens=10)
+        for req in requests:
+            req.num_computed_tokens = req.num_tokens
+            scheduler.requests[req.request_id] = req
+            scheduler.running.append(req)
+            req.status = RequestStatus.RUNNING
+
+        scheduler_output = SchedulerOutput(scheduled_new_reqs=[],
+                                           scheduled_cached_reqs=[],
+                                           num_scheduled_tokens={
+                                               requests[0].request_id: 1,
+                                               requests[1].request_id: 2
+                                           },
+                                           total_num_scheduled_tokens=3,
+                                           scheduled_encoder_inputs={},
+                                           scheduled_spec_decode_tokens={
+                                               requests[0].request_id: [],
+                                               requests[1].request_id: [10]
+                                           },
+                                           num_common_prefix_blocks=0,
+                                           finished_req_ids=set(),
+                                           free_encoder_mm_hashes=[])
+        model_output = ModelRunnerOutput(
+            req_ids=[req.request_id for req in requests],
+            req_id_to_index={
+                req.request_id: i
+                for i, req in enumerate(requests)
+            },
+            sampled_token_ids=[[EOS_TOKEN_ID], [10, 11]
+                               ],  # First request hits EOS, second continues
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[])
+
+        scheduler.update_from_output(scheduler_output, model_output)
+
+        # Verify first request stopped, second continues
+        self.assertEqual(len(scheduler.running), 1)
+        self.assertEqual(scheduler.running[0].request_id,
+                         requests[1].request_id)
+        self.assertEqual(requests[0].status, RequestStatus.FINISHED_STOPPED)
+        self.assertIn(requests[0].request_id, scheduler.finished_req_ids)
+        self.assertEqual(list(requests[0].output_token_ids), [EOS_TOKEN_ID])
+        self.assertEqual(list(requests[1].output_token_ids), [10, 11])
+
+        # Test case 2: Stop on custom stop token
+        NUM_SPECULATIVE_TOKENS = 2
+        scheduler = self.create_scheduler()
+        requests = create_requests(num_requests=2,
+                                   max_tokens=10,
+                                   stop_token_ids=[42, 43])
+        for req in requests:
+            req.num_computed_tokens = req.num_tokens
+            scheduler.requests[req.request_id] = req
+            scheduler.running.append(req)
+            req.status = RequestStatus.RUNNING
+
+        scheduler_output = SchedulerOutput(scheduled_new_reqs=[],
+                                           scheduled_cached_reqs=[],
+                                           num_scheduled_tokens={
+                                               requests[0].request_id: 3,
+                                               requests[1].request_id: 2
+                                           },
+                                           total_num_scheduled_tokens=5,
+                                           scheduled_encoder_inputs={},
+                                           scheduled_spec_decode_tokens={
+                                               requests[0].request_id:
+                                               [10, 42],
+                                               requests[1].request_id: [13]
+                                           },
+                                           num_common_prefix_blocks=0,
+                                           finished_req_ids=set(),
+                                           free_encoder_mm_hashes=[])
+        model_output = ModelRunnerOutput(
+            req_ids=[req.request_id for req in requests],
+            req_id_to_index={
+                req.request_id: i
+                for i, req in enumerate(requests)
+            },
+            sampled_token_ids=[[10, 42, 12],
+                               [13, 14]],  # First request hits stop token
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[])
+
+        scheduler.update_from_output(scheduler_output, model_output)
+
+        # Verify first request stopped on custom token
+        self.assertEqual(len(scheduler.running), 1)
+        self.assertEqual(scheduler.running[0].request_id,
+                         requests[1].request_id)
+        self.assertEqual(requests[0].status, RequestStatus.FINISHED_STOPPED)
+        self.assertEqual(requests[0].stop_reason, 42)
+        self.assertIn(requests[0].request_id, scheduler.finished_req_ids)
+        self.assertEqual(list(requests[0].output_token_ids), [10, 42])
+        self.assertEqual(list(requests[1].output_token_ids), [13, 14])
+
+        # Test case 3: Stop on max tokens
+        NUM_SPECULATIVE_TOKENS = 2
+        scheduler = self.create_scheduler()
+        requests = create_requests(num_requests=2, max_tokens=2)
+        for req in requests:
+            req.num_computed_tokens = req.num_tokens
+            scheduler.requests[req.request_id] = req
+            scheduler.running.append(req)
+            req.status = RequestStatus.RUNNING
+
+        scheduler_output = SchedulerOutput(scheduled_new_reqs=[],
+                                           scheduled_cached_reqs=[],
+                                           num_scheduled_tokens={
+                                               requests[0].request_id: 3,
+                                               requests[1].request_id: 1
+                                           },
+                                           total_num_scheduled_tokens=4,
+                                           scheduled_encoder_inputs={},
+                                           scheduled_spec_decode_tokens={
+                                               requests[0].request_id:
+                                               [10, 11],
+                                               requests[1].request_id: []
+                                           },
+                                           num_common_prefix_blocks=0,
+                                           finished_req_ids=set(),
+                                           free_encoder_mm_hashes=[])
+        model_output = ModelRunnerOutput(
+            req_ids=[req.request_id for req in requests],
+            req_id_to_index={
+                req.request_id: i
+                for i, req in enumerate(requests)
+            },
+            sampled_token_ids=[[10, 11, 12],
+                               [13]],  # First request exceeds max_tokens
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[])
+        scheduler.update_from_output(scheduler_output, model_output)
+
+        # Verify first request stopped due to length
+        self.assertEqual(len(scheduler.running), 1)
+        self.assertEqual(scheduler.running[0].request_id,
+                         requests[1].request_id)
+        self.assertEqual(requests[0].status,
+                         RequestStatus.FINISHED_LENGTH_CAPPED)
+        self.assertIn(requests[0].request_id, scheduler.finished_req_ids)
+        self.assertEqual(list(requests[0].output_token_ids), [10, 11])
+        self.assertEqual(list(requests[1].output_token_ids), [13])
+
+        # Test case 4: Ignore EOS flag
+        scheduler = self.create_scheduler()
+        requests = create_requests(num_requests=1, max_tokens=10)
+        requests[0].sampling_params.ignore_eos = True
+        requests[0].num_computed_tokens = requests[0].num_tokens
+        scheduler.requests[requests[0].request_id] = requests[0]
+        scheduler.running.append(requests[0])
+
+        scheduler_output = SchedulerOutput(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=[],
+            num_scheduled_tokens={requests[0].request_id: 3},
+            total_num_scheduled_tokens=3,
+            scheduled_encoder_inputs={},
+            scheduled_spec_decode_tokens={
+                requests[0].request_id: [EOS_TOKEN_ID, 10]
+            },
+            num_common_prefix_blocks=0,
+            finished_req_ids=set(),
+            free_encoder_mm_hashes=[])
+        model_output = ModelRunnerOutput(
+            req_ids=[requests[0].request_id],
+            req_id_to_index={requests[0].request_id: 0},
+            sampled_token_ids=[[EOS_TOKEN_ID, 10, 11]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[])
+
+        scheduler.update_from_output(scheduler_output, model_output)
+
+        # Verify request continues past EOS
+        self.assertEqual(len(scheduler.running), 1)
+        self.assertFalse(requests[0].is_finished())
+        self.assertEqual(list(requests[0].output_token_ids),
+                         [EOS_TOKEN_ID, 10, 11])
+
+    def test_recompute_worker_metadata_precedes_same_step_finish(self):
+        scheduler = self.create_scheduler()
+        request = create_requests(num_requests=1, max_tokens=1)[0]
+        scheduler.add_request(request)
+        scheduler_output = scheduler.schedule()
+        scheduler_output.recomputed_reqs = None
+        connector = scheduler.connector = MagicMock()
+        calls = []
+        connector.update_connector_worker_metadata.side_effect = (
+            lambda *_args: calls.append("metadata")
+        )
+        connector.request_finished.side_effect = (
+            lambda *_args: calls.append("finished") or (False, None)
+        )
+        connector.update_connector_output.side_effect = (
+            lambda *_args: calls.append("output")
+        )
+        connector.take_events.return_value = None
+
+        model_output = ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[EOS_TOKEN_ID]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            kv_connector_output=KVConnectorOutput(
+                kv_connector_worker_meta=MagicMock()
+            ),
+        )
+
+        RecomputeScheduler.update_from_output(
+            scheduler, scheduler_output, model_output
+        )
+
+        self.assertEqual(calls, ["metadata", "finished", "output"])
+
+    def test_schedule_concurrent_batches(self):
+        global MAX_NUM_BATCHED_TOKENS
+        global ENABLE_PREFIX_CACHING
+        global ENABLE_CHUNKED_PREFILL
+        global MAX_NUM_SEQS
+        global PROMPT_LOGPROBS
+        ENABLE_PREFIX_CACHING = None
+        MAX_NUM_BATCHED_TOKENS = 1024
+        MAX_NUM_SEQS = 2
+        ENABLE_CHUNKED_PREFILL = True
+        PROMPT_LOGPROBS = None
+
+        enable_prefix_caching_list = [None, True]
+        prompt_logprobs_list = [None, 5]
+
+        for i in range(len(enable_prefix_caching_list)):
+            ENABLE_PREFIX_CACHING = enable_prefix_caching_list[i]
+            PROMPT_LOGPROBS = prompt_logprobs_list[i]
+            scheduler = self.create_scheduler()
+            requests = create_requests(
+                num_requests=2,
+                num_tokens=512,
+            )
+
+            # Schedule the first request.
+            scheduler.add_request(requests[0])
+            scheduler_output0 = scheduler.schedule()
+            self.assertEqual(len(scheduler_output0.scheduled_new_reqs), 1)
+            self.assertEqual(
+                scheduler_output0.num_scheduled_tokens[requests[0].request_id],
+                512)
+
+            # The first request is still running, so only schedule the second request.
+            scheduler.add_request(requests[1])
+            scheduler_output1 = scheduler.schedule()
+            self.assertEqual(len(scheduler_output1.scheduled_new_reqs), 1)
+            self.assertEqual(
+                scheduler_output1.num_scheduled_tokens[requests[1].request_id],
+                512)
+
+            # Model output of the first request.
+            model_runner_output = ModelRunnerOutput(
+                req_ids=[requests[0].request_id],
+                req_id_to_index={requests[0].request_id: 0},
+                sampled_token_ids=[[0]],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[])
+
+            scheduler.update_from_output(scheduler_output0,
+                                         model_runner_output)
+
+            # Schedule the next step.
+            # The first request can be scheduled again while the second
+            # request is still running.
+            scheduler.schedule()
+            # Model output of the second request.
+            model_runner_output = ModelRunnerOutput(
+                req_ids=[requests[1].request_id],
+                req_id_to_index={requests[1].request_id: 0},
+                sampled_token_ids=[[0]],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[])
+
+            scheduler.update_from_output(scheduler_output1,
+                                         model_runner_output)
+
+    def test_schedule_spec_decoding_stats(self):
+        """Test scheduling behavior with speculative decoding.
+
+        This test verifies that:
+        1. Speculated tokens get scheduled correctly
+        2. Spec decoding stats properly count number of draft and accepted tokens
+        """
+        spec_tokens_list: List[List[List[int]]] = [[[1, 2, 3]], [[1, 2, 3]],
+                                                   [[1, 2], [3]], [[1]], [[]],
+                                                   [[1, 2, 3], [4, 5, 6]]]
+        output_tokens_list: List[List[List[int]]] = [[[1, 2, 3, 4]], [[1, 5]],
+                                                     [[1, 2, 5], [3, 4]],
+                                                     [[1, 2]], [[5]],
+                                                     [[1, 2, 7], [4, 8]]]
+        expected_list: List[Tuple[int, int,
+                                  int, List[int]]] = [(1, 3, 3, [1, 1, 1]),
+                                                      (1, 3, 1, [1, 0, 0]),
+                                                      (2, 3, 3, [2, 1]),
+                                                      (1, 1, 1, [1]),
+                                                      (0, 0, 0, [0]),
+                                                      (2, 6, 3, [2, 1, 0])]
+
+        global NUM_SPECULATIVE_TOKENS
+        for idx in range(len(spec_tokens_list)):
+            spec_tokens = spec_tokens_list[idx]
+            output_tokens = output_tokens_list[idx]
+            expected = expected_list[idx]
+            num_spec_tokens = max(1, max(len(t) for t in spec_tokens))
+            NUM_SPECULATIVE_TOKENS = num_spec_tokens
+            scheduler = self.create_scheduler()
+            requests = create_requests(num_requests=len(spec_tokens),
+                                       num_tokens=1)
+            req_ids = []
+            req_to_index = {}
+            for i, request in enumerate(requests):
+                scheduler.add_request(request)
+                req_ids.append(request.request_id)
+                req_to_index[request.request_id] = i
+
+            # Schedule a decode, which will also draft speculative tokens
+            output = scheduler.schedule()
+            self.assertEqual(len(output.scheduled_new_reqs), len(requests))
+            self.assertEqual(output.total_num_scheduled_tokens, len(requests))
+            for i in range(len(requests)):
+                req_id = requests[i].request_id
+                self.assertEqual(output.num_scheduled_tokens[req_id], 1)
+                self.assertNotIn(req_id, output.scheduled_spec_decode_tokens)
+
+            model_runner_output = ModelRunnerOutput(
+                req_ids=req_ids,
+                req_id_to_index=req_to_index,
+                sampled_token_ids=[[0] for _ in range(len(requests))],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[])
+            draft_token_ids = DraftTokenIds(req_ids, spec_tokens)
+
+            engine_core_outputs = scheduler.update_from_output(
+                output, model_runner_output)
+            scheduler.update_draft_token_ids(draft_token_ids)
+
+            for i in range(len(requests)):
+                running_req = scheduler.running[i]
+                # The prompt token
+                self.assertEqual(running_req.num_computed_tokens, 1)
+                # The prompt token and the sampled token
+                self.assertEqual(running_req.num_tokens, 2)
+                # The prompt token, the sampled token, and the speculated tokens
+                self.assertEqual(running_req.num_tokens_with_spec,
+                                 2 + len(spec_tokens[i]))
+
+            # No draft or accepted tokens counted yet
+            self.assertTrue(
+                not engine_core_outputs
+                or (engine_core_outputs[0].scheduler_stats.spec_decoding_stats
+                    is None))
+
+            # Schedule the speculated tokens for validation
+            output = scheduler.schedule()
+            self.assertEqual(len(output.scheduled_new_reqs), 0)
+            # The sampled token and speculated tokens
+            self.assertEqual(
+                output.total_num_scheduled_tokens,
+                len(requests) + sum(len(ids) for ids in spec_tokens))
+            for i in range(len(requests)):
+                req_id = requests[i].request_id
+                self.assertEqual(output.num_scheduled_tokens[req_id],
+                                 1 + len(spec_tokens[i]))
+                if spec_tokens[i]:
+                    self.assertEqual(
+                        len(output.scheduled_spec_decode_tokens[req_id]),
+                        len(spec_tokens[i]))
+                else:
+                    self.assertNotIn(req_id,
+                                     output.scheduled_spec_decode_tokens)
+
+            model_runner_output = ModelRunnerOutput(
+                req_ids=req_ids,
+                req_id_to_index=req_to_index,
+                sampled_token_ids=output_tokens,
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[])
+
+            engine_core_outputs = scheduler.update_from_output(
+                output, model_runner_output)
+
+            scheduler_stats = engine_core_outputs[0].scheduler_stats \
+                if engine_core_outputs else None
+            if expected[0] == 0:
+                self.assertIsNone(scheduler_stats.spec_decoding_stats)
+            else:
+                self.assertIsNotNone(scheduler_stats.spec_decoding_stats)
+                stats = scheduler_stats.spec_decoding_stats
+                self.assertEqual(stats.num_drafts, expected[0])
+                self.assertEqual(stats.num_draft_tokens, expected[1])
+                self.assertEqual(stats.num_accepted_tokens, expected[2])
+                self.assertEqual(stats.num_accepted_tokens_per_pos,
+                                 expected[3])
+
+    def assert_scheduler_empty(self, scheduler):
+        """Confirm the scheduler is "empty" - i.e. no leaks."""
+        # Scheduler Metadata.
+        scheduler = self.create_scheduler()
+        self.assertEqual(len(scheduler.requests), 0)
+        self.assertEqual(len(scheduler.waiting), 0)
+        self.assertEqual(len(scheduler.running), 0)
+        self.assertEqual(len(scheduler.finished_req_ids), 0)
+
+        # EncoderCacheManager.
+        self.assertEqual(len(scheduler.encoder_cache_manager.freed), 0)
+        self.assertEqual(len(scheduler.encoder_cache_manager.cached), 0)
+
+        # KVCache Manager.
+        self.assertEqual(
+            len(scheduler.kv_cache_manager.coordinator.single_type_managers[0].
+                req_to_blocks), 0)
+        self.assertEqual(
+            len(scheduler.kv_cache_manager.coordinator.single_type_managers[0].
+                num_cached_block), 0)
+        num_free_blocks = (scheduler.kv_cache_manager.block_pool.
+                           free_block_queue.num_free_blocks)
+        self.assertEqual(
+            num_free_blocks,
+            scheduler.kv_cache_manager.block_pool.num_gpu_blocks - 1)
+
+        # NOTE(rob): just the ref count on blocks will be 0. The hash
+        # value, etc will remain since we lazily evict for prefix cache.
+        for block in scheduler.kv_cache_manager.block_pool.blocks:
+            self.assertEqual(block.ref_cnt, 0)
+
+    def test_memory_leak(self):
+        """Test that we do not have a memory leak."""
+        scheduler = self.create_scheduler()
+        NUM_REQUESTS = 5
+        NUM_TOKENS = 10
+        MAX_TOKENS = 10
+        requests = create_requests(num_requests=NUM_REQUESTS,
+                                   num_tokens=NUM_TOKENS,
+                                   max_tokens=MAX_TOKENS)
+
+        # Add each request.
+        for request in requests:
+            scheduler.add_request(request)
+            scheduler_output = scheduler.schedule()
+            model_runner_output = make_output(scheduler)
+            scheduler.update_from_output(scheduler_output, model_runner_output)
+
+        # Iterate until done.
+        while True:
+            scheduler_output = scheduler.schedule()
+            if len(scheduler.running) == 0:
+                break
+            model_runner_output = make_output(scheduler)
+            scheduler.update_from_output(scheduler_output, model_runner_output)
+
+        # Confirm no memory leak.
+        self.assert_scheduler_empty(scheduler)

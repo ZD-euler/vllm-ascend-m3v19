@@ -33,14 +33,11 @@ on:
         type: choice
         options:
           - main
-          - v0.19.1rc1
-          - v0.18.0
-          - v0.18.0rc1
           - v0.17.0rc1
           - v0.16.0rc1
           - v0.15.0rc1
           - v0.14.0rc1
-          - v0.13.0
+          - v0.13.0rc3
 
 jobs:
   build_and_release_code:
@@ -48,7 +45,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.12"]
+        python-version: ["3.11"]
     steps:
       - name: checkout vllm-ascend
         if: ${{ github.event_name != 'workflow_dispatch' }}
@@ -96,7 +93,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm]
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.10", "3.11"]
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -136,8 +133,32 @@ jobs:
 
       - name: Repair wheels with auditwheel
         run: |
-          python3 -m pip install auditwheel patchelf
-          python3 .github/workflows/scripts/wheel/auto_exclude.py dist
+          python3 -m pip install auditwheel
+          python3 -m pip install patchelf
+          mkdir -p dist/repaired
+          for whl in dist/*.whl; do
+            auditwheel repair "$whl" -w dist/repaired/ \
+            --exclude libplatform.so \
+            --exclude libregister.so \
+            --exclude libge_common_base.so \
+            --exclude libc10.so \
+            --exclude libc_sec.so \
+            --exclude libnnopbase.so \
+            --exclude libprofapi.so \
+            --exclude libgraph_base.so \
+            --exclude libgraph.so \
+            --exclude libexe_graph.so \
+            --exclude "libascend*.so" \
+            --exclude "libtorch*.so" \
+            --exclude "libopapi.so" \
+            --exclude "liberror_manager.so" \
+            --exclude "libruntime.so" \
+            --exclude "libmmpa.so"
+
+          done
+          rm -f dist/*.whl
+          mv dist/repaired/*.whl dist/
+          rmdir dist/repaired
           ls dist
 
       - name: Verify automatic platform tags
@@ -180,7 +201,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm]
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.10", "3.11"]
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -220,8 +241,32 @@ jobs:
 
       - name: Repair wheels with auditwheel
         run: |
-          python3 -m pip install auditwheel patchelf
-          python3 .github/workflows/scripts/wheel/auto_exclude.py dist
+          python3 -m pip install auditwheel
+          python3 -m pip install patchelf
+          mkdir -p dist/repaired
+          for whl in dist/*.whl; do
+            auditwheel repair "$whl" -w dist/repaired/ \
+            --exclude libplatform.so \
+            --exclude libregister.so \
+            --exclude libge_common_base.so \
+            --exclude libc10.so \
+            --exclude libc_sec.so \
+            --exclude libnnopbase.so \
+            --exclude libprofapi.so \
+            --exclude libgraph_base.so \
+            --exclude libgraph.so \
+            --exclude libexe_graph.so \
+            --exclude "libascend*.so" \
+            --exclude "libtorch*.so" \
+            --exclude "libopapi.so" \
+            --exclude "liberror_manager.so" \
+            --exclude "libruntime.so" \
+            --exclude "libmmpa.so"
+
+          done
+          rm -f dist/*.whl
+          mv dist/repaired/*.whl dist/
+          rmdir dist/repaired
           ls dist
 
       - name: Verify automatic platform tags
@@ -258,7 +303,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm]
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.10", "3.11"]
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -298,8 +343,32 @@ jobs:
 
       - name: Repair wheels with auditwheel
         run: |
-          python3 -m pip install auditwheel patchelf
-          python3 .github/workflows/scripts/wheel/auto_exclude.py dist
+          python3 -m pip install auditwheel
+          python3 -m pip install patchelf
+          mkdir -p dist/repaired
+          for whl in dist/*.whl; do
+            auditwheel repair "$whl" -w dist/repaired/ \
+            --exclude libplatform.so \
+            --exclude libregister.so \
+            --exclude libge_common_base.so \
+            --exclude libc10.so \
+            --exclude libc_sec.so \
+            --exclude libnnopbase.so \
+            --exclude libprofapi.so \
+            --exclude libgraph_base.so \
+            --exclude libgraph.so \
+            --exclude libexe_graph.so \
+            --exclude "libascend*.so" \
+            --exclude "libtorch*.so" \
+            --exclude "libopapi.so" \
+            --exclude "liberror_manager.so" \
+            --exclude "libruntime.so" \
+            --exclude "libmmpa.so"
+
+          done
+          rm -f dist/*.whl
+          mv dist/repaired/*.whl dist/
+          rmdir dist/repaired
           ls dist
 
       - name: Verify automatic platform tags
@@ -338,7 +407,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Download all variant wheels
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v4
         with:
           pattern: '*-wheel'
           path: all-wheels/
@@ -354,7 +423,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
       - name: Generate combined variant index
         run: |

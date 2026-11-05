@@ -22,12 +22,57 @@ import os
 from collections.abc import Callable
 from typing import Any
 
+from vllm.v1.core.dsa_shared_pool import layerwise_prefill_bank_count
+
+
+def _strict_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name, "true" if default else "false")
+    normalized = raw.strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise ValueError(f"{name} must be 'true' or 'false', got {raw!r}")
+
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
 
 # begin-env-vars-definition
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Raw tensors for real PD diagnostics. Empty (default) disables all hooks.
+    # Otherwise an absolute run directory, e.g. /repo/pd-tensor-dump/case-on.
+    # Non-secret setting; files contain request/model data. Requires eager,
+    # compilation mode 0 and synchronous scheduling; introduces host readback.
+    "VLLM_ASCEND_PD_TENSOR_DUMP_DIR": lambda: os.getenv("VLLM_ASCEND_PD_TENSOR_DUMP_DIR", "").strip(),
+    # Non-secret diagnostic row limit per request-local 4096-token segment.
+    # Default 0 (all tokens); integer in [0, 4096]. Positive values retain the
+    # legacy chunk-prefix sample. Only read when PD_TENSOR_DUMP_DIR is enabled.
+    "VLLM_ASCEND_PD_TENSOR_DUMP_MAX_TOKENS": lambda: int(os.getenv("VLLM_ASCEND_PD_TENSOR_DUMP_MAX_TOKENS", "0")),
+    # Non-secret diagnostic last-feature-axis limit; integer >= 0, default 8.
+    # 0 keeps full features. Token/head axes, IDs, top-k, logits and rejection
+    # evidence stay intact. KV is narrowed before gather and device readback.
+    "VLLM_ASCEND_PD_TENSOR_DUMP_MAX_FEATURES": lambda: int(os.getenv("VLLM_ASCEND_PD_TENSOR_DUMP_MAX_FEATURES", "8")),
+    # Shared PD serving performance diagnostics across vLLM and LMCache.
+    # Non-sensitive; configure before worker startup. Default 0/off. Values:
+    # 1 = host timing, detail = extra host detail, device = opt-in device timing.
+    # Empty/0/false/no/off disable it (case-insensitive). Other nonfalse values
+    # retain host timing semantics. Content/crash diagnostics remain separate.
+    "PD_SERVING_PERF": lambda: os.getenv("PD_SERVING_PERF", "0").strip().lower(),
+    # Explicit PD prefill-node marker and feature gate for the layerwise DSA
+    # child pool. It is intentionally independent of kv_role/kv_rank.
+    "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE": lambda: _strict_bool_env(
+        "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE"
+    ),
+    # Non-secret P-node bank rotation depth. Positive integer, default 4;
+    # ignored unless the P-node switch above is true. Read before startup.
+    "VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS": layerwise_prefill_bank_count,
+    # Non-secret P-node bank overlap statistics. Default false; accepts
+    # true/false. Records NPU timing events, without host synchronization;
+    # a background collector emits one summary per chunked-prefill step.
+    "VLLM_ASCEND_PREFILL_OVERLAP_STATS": lambda: _strict_bool_env(
+        "VLLM_ASCEND_PREFILL_OVERLAP_STATS"
+    ),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.
@@ -71,7 +116,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE", "0"))),
     # Whether to enable FlashComm optimization when tensor parallel is enabled.
     # This feature will get better performance when concurrency is large.
-    # DEPRECATED: use additional_config.enable_flashcomm1 instead.
     "VLLM_ASCEND_ENABLE_FLASHCOMM1": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_FLASHCOMM1", "0"))),
     # Whether to enable FLASHCOMM2. Setting it to 0 disables the feature, while setting it to 1 or above enables it.
     # The specific value set will be used as the O-matrix TP group size for flashcomm2.
@@ -90,9 +134,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # 1: only quant case enable nz;
     # 2: enable nz as long as possible.
     "VLLM_ASCEND_ENABLE_NZ": lambda: int(os.getenv("VLLM_ASCEND_ENABLE_NZ", 1)),
+    # Decide whether we should enable CP parallelism.
+    "VLLM_ASCEND_ENABLE_CONTEXT_PARALLEL": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_CONTEXT_PARALLEL", "0"))),
     # Whether to anbale dynamic EPLB
     "DYNAMIC_EPLB": lambda: os.getenv("DYNAMIC_EPLB", "false").lower(),
-    # Whether to enable fused MC2 (`dispatch_gmm_combine_decode` / `dispatch_ffn_combine`).
+    # Whether to enable fused mc2(`dispatch_gmm_combine_decode`/`dispatch_ffn_combine` operator)
     # 0, or not set: default ALLTOALL and MC2 will be used.
     # 1: ALLTOALL and MC2 might be replaced by `dispatch_ffn_combine` operator.
     # `dispatch_ffn_combine` can be used only for moe layer with W8A8, EP<=32, non-mtp, non-dynamic-eplb.
@@ -100,18 +146,196 @@ env_variables: dict[str, Callable[[], Any]] = {
     # `dispatch_gmm_combine_decode` can be used only for **decode node** moe layer
     # with W8A8. And MTP layer must be W8A8.
     "VLLM_ASCEND_ENABLE_FUSED_MC2": lambda: int(os.getenv("VLLM_ASCEND_ENABLE_FUSED_MC2", "0")),
-    # DEPRECATED: VLLM_ASCEND_BALANCE_SCHEDULING env var will be removed in a future release.
-    # Use --additional-config '{"enable_balance_scheduling": true}' instead.
+    # Whether to anbale balance scheduling
     "VLLM_ASCEND_BALANCE_SCHEDULING": lambda: bool(int(os.getenv("VLLM_ASCEND_BALANCE_SCHEDULING", "0"))),
     # use fused op transpose_kv_cache_by_block, default is True
     "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK": lambda: bool(
         int(os.getenv("VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK", "1"))
     ),
-    # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
-    # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
-    "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
-    # Whether to use MultiBlockPool for KV cache management
-    "VLLM_ASCEND_APPLY_DSV4_PATCH": lambda: bool(int(os.getenv("VLLM_ASCEND_APPLY_DSV4_PATCH", "0"))),
+    # Enable DSA latent KV offload for GLM5.1 (GlmMoeDsa): at prefill end the MLA
+    # latent KV is offloaded to LMCache and only the indexer-selected top-k tokens
+    # are gathered back per decode step, while the indexer-key cache stays resident.
+    # Only effective for DSA / sparse-attention (SFA backend) models. Default off.
+    "VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD", "0"))),
+    # DSA latent offload staging gate (bring-up). 0 (Stage 1/2): keep the paged latent
+    # write so the offload path can be compared against native sparse attention.
+    # 1 (Stage 3): stop writing the paged latent (it lives only in LMCache + decode
+    # store) to actually free NPU memory. Default 0. Only effective with the offload
+    # flag on AND the SFA kernel-redirect wiring done (see sparse_offload/INTEGRATION.md).
+    "VLLM_ASCEND_DSA_OFFLOAD_FREE_PAGED": lambda: bool(int(os.getenv("VLLM_ASCEND_DSA_OFFLOAD_FREE_PAGED", "0"))),
+    # DSA latent offload parity check (bring-up). When 1, the SFA decode path runs both
+    # the scratch-gather and the native paged sparse attention and logs/asserts their
+    # outputs match. Use during Step 2 of bring-up; disable in production (it doubles
+    # the attention cost). Default 0.
+    "VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY": lambda: bool(int(os.getenv("VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY", "0"))),
+    # DSA un-bundle (proper route P1). When 1, the SFA KV cache is split into TWO
+    # vLLM-managed KV cache groups: the MLA latent (k_nope+k_pe) and the indexer key,
+    # instead of the bundled 3-tuple. This is the prerequisite for freeing the latent
+    # blocks after prefill (P2) in a graph-compatible way. Default 0 (bundled path).
+    "VLLM_ASCEND_DSA_UNBUNDLE": lambda: bool(int(os.getenv("VLLM_ASCEND_DSA_UNBUNDLE", "0"))),
+    # DSA Step A: latent and indexer become two REAL KV cache groups with separate
+    # block tables and per-group block pools (the vLLM fork gates its side on the
+    # same variable, read as a raw env there). Requires VLLM_ASCEND_DSA_UNBUNDLE=1
+    # and --no-enable-prefix-caching. Prerequisite for freeing latent blocks at
+    # end of prefill (DSA latent offload P2). Default 0.
+    "VLLM_ASCEND_DSA_TWO_GROUPS": lambda: bool(int(os.getenv("VLLM_ASCEND_DSA_TWO_GROUPS", "0"))),
+    # DSA shared bundle pool. Requires DSA_UNBUNDLE=1 and DSA_TWO_GROUPS=1.
+    # vLLM owns one physical bundle allocator while exposing two logical block
+    # tables: latent (k_nope+k_pe) and indexer. vLLM-Ascend backs sibling latent
+    # and indexer layers with one raw tensor laid out as
+    # [all k_nope pages][all k_pe pages].
+    "VLLM_ASCEND_DSA_SHARED_POOL": lambda: bool(int(os.getenv("VLLM_ASCEND_DSA_SHARED_POOL", "1"))),
+    # Debug/compat switch: disable DSA indexer LMCache/index-offload hooks.
+    # When enabled, unbundled indexer 1-tuple caches stay resident and are not
+    # registered with LMCache connectors that cannot permute 1-tuple KV entries.
+    "VLLM_ASCEND_DSA_DISABLE_INDEX_LMCACHE": lambda: bool(int(os.getenv("VLLM_ASCEND_DSA_DISABLE_INDEX_LMCACHE", "0"))),
+    # DSA Step B staging. Requires TWO_GROUPS=1 + the LMCache connector.
+    # 1 (B2): decode reads prefill-selected latent from the compact scratch
+    #   (request's first ceil(k/block_size) latent blocks, filled by LMCache);
+    #   decode-selected latent is read in place (absolute positions). Latent
+    #   blocks are NOT freed yet — outputs must match the resident path.
+    # 2 (B2+B1): additionally free the latent blocks [k .. prompt) at end of
+    #   prefill (the actual memory saving). Default 0.
+    "VLLM_ASCEND_DSA_SHRINK_LATENT": lambda: int(os.getenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "0")),
+    # Select the production sharded sparse-index operator for MTP=1/2. MTP=1
+    # bypasses sort/union inside that operator; MTP=2 uses request-sharded
+    # sort/union. 1 (default) enables it; 0 keeps the legacy staged operator as
+    # a compatibility fallback. Non-sensitive.
+    "VLLM_ASCEND_DSA_MTP_SHARDED_SORT": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_MTP_SHARDED_SORT", "1"))
+    ),
+    # Reuse compact-scratch rows that already contain this decode step's
+    # request-union tokens. 1 (default) enables the sorted-shard resident
+    # planner, so LMCache receives only misses. 0 keeps the ordinary
+    # split-boundary union and retrieves its complete payload every step.
+    # Read during model initialization; changing it requires a worker restart.
+    "VLLM_ASCEND_DSA_RESIDENT_CACHE": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_RESIDENT_CACHE", "1"))
+    ),
+    # Share resident planning across structural target indexer groups.
+    # 0 (default): per-layer planning; 1: common-slot fixed/bounded decode.
+    # Non-sensitive. Read at initialization; changing it requires a restart.
+    "VLLM_ASCEND_SFA_SHARED_RESIDENT_PLAN": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_SFA_SHARED_RESIDENT_PLAN", "0"))
+    ),
+    # Experimental Group-0 prefetch across shared-indexer layers. Non-sensitive.
+    # 0 (default): serial; 1: full-graph overlap. Worker restart required.
+    "VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP", "0"))
+    ),
+    # Exact resident union/state-update kernels. 1 (default) enables, 0 selects
+    # baseline. Non-sensitive; read before graph capture, worker restart required.
+    "VLLM_ASCEND_DSA_RESIDENT_EXACT_KERNELS": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_RESIDENT_EXACT_KERNELS", "1"))
+    ),
+    # Value shards assigned to each MTP row by the sorted resident planner.
+    # The request-wide shard count is MTP * shards_per_row. The value must be
+    # a power of two in [1, 4]. Read once during model initialization so graph
+    # capture and replay use one fixed state/workspace layout.
+    "VLLM_ASCEND_DSA_RESIDENT_SHARDS_PER_ROW": lambda: int(
+        os.getenv("VLLM_ASCEND_DSA_RESIDENT_SHARDS_PER_ROW", "4")
+    ),
+    # Experimental SFA graph-capture proof of concept. When enabled, exact-Q1
+    # decode is captured across layers, with selective LMCache retrieval as
+    # the eager split operation.
+    # Unsupported live batch shapes keep using the existing eager SFA forward;
+    # incompatible model/runtime features fail fast during startup capture so
+    # an explicitly requested POC cannot silently remain inactive.
+    "VLLM_ASCEND_SFA_STAGED_GRAPH": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_STAGED_GRAPH", "0"))),
+    # Experimental single target-forward ACL replay, including sparse loads.
+    # 0 (default): original staged islands; 1: one root graph. Requires staged
+    # SFA and bounded Q1/Q2 requests, including internal TP/DP/EP. Explicit
+    # enforce_eager takes precedence (P nodes). Non-sensitive; restart required.
+    "VLLM_ASCEND_SFA_FULL_GRAPH": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_FULL_GRAPH", "0"))),
+    # Experimental device MTP preparation for unchanged full-SFA decode batches.
+    # 0 (default): original runner; 1: launch before CPU count reconciliation.
+    # Non-sensitive, requires async MTP=1, PP=PCP=DCP=1 and a worker restart.
+    "VLLM_ASCEND_SFA_ASYNC_MTP_PREP": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_ASYNC_MTP_PREP", "0"))),
+    # Independently capture the MTP drafter as a FULL graph while the target
+    # model uses staged SFA. Disabled by default; the target staged graph and
+    # resident scratch reuse do not depend on this opt-in. Non-sensitive; read
+    # during proposer initialization and requires a worker restart.
+    "VLLM_ASCEND_SFA_STAGED_MTP_DRAFT_GRAPH": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_SFA_STAGED_MTP_DRAFT_GRAPH", "0"))
+    ),
+    # Comma-separated positive exact-Q1 batch sizes, bounded by scheduler
+    # capacity. Defaults to singleton capture; not sensitive.
+    "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES": lambda: os.getenv(
+        "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES",
+        "1",
+    ),
+    # Number of blocks for the self-managed paged latent pool (Route 1). 0 = derive a
+    # default from max_num_seqs. The pool holds prefill latent during prefill (freed
+    # after) + decode latent, sized far below full-context. Tune up for long prompts.
+    "VLLM_ASCEND_DSA_LATENT_POOL_BLOCKS": lambda: int(os.getenv("VLLM_ASCEND_DSA_LATENT_POOL_BLOCKS", "0")),
+    # Storage device for the in-memory reference offload backend (the LMCache stand-in
+    # used until the real adapter lands). "npu" keeps latent in device memory (no
+    # memory relief, correctness-only); "cpu" stages latent in host RAM, simulating
+    # an off-NPU LMCache — pair with Stage 2 to actually free NPU memory. Default npu.
+    "VLLM_ASCEND_DSA_OFFLOAD_BACKEND_DEVICE": lambda: os.getenv("VLLM_ASCEND_DSA_OFFLOAD_BACKEND_DEVICE", "npu"),
+    # Adapter-backed DSA latent hot cache (bring-up; default OFF). When on, decode
+    # retrieves selected latent from an on-NPU pool (KVCacheAdapter) read in place by
+    # the sparse-attn kernel, instead of the scratch-gather offload-manager path.
+    "VLLM_ASCEND_DSA_USE_ADAPTER_CACHE": lambda: bool(int(os.getenv("VLLM_ASCEND_DSA_USE_ADAPTER_CACHE", "0"))),
+    # Adapter pool headroom over the per-step working set (>=1; larger -> more
+    # cross-step reuse and more NPU memory). See adapter_cache.py sizing notes.
+    "VLLM_ASCEND_DSA_ADAPTER_POOL_RATIO": lambda: float(os.getenv("VLLM_ASCEND_DSA_ADAPTER_POOL_RATIO", "1.5")),
+    # Concurrency the adapter pool is sized for without thrash (0 -> max_num_seqs).
+    "VLLM_ASCEND_DSA_ADAPTER_CONCURRENCY_CAP": lambda: int(os.getenv("VLLM_ASCEND_DSA_ADAPTER_CONCURRENCY_CAP", "0")),
+    # Back the adapter latent pool with LMCache (host KV store) instead of the
+    # in-memory reference backend. Default OFF: the in-memory backend keeps the CPU
+    # parity path and a no-LMCache A/B baseline. On -> evicted pool blocks spill to
+    # LMCache and misses reload from it (see adapter_cache.build_adapter_cache).
+    "VLLM_ASCEND_DSA_USE_LMCACHE_BACKEND": lambda: bool(int(os.getenv("VLLM_ASCEND_DSA_USE_LMCACHE_BACKEND", "0"))),
+    # DSA/LMCache trace logging. Default OFF because tensor summaries can force
+    # NPU->CPU synchronization on the decode hot path.
+    "VLLM_ASCEND_DSA_LMCACHE_TRACE": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_LMCACHE_TRACE", "0"))
+    ),
+    # Emit the per-layer sparse LMCache miss-token ratio about once per second.
+    # The denominator is index_topk * decode rows (including MTP rows). Default
+    # off because each emitted sample intentionally synchronizes one scalar from
+    # NPU to CPU. Non-sensitive; read during model initialization.
+    "VLLM_ASCEND_DSA_LMCACHE_LOAD_STAT": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_LMCACHE_LOAD_STAT", "0"))
+    ),
+    # Fence every live target-SFA phase plus the target/MTP-drafter boundary,
+    # and persist rolling target-layer and draft-layer tensor snapshots for
+    # crash diagnosis. Default off because the fences serialize NPU work and
+    # the snapshots copy substantial tensor data to CPU/disk. Non-sensitive;
+    # changing it requires restart because it also changes graph partitions.
+    "VLLM_ASCEND_MTP_DRAFT_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_MTP_DRAFT_DEBUG", "0"))
+    ),
+    # Emit bounded diagnostics for MTP and LMCache decode-window interaction.
+    # Default off because sampled tensor summaries can synchronize NPU and CPU.
+    "VLLM_ASCEND_MTP_DW_DIAG": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_MTP_DW_DIAG", "0"))
+    ),
+    # Keep this many completed decode-window saves pending before publishing
+    # them to the scheduler. The scheduler uses the published frontier for
+    # both the next DSA split boundary and saved-block release, so both lag
+    # together. Only active when LMCache decode-window save is enabled.
+    "VLLM_ASCEND_LMCACHE_DECODE_WINDOW_SAVE_COMMIT_DELAY_WINDOWS": lambda: max(
+        int(
+            os.getenv(
+                "VLLM_ASCEND_LMCACHE_DECODE_WINDOW_SAVE_COMMIT_DELAY_WINDOWS",
+                "0",
+            )
+        ),
+        0,
+    ),
+    # Emit one CPU-synchronized, first-post-commit mapping diagnostic for the
+    # SHRINK_LATENT=2 compact-scratch path. Requires MTP_DW_DIAG. Default off;
+    # diagnostic only, with no inference fallback or output changes.
+    "VLLM_ASCEND_MTP_DW_DEEP_DIAG": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_MTP_DW_DIAG", "0"))
+        and int(os.getenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "0"))
+    ),
+    # Host CPU budget (GiB) PER LAYER for the LMCache adapter backend. 0 (default) =
+    # auto-size from the per-layer pinned-bundle need (num_logical_blocks * bundle,
+    # with headroom); set >0 to override. Total host = this x number of MLA layers.
+    "VLLM_ASCEND_DSA_LMCACHE_CPU_GB": lambda: float(os.getenv("VLLM_ASCEND_DSA_LMCACHE_CPU_GB", "0")),
 }
 
 # end-env-vars-definition

@@ -21,12 +21,12 @@ import numpy as np
 import torch
 from vllm.lora.request import LoRARequest
 from vllm.pooling_params import PoolingParams
-from vllm.v1.kv_cache_interface import KVCacheGroupSpec
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.pool.metadata import PoolingStates
 from vllm.v1.sample.logits_processor import BatchUpdateBuilder, LogitsProcessors
 from vllm.v1.worker.gpu_input_batch import InputBatch
 
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.worker.block_table import MultiGroupBlockTable
 
 
@@ -48,15 +48,9 @@ class NPUInputBatch(InputBatch):
         is_pooling_model: bool = False,
         num_speculative_tokens: int = 0,
         cp_kv_cache_interleave_size: int = 1,
-        kv_cache_groups: list[KVCacheGroupSpec] | None = None,
     ):
         self.is_pooling_model = is_pooling_model
         self.is_spec_decode = is_spec_decode
-        # Added for compatibility with InputBatch methods that reference these
-        # attributes after PR vllm-project/vllm#34668. NPU does not use
-        # thinking budget, so the holder is always None.
-        self.thinking_budget_state_holder = None
-        self.thinking_token_budget_reqs: set[str] = set()
         self.max_num_reqs = max_num_reqs
         self.max_model_len = max_model_len
         self.max_num_batched_tokens = max_num_batched_tokens
@@ -87,20 +81,8 @@ class NPUInputBatch(InputBatch):
         # Maps req_index -> tensor of shape (num_prompt_tokens, hidden_size)
         self.req_prompt_embeds: dict[int, torch.Tensor] = {}
         self.num_tokens = np.zeros(max_num_reqs, dtype=np.int32)
-        self.num_tokens_no_spec_cpu_tensor = torch.zeros(
-            (max_num_reqs,),
-            device="cpu",
-            dtype=torch.int32,
-            pin_memory=pin_memory,
-        )
-        self.num_tokens_no_spec = self.num_tokens_no_spec_cpu_tensor.numpy()
-        self.num_prompt_tokens_cpu_tensor = torch.zeros(
-            (max_num_reqs,),
-            device="cpu",
-            dtype=torch.int32,
-            pin_memory=pin_memory,
-        )
-        self.num_prompt_tokens = self.num_prompt_tokens_cpu_tensor.numpy()
+        self.num_tokens_no_spec = np.zeros(max_num_reqs, dtype=np.int32)
+        self.num_prompt_tokens = np.zeros(max_num_reqs, dtype=np.int32)
         self.num_computed_tokens_cpu_tensor = torch.zeros(
             (max_num_reqs,),
             device="cpu",
@@ -121,8 +103,29 @@ class NPUInputBatch(InputBatch):
             num_speculative_tokens=num_speculative_tokens,
             kernel_sizes=kernel_block_sizes,
             cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
-            kv_cache_groups=kv_cache_groups,
         )
+        self.layerwise_prefill_block_tables = (self.block_table,)
+        if envs_ascend.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE:
+            self.layerwise_prefill_block_tables = (
+                self.block_table,
+                *(
+                    MultiGroupBlockTable(
+                        max_num_reqs=max_num_reqs,
+                        max_model_len=max_model_len,
+                        max_num_batched_tokens=max_num_batched_tokens,
+                        pin_memory=pin_memory,
+                        device=device,
+                        block_sizes=block_sizes,
+                        max_num_blocks=max_num_blocks_per_req,
+                        num_speculative_tokens=num_speculative_tokens,
+                        kernel_sizes=kernel_block_sizes,
+                        cp_kv_cache_interleave_size=(
+                            cp_kv_cache_interleave_size
+                        ),
+                    )
+                    for _ in range(envs_ascend.VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS - 1)
+                ),
+            )
 
         # Sampling-related.
         self.temperature = torch.empty((max_num_reqs,), dtype=torch.float32, device=device)
@@ -172,7 +175,7 @@ class NPUInputBatch(InputBatch):
 
         # Speculative decoding
         self.num_accepted_tokens_cpu_tensor = torch.ones(
-            (max_num_reqs,), dtype=torch.int32, device="cpu", pin_memory=pin_memory
+            (max_num_reqs,), dtype=torch.int64, device="cpu", pin_memory=pin_memory
         )
         self.num_accepted_tokens_cpu = self.num_accepted_tokens_cpu_tensor.numpy()
 
@@ -190,10 +193,6 @@ class NPUInputBatch(InputBatch):
 
         # To accumulate prompt logprobs tensor chunks across prefill steps.
         self.in_progress_prompt_logprobs_cpu: dict[str, LogprobsTensors] = {}
-
-        # req_id -> list of specific token IDs to compute logprobs for
-        # More efficient than num_logprobs=-1 when only a few tokens are needed
-        self.logprob_token_ids: dict[str, list[int]] = {}
 
         # Internal representation of per-step batch state changes, used for
         # reordering persistent batch and generating logitsprocs batch state

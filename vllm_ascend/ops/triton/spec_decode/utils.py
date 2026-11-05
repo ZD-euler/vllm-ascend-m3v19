@@ -19,6 +19,37 @@ from vllm.triton_utils import tl, triton
 
 
 @triton.jit(do_not_specialize=["num_reqs"])
+def prepare_next_mtp_tokens_kernel(
+    sampled, backup, next_tokens, valid_counts,
+    num_reqs, vocab_size, row_stride, token_stride,
+    WIDTH: tl.constexpr, BLOCK_SIZE: tl.constexpr,
+    sample_indices=None, rejected_counts=None, FIXED_Q2: tl.constexpr = False,
+):
+    """Fuse the existing Ascend next-token/count rule for one-draft MTP."""
+    pid = tl.program_id(0)
+    step = tl.num_programs(0) * BLOCK_SIZE
+    for start in tl.range(pid * BLOCK_SIZE, num_reqs, step):
+        rows = start + tl.arange(0, BLOCK_SIZE)
+        mask = rows < num_reqs
+        first = tl.load(sampled + rows * row_stride, mask, other=-1)
+        second = tl.full((BLOCK_SIZE,), -1, tl.int32)
+        if WIDTH == 2:
+            second = tl.load(sampled + rows * row_stride + token_stride, mask, other=-1)
+        count = ((first != -1) & (first < vocab_size)).to(tl.int32)
+        count += ((second != -1) & (second < vocab_size)).to(tl.int32)
+        fallback = tl.load(backup + rows, mask & (count == 0), other=0)
+        # Match gather(count - 1), including irregular validity patterns;
+        # selecting the last valid physical index would change the old rule.
+        token = tl.where(count == 2, second, first)
+        tl.store(next_tokens + rows, tl.where(count > 0, token, fallback), mask)
+        tl.store(valid_counts + rows, count, mask)
+        if FIXED_Q2:
+            # One draft per row: last query index minus (2 - accepted count).
+            tl.store(sample_indices + rows, 2 * rows + count - 1, mask)
+            tl.store(rejected_counts + rows, 2 - count, mask)
+
+
+@triton.jit(do_not_specialize=["num_reqs"])
 def prepare_inputs_padded_kernel(
     cu_num_draft_tokens_ptr,  # [num_reqs]
     valid_sampled_tokens_count_ptr,  # [num_reqs]
@@ -65,72 +96,11 @@ def prepare_inputs_padded_kernel(
         tl.store(num_rejected_tokens_gpu_ptr + offsets, num_rejected, mask=mask)
 
 
-@triton.jit
-def copy_and_expand_dflash_inputs_kernel_single_grid(
-    # Inputs
-    next_token_ids_ptr,  # [num_reqs]
-    target_positions_ptr,  # [num_context]
-    # Outputs
-    out_input_ids_ptr,  # [num_query_total] (output)
-    out_context_positions_ptr,  # [num_context] (output)
-    out_query_positions_ptr,  # [num_query_total] (output)
-    out_context_slot_mapping_ptr,  # [num_context] (output)
-    out_query_slot_mapping_ptr,  # [num_query_total] (output)
-    out_token_indices_ptr,  # [num_reqs * num_speculative_tokens] (output)
-    # Block table
-    block_table_ptr,  # [max_reqs, max_blocks]
-    block_table_stride,  # stride of block_table dim 0 (in elements)
-    # Metadata
-    query_start_loc_ptr,  # [num_reqs + 1]
-    num_rejected_tokens_ptr,  # [num_reqs] or null (0) when not padded
-    # Scalars
-    parallel_drafting_token_id,  # tl.int32
-    block_size,  # tl.int32
-    num_query_per_req,  # tl.int32
-    num_speculative_tokens,  # tl.int32
-    total_input_tokens,  # tl.int32
-    batch_size,  # tl.int32
-    HAS_NUM_REJECTED: tl.constexpr = False,
-):
-    for req_idx in range(0, batch_size):
-        ctx_start = tl.load(query_start_loc_ptr + req_idx)
-        ctx_end = tl.load(query_start_loc_ptr + req_idx + 1)
-        num_ctx = ctx_end - ctx_start
-
-        for j in range(0, num_ctx):
-            ctx_pos_idx = ctx_start + j
-            pos = tl.load(target_positions_ptr + ctx_pos_idx)
-            tl.store(out_context_positions_ptr + ctx_pos_idx, pos)
-
-            block_num = pos // block_size
-            block_id = tl.load(block_table_ptr + req_idx * block_table_stride + block_num).to(tl.int64)
-            slot = block_id * block_size + (pos % block_size)
-            tl.store(out_context_slot_mapping_ptr + ctx_pos_idx, slot)
-
-        if HAS_NUM_REJECTED:
-            num_rejected = tl.load(num_rejected_tokens_ptr + req_idx)
-            valid_ctx_end = ctx_end - num_rejected
-        else:
-            valid_ctx_end = ctx_end
-
-        last_pos = tl.load(target_positions_ptr + valid_ctx_end - 1)
-
-        for q_idx in range(0, num_query_per_req):
-            query_pos = last_pos + 1 + q_idx
-            query_out_idx = req_idx * num_query_per_req + q_idx
-
-            tl.store(out_query_positions_ptr + query_out_idx, query_pos)
-
-            block_num_q = query_pos // block_size
-            block_id_q = tl.load(block_table_ptr + req_idx * block_table_stride + block_num_q).to(tl.int64)
-            slot_q = block_id_q * block_size + (query_pos % block_size)
-            tl.store(out_query_slot_mapping_ptr + query_out_idx, slot_q)
-
-            if q_idx == 0:
-                bonus_token = tl.load(next_token_ids_ptr + req_idx)
-                tl.store(out_input_ids_ptr + query_out_idx, bonus_token)
-            else:
-                tl.store(out_input_ids_ptr + query_out_idx, parallel_drafting_token_id)
-
-                sample_out_idx = req_idx * num_speculative_tokens + (q_idx - 1)
-                tl.store(out_token_indices_ptr + sample_out_idx, query_out_idx)
+@triton.jit(do_not_specialize=["num_tokens"])
+def pack_mtp_tokens_positions_kernel(tokens, positions, out_tokens, out_positions, num_tokens, BLOCK: tl.constexpr):
+    rows = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    # Leave the final token slot untouched, matching the original shift.
+    shifted = tl.load(tokens + rows + 1, rows + 1 < num_tokens, other=0)
+    tl.store(out_tokens + rows, shifted, rows + 1 < num_tokens)
+    position = tl.load(positions + rows, rows < num_tokens, other=0)
+    tl.store(out_positions + rows, position, rows < num_tokens)

@@ -1,6 +1,6 @@
 import math
 from contextlib import contextmanager
-from contextvars import ContextVar
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
@@ -10,9 +10,11 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed import get_dp_group, get_ep_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import BatchDescriptor, get_forward_context, set_forward_context
 
-from vllm_ascend.ascend_config import get_ascend_config
+import vllm_ascend.envs as envs_ascend
+from vllm_ascend.core.mc2_recovery import calculate_mc2_tokens_capacity
 from vllm_ascend.utils import (
     AscendDeviceType,
+    StagedSFARouteDecision,
     enable_sp,
     flashcomm2_enable,
     get_ascend_device_type,
@@ -20,6 +22,7 @@ from vllm_ascend.utils import (
     is_drafter_moe_model,
     is_moe_model,
     speculative_enable_dispatch_gmm_combine_decode,
+    vllm_version_is,
 )
 
 
@@ -30,33 +33,97 @@ class MoECommType(Enum):
     FUSED_MC2 = 3
 
 
-_MRV2_IN_PROFILE_RUN: ContextVar[bool] = ContextVar("_MRV2_IN_PROFILE_RUN", default=False)
+class StagedSFAQueryProfile(str, Enum):
+    """Structural query layouts that require distinct staged SFA graphs."""
+
+    DECODE_Q1 = "decode_q1"
+    SPEC_FIXED = "spec_fixed"
+    DECODE_BOUNDED = "decode_bounded"
 
 
-@contextmanager
-def override_mrv2_in_profile_run(enabled: bool):
-    """Override MRv2's extra profile-run marker for one forward path.
+@dataclass(frozen=True)
+class StagedSFAGraphKey:
+    """Shape/topology key for a staged SFA outer-graph plan.
 
-    MRv2 builds the base forward context inside upstream vLLM, so Ascend's
-    platform hook cannot tell whether the current forward is the extra MC2
-    profile dummy run. A ContextVar keeps this MRv2-only state scoped to the
-    current forward path without adding default fallback behavior.
+    Actual token/request counts and sequence lengths are dynamic buffer
+    contents. Capacities and query topology are structural and must never
+    collapse onto the same outer graph entry.
     """
-    token = _MRV2_IN_PROFILE_RUN.set(enabled)
-    try:
-        yield
-    finally:
-        _MRV2_IN_PROFILE_RUN.reset(token)
+
+    token_capacity: int
+    request_capacity: int
+    query_profile: StagedSFAQueryProfile
+    max_query_len: int
+
+    def __post_init__(self) -> None:
+        if self.token_capacity <= 0 or self.request_capacity <= 0 or self.max_query_len <= 0:
+            raise ValueError("Staged SFA graph capacities must be positive.")
+        if self.query_profile == StagedSFAQueryProfile.DECODE_Q1:
+            if (
+                self.max_query_len != 1
+                or self.token_capacity != self.request_capacity
+            ):
+                raise ValueError(
+                    "DECODE_Q1 requires equal token/request capacity and "
+                    "max_query_len=1."
+                )
+        elif self.query_profile == StagedSFAQueryProfile.DECODE_BOUNDED:
+            if self.max_query_len not in (1, 2) or self.token_capacity != self.request_capacity * self.max_query_len:
+                raise ValueError("Bounded decode requires Q<=2 and token_capacity=request_capacity*Q")
+        elif (
+            self.max_query_len <= 1
+            or self.token_capacity
+            != self.request_capacity * self.max_query_len
+        ):
+            raise ValueError(
+                "SPEC_FIXED requires token_capacity == request_capacity * "
+                "max_query_len with max_query_len > 1."
+            )
+
+    @classmethod
+    def exact_q1(cls, size: int) -> "StagedSFAGraphKey":
+        """Construct an equal token/request-capacity Q=1 key."""
+        return cls(
+            token_capacity=size,
+            request_capacity=size,
+            query_profile=StagedSFAQueryProfile.DECODE_Q1,
+            max_query_len=1,
+        )
+
+    @classmethod
+    def bounded_decode(cls, request_capacity: int, query_width: int) -> "StagedSFAGraphKey":
+        """One topology for mixed Q1/Q2 rows, with a separate attention padding lane."""
+        return cls(request_capacity * query_width, request_capacity, StagedSFAQueryProfile.DECODE_BOUNDED, query_width)
+
+    @classmethod
+    def fixed_spec(
+        cls,
+        request_capacity: int,
+        query_width: int,
+    ) -> "StagedSFAGraphKey":
+        """Construct a fixed-width speculative-decode graph key."""
+        if query_width <= 1:
+            raise ValueError("SPEC_FIXED query_width must be greater than one.")
+        return cls(
+            token_capacity=request_capacity * query_width,
+            request_capacity=request_capacity,
+            query_profile=StagedSFAQueryProfile.SPEC_FIXED,
+            max_query_len=query_width,
+        )
+
+    def to_legacy_batch_descriptor(self) -> BatchDescriptor:
+        """Adapt the structural key to normalized PIECEWISE dispatch."""
+        return BatchDescriptor(num_tokens=self.token_capacity)
 
 
-def get_mrv2_in_profile_run() -> bool:
-    return _MRV2_IN_PROFILE_RUN.get()
+STAGED_SFA_SINGLETON_GRAPH_KEY = StagedSFAGraphKey.exact_q1(1)
 
 
 @contextmanager
 def set_ascend_forward_context(
     attn_metadata: Any,
     vllm_config: VllmConfig,
+    virtual_engine: int = 0,
     num_tokens: int = 0,
     num_tokens_across_dp: torch.Tensor | None = None,
     in_profile_run: bool = False,
@@ -68,8 +135,16 @@ def set_ascend_forward_context(
     skip_compiled: bool = False,
     max_tokens_across_pcp: int = 0,
     draft_attn_metadatas=None,
-    has_sinks=False,
-    input_ids=None,
+    dsa_offload_manager=None,
+    dsa_req_ids=None,
+    dsa_prompt_lens=None,
+    dsa_adapter_cache=None,
+    mtp_dw_diag_req_ids=None,
+    mtp_dw_diag_post_commit_req_ids=None,
+    mtp_dw_deep_diag_req_ids=None,
+    staged_sfa_graph_dummy_run: bool = False,
+    staged_sfa_route: StagedSFARouteDecision | None = None,
+    staged_sfa_graph_key: StagedSFAGraphKey | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -84,11 +159,42 @@ def set_ascend_forward_context(
         "batch_descriptor": batch_descriptor,
         "skip_compiled": skip_compiled,
     }
+    if vllm_version_is("0.18.0"):
+        forward_context_kwargs["virtual_engine"] = virtual_engine
+
     with set_forward_context(**forward_context_kwargs):
         forward_context = get_forward_context()
         forward_context.draft_attn_metadatas = draft_attn_metadatas
-
-        forward_context.input_ids = input_ids
+        # DSA latent offload manager (None unless GLM5.1 latent offload is enabled);
+        # read by AscendSFAImpl to drive prefill store / decode gather. req_ids and
+        # prompt_lens (per request, batch order) come from the runner's input_batch.
+        forward_context.dsa_offload_manager = dsa_offload_manager
+        forward_context.dsa_req_ids = dsa_req_ids
+        forward_context.dsa_prompt_lens = dsa_prompt_lens
+        # Adapter-backed latent hot cache (None unless VLLM_ASCEND_DSA_USE_ADAPTER_CACHE).
+        forward_context.dsa_adapter_cache = dsa_adapter_cache
+        if mtp_dw_diag_req_ids is not None:
+            forward_context.mtp_dw_diag_req_ids = mtp_dw_diag_req_ids
+            forward_context.mtp_dw_diag_post_commit_req_ids = (
+                mtp_dw_diag_post_commit_req_ids
+            )
+            forward_context.mtp_dw_deep_diag_req_ids = mtp_dw_deep_diag_req_ids
+        # True only for the explicit one-token eager warmup / graph-capture
+        # passes used by the staged SFA proof of concept. Connector generators
+        # and save hooks must not advance during either dummy pass.
+        forward_context.staged_sfa_graph_dummy_run = staged_sfa_graph_dummy_run
+        forward_context.staged_sfa_route = staged_sfa_route
+        forward_context.staged_sfa_graph_key = staged_sfa_graph_key
+        forward_context.staged_sfa_cold_mtp_replay = bool(
+            staged_sfa_graph_key is not None
+            and getattr(staged_sfa_graph_key, "max_query_len", 1) > 1
+            and any(getattr(staged_sfa_route, "cold_compact_resumes", ()))
+        )
+        # Async staged PIECEWISE replay fences only the first graph island in
+        # one model forward. ForwardContext is the ownership boundary for that
+        # state: MTP rows and all layer islands in this forward share it, while
+        # the next scheduler step must start unfenced.
+        forward_context.staged_sfa_replay_fenced = False
 
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 
@@ -105,9 +211,6 @@ def set_ascend_forward_context(
         # NOTE: This cannot be set using set_forward_context
         # due to multiple warmups before actual capturing
         forward_context.capturing = False
-
-        # TODO: remove it when fia merge in fiav2
-        forward_context.sinks = has_sinks
 
         # TODO: remove it when torch_npu.npu_mm_reduce_scatter_base supports tp_size >= 16.
         mmrs_fusion = tp_world_size <= 8
@@ -154,15 +257,13 @@ def set_ascend_forward_context(
         forward_context.prefetch_mlp_down_proj = False
         forward_context.model_instance = model_instance
         forward_context.is_draft_model = is_draft_model
-        forward_context.is_draft_model_prefill = False
 
         if num_tokens is None and attn_metadata is not None:
             num_tokens = attn_metadata.num_actual_tokens
 
         dp_world_size = get_dp_group().world_size
         if dp_world_size > 1 and forward_context.dp_metadata is not None:
-            dp_meta = forward_context.dp_metadata
-            max_tokens_across_dp = dp_meta.num_tokens_across_dp_cpu.max().item()
+            max_tokens_across_dp = forward_context.dp_metadata.max_tokens_across_dp_cpu.item()
             if forward_context.flash_comm_v1_enabled or forward_context.flashcomm_v2_enabled:
                 padded_length = (max_tokens_across_dp + tp_world_size - 1) // tp_world_size * tp_world_size
                 pad_size = padded_length - num_tokens
@@ -199,15 +300,7 @@ def set_mc2_tokens_capacity(vllm_config, max_num_reqs, uniform_decode_query_len)
     global _mc2_tokens_capacity
     if _mc2_tokens_capacity is not None:
         return
-    if vllm_config.compilation_config.cudagraph_capture_sizes:
-        max_num_tokens = vllm_config.compilation_config.max_cudagraph_capture_size
-    else:
-        # NOTE: To save memory, we cap the max number of tokens to 512.
-        max_num_tokens = min(max_num_reqs * uniform_decode_query_len, 512)
-    tp_size = vllm_config.parallel_config.tensor_parallel_size
-    # Use integer arithmetic for ceiling division.
-    num_tokens_per_tp_rank = (max_num_tokens + tp_size - 1) // tp_size
-    _mc2_tokens_capacity = num_tokens_per_tp_rank * tp_size
+    _mc2_tokens_capacity = calculate_mc2_tokens_capacity(vllm_config, max_num_reqs, uniform_decode_query_len)
 
 
 def get_mc2_tokens_capacity():
@@ -219,9 +312,7 @@ def set_mc2_mask(vllm_config, device):
     if _reserved_mc2_mask is not None:
         return
     if is_moe_model(vllm_config):
-        _reserved_mc2_mask = torch.zeros(
-            vllm_config.scheduler_config.max_num_batched_tokens, dtype=torch.bool, device=device
-        )
+        _reserved_mc2_mask = torch.zeros(get_mc2_tokens_capacity(), dtype=torch.bool, device=device)
     else:
         _reserved_mc2_mask = None
 
@@ -242,9 +333,6 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
        quantization with small EP size, no dynamic_eplb, and not in MTP
        mode; otherwise use MC2 within capacity or all-to-all.
     5. On 310P, always use all-gather.
-    6. On A5 with expert parallel, use MC2 when tokens fit the MC2 capacity
-       and the EP size is large enough; otherwise use all-gather when
-       EP size is smaller than num of topK experts or all-to-all.
 
     Args:
         num_tokens (int): The number of tokens in the current batch.
@@ -283,13 +371,13 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
     elif soc_version in {AscendDeviceType.A3}:
         # TODO: drop the EP-size guard when dispatch_ffn_combine supports larger EP sizes
         # TODO: drop speculative method guard when dispatch_gmm_combine_decode supports w16a16
-        fused_mc2_enable = get_ascend_config().enable_fused_mc2
+        fused_mc2_enable = envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2
         dispatch_ffn_combine_enable = get_ep_group().world_size <= 32 and (not is_draft_model)
         if num_tokens <= mc2_tokens_capacity:
             fused_decode_enable = fused_mc2_enable
-            if fused_mc2_enable == 1:
+            if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1:
                 fused_decode_enable = fused_mc2_enable and dispatch_ffn_combine_enable
-            elif fused_mc2_enable == 2:
+            elif envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 2:
                 fused_decode_enable = (
                     fused_mc2_enable
                     and speculative_enable_dispatch_gmm_combine_decode(vllm_config)
@@ -298,20 +386,16 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
             moe_comm_type = MoECommType.FUSED_MC2 if fused_decode_enable else MoECommType.MC2
         else:
             fused_prefill_enable = fused_mc2_enable
-            if fused_mc2_enable == 1:
+            if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1:
                 fused_prefill_enable = fused_mc2_enable and dispatch_ffn_combine_enable
-            elif fused_mc2_enable == 2:
+            elif envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 2:
                 fused_prefill_enable = False
             moe_comm_type = MoECommType.FUSED_MC2 if fused_prefill_enable else MoECommType.ALLTOALL
     elif soc_version in {AscendDeviceType._310P}:
         moe_comm_type = MoECommType.ALLGATHER
     elif soc_version in {AscendDeviceType.A5}:
-        num_experts_per_tok = vllm_config.model_config.hf_text_config.num_experts_per_tok
-        world_size = vllm_config.parallel_config.world_size_across_dp
-        if num_tokens <= mc2_tokens_capacity and world_size > 1:
+        if num_tokens <= mc2_tokens_capacity and vllm_config.parallel_config.world_size_across_dp > 1:
             moe_comm_type = MoECommType.MC2
-        elif world_size <= num_experts_per_tok:
-            moe_comm_type = MoECommType.ALLGATHER
         else:
             moe_comm_type = MoECommType.ALLTOALL
     else:
@@ -335,7 +419,6 @@ class _ExtraForwardContextProxy:
         "num_tokens_across_dp",
         "mc2_mask",
         "is_draft_model",
-        "is_draft_model_prefill",
         "prefetch_mlp_gate_up_proj",
         "prefetch_mlp_down_proj",
         "model_instance",
@@ -345,7 +428,6 @@ class _ExtraForwardContextProxy:
         "num_accept_tokens",
         "in_profile_run",
         "padded_num_tokens",
-        "sinks",
     )
 
     def check_extra_attr(self, name: str):
@@ -363,10 +445,8 @@ class _ExtraForwardContextProxy:
         self.check_extra_attr(name)
         ctx = self._ctx()
         if envs_vllm.VLLM_USE_V2_MODEL_RUNNER:
-            # Unset known extras default to None so optional flags (e.g. `sinks`)
-            # can be read with truthiness checks before the V2 path populates them.
-            return ctx.additional_kwargs.get(name)
-        return getattr(ctx, name, None)
+            return ctx.additional_kwargs[name]
+        return getattr(ctx, name)
 
     def __setattr__(self, name: str, value: Any) -> None:
         self.check_extra_attr(name)

@@ -1,13 +1,18 @@
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import torch
-from torch import nn
+from torch import fx, nn
+from vllm.compilation.backends import split_graph
 from vllm.config import CacheConfig, CompilationConfig, VllmConfig
 from vllm.forward_context import ForwardContext
 from vllm.model_executor.layers.mla import MLAModules
 
 from tests.ut.base import TestBase
-from vllm_ascend.ops.mla import AscendMultiHeadLatentAttention, IndexerWrapper
+from vllm_ascend.ops.mla import (
+    AscendMultiHeadLatentAttention,
+    IndexerWrapper,
+    sfa_forward_pre_fake,
+)
 
 
 class TestIndexerWrapper(TestBase):
@@ -18,7 +23,8 @@ class TestIndexerWrapper(TestBase):
         mock_indexer.topk_tokens = 2048
         mock_indexer.q_lora_rank = 1536
         mock_indexer.wq_b = nn.Linear(128, 128)
-        mock_indexer.wk_weights_proj = nn.Linear(128, 128)
+        mock_indexer.wk = nn.Linear(128, 128)
+        mock_indexer.weights_proj = nn.Linear(128, 128)
         mock_indexer.k_norm = nn.LayerNorm(128)
         mock_indexer.softmax_scale = 0.123
         mock_indexer.topk_indices_buffer = torch.randn(10)
@@ -31,12 +37,64 @@ class TestIndexerWrapper(TestBase):
         self.assertEqual(wrapper.topk_tokens, 2048)
         self.assertEqual(wrapper.q_lora_rank, 1536)
         self.assertIs(wrapper.wq_b, mock_indexer.wq_b)
-        self.assertIs(wrapper.wk_weights_proj, mock_indexer.wk_weights_proj)
+        self.assertIs(wrapper.wk, mock_indexer.wk)
+        self.assertIs(wrapper.weights_proj, mock_indexer.weights_proj)
         self.assertIs(wrapper.k_norm, mock_indexer.k_norm)
         self.assertEqual(wrapper.softmax_scale, 0.123)
 
         self.assertIsNone(mock_indexer.topk_indices_buffer)
         self.assertIsNone(mock_indexer.k_cache)
+
+    def test_staged_sfa_fake_bridge_tracks_exact_batch(self):
+        outputs = sfa_forward_pre_fake(
+            torch.empty(4, 8),
+            False,
+            torch.empty(4, 8),
+            "layer-0",
+            2,
+            4,
+            2,
+            16,
+            4,
+            4,
+            32,
+        )
+
+        self.assertIsInstance(outputs, tuple)
+        self.assertEqual(len(outputs), 6)
+        self.assertEqual(
+            [tuple(output.shape) for output in outputs],
+            [
+                (4, 2, 4),
+                (4, 2, 2),
+                (4, 1, 16),
+                (4, 32),
+                (4,),
+                (4, 32),
+            ],
+        )
+        self.assertTrue(all(output.is_contiguous() for output in outputs))
+
+    def test_staged_sfa_fake_bridge_caps_native_profile_shape(self):
+        outputs = sfa_forward_pre_fake(
+            torch.empty(16384, 8),
+            False,
+            torch.empty(16384, 8),
+            "layer-0",
+            2,
+            4,
+            2,
+            16,
+            4,
+            2,
+            32,
+        )
+
+        self.assertEqual(
+            [output.shape[0] for output in outputs],
+            [4, 4, 4, 2, 2, 2],
+        )
+        self.assertTrue(all(output.is_contiguous() for output in outputs))
 
     def test_forward(self):
         mock_indexer = MagicMock()
@@ -166,3 +224,113 @@ class TestAscendMultiHeadLatentAttention(TestBase):
         output = attn.forward(positions, hidden_states)
 
         self.assertEqual(output.shape, (3, self.hidden_size))
+
+    @patch("vllm_ascend.ops.mla.get_current_vllm_config")
+    @patch("vllm_ascend.ops.mla.get_ascend_config")
+    @patch("vllm_ascend.ops.mla.get_tensor_model_parallel_world_size")
+    def test_cross_layer_forward_splits_only_lmcache_retrieve(
+        self, mock_tp_size, mock_ascend_config, mock_get_vllm_config
+    ):
+        mock_tp_size.return_value = 1
+        mock_ascend_config.return_value.enable_shared_expert_dp = False
+        vllm_config = MagicMock(spec=VllmConfig)
+        vllm_config.model_config.hf_text_config = MagicMock(num_hidden_layers=2, first_k_dense_replace=False)
+        vllm_config.compilation_config = CompilationConfig()
+        mock_get_vllm_config.return_value = vllm_config
+
+        impl = MagicMock(
+            enable_staged_sfa_graph=True,
+            shared_resident_plan=None,
+            local_num_heads=4,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            index_topk=8,
+            decode_threshold=1,
+            _staged_sfa_graph_capture_sizes=(1,),
+        )
+        mla_attn = MagicMock(impl=impl)
+        mla_attn.process_weights_after_loading = MagicMock()
+        with patch("vllm_ascend.ops.mla.MLAAttention", return_value=mla_attn):
+            attn = AscendMultiHeadLatentAttention(
+                hidden_size=self.hidden_size,
+                num_heads=self.num_heads,
+                scale=self.scale,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                v_head_dim=self.v_head_dim,
+                q_lora_rank=self.q_lora_rank,
+                kv_lora_rank=self.kv_lora_rank,
+                mla_modules=self.mock_mla_modules,
+                cache_config=self.mock_cache_config,
+                quant_config=self.mock_quant_config,
+                prefix=self.prefix,
+            )
+
+        hidden_states = torch.randn(1, self.hidden_size)
+        pre_outputs = (
+            torch.empty(1, 4, self.kv_lora_rank),
+            torch.empty(1, 4, self.qk_rope_head_dim),
+            torch.empty(1, 1, 8, dtype=torch.int32),
+            torch.empty(1, 8, dtype=torch.int32),
+            torch.empty(1, dtype=torch.int32),
+            torch.empty(1, 8, dtype=torch.long),
+        )
+        with (
+            patch(
+                "vllm_ascend.ops.mla.torch.ops.vllm.sfa_forward_pre",
+                return_value=pre_outputs,
+            ) as pre,
+            patch("vllm_ascend.ops.mla.torch.ops.vllm.sfa_lmcache_retrieve") as retrieve,
+            patch("vllm_ascend.ops.mla.torch.ops.vllm.sfa_forward_post") as post,
+            patch("vllm_ascend.ops.mla.torch.ops.vllm.sfa_target_layer_diag") as diag,
+        ):
+            attn.target_sfa_debug = True
+            output = attn.forward(torch.tensor([0]), hidden_states)
+
+        self.assertEqual(output.shape, hidden_states.shape)
+        self.assertEqual(attn.next_layer_name, "model.layers.1.mla.attn")
+        retrieve.assert_called_once()
+        pre.assert_called_once()
+        post.assert_called_once()
+        self.assertEqual(
+            diag.call_args_list,
+            [
+                call(hidden_states, self.prefix, "input"),
+                call(output, self.prefix, "output"),
+            ],
+        )
+
+    def test_retrieve_only_partition_builds_cross_layer_island(self):
+        graph = fx.Graph()
+        value = graph.placeholder("value")
+        pre_0 = graph.call_function(torch.ops.aten.sin.default, (value,))
+        retrieve_0 = graph.call_function(torch.ops.aten.clone.default, (pre_0,))
+        post_0 = graph.call_function(torch.ops.aten.cos.default, (retrieve_0,))
+        tail_0 = graph.call_function(torch.ops.aten.neg.default, (post_0,))
+        pre_1 = graph.call_function(torch.ops.aten.sin.default, (tail_0,))
+        retrieve_1 = graph.call_function(torch.ops.aten.clone.default, (pre_1,))
+        post_1 = graph.call_function(torch.ops.aten.cos.default, (retrieve_1,))
+        graph.output(post_1)
+
+        _, partitions = split_graph(
+            fx.GraphModule({}, graph),
+            ["aten::clone"],
+        )
+
+        self.assertEqual(
+            [partition.is_splitting_graph for partition in partitions],
+            [False, True, False, True, False],
+        )
+        middle_targets = [node.target for node in partitions[2].graph.graph.nodes if node.op == "call_function"]
+        self.assertEqual(
+            middle_targets,
+            [
+                torch.ops.aten.cos.default,
+                torch.ops.aten.neg.default,
+                torch.ops.aten.sin.default,
+            ],
+        )
+        retrieve_output = torch.ops.vllm.sfa_lmcache_retrieve.default._schema.arguments[1]
+        self.assertTrue(retrieve_output.alias_info.is_write)
+        diag_tensor = torch.ops.vllm.sfa_target_layer_diag.default._schema.arguments[0]
+        self.assertTrue(diag_tensor.alias_info.is_write)

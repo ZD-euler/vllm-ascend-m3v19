@@ -40,6 +40,7 @@ Row parallel op follows a similar approach - inherit from RowColumnParallelOp an
 get_row_parallel_op.
 """
 
+from collections.abc import Callable
 from functools import lru_cache
 from types import SimpleNamespace
 
@@ -81,6 +82,37 @@ from vllm_ascend.utils import (
     oproj_tp_enable,
     shared_expert_dp_enabled,
 )
+
+
+def row_parallel_with_prefill_transfer(
+    layer: nn.Module, input_: torch.Tensor, submit_transfer: Callable[[], None]
+) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+    """Submit bank copies after a plain o_proj GEMM, before its TP collective.
+
+    Used only by the layerwise-prefill transfer window. Fused/custom linear
+    implementations retain their own computation and communication; we cannot
+    insert into a fused GEMM+collective, so submit before that implementation.
+    Normal (non-P) forward never calls this function.
+    """
+    if getattr(layer, "custom_op", None) is not None:
+        submit_transfer()
+        return layer(input_)
+
+    if layer.input_is_parallel:
+        input_parallel = input_
+    else:
+        split_input = split_tensor_along_last_dim(input_, num_partitions=layer.tp_size)
+        input_parallel = split_input[layer.tp_rank].contiguous()
+    bias = None if (layer.tp_rank > 0 or layer.skip_bias_add) else layer.bias
+    output = layer.quant_method.apply(layer, input_parallel, bias)
+    # Both copy streams take their dependency on the current compute stream
+    # here, before all_reduce adds its completion dependency to that stream.
+    submit_transfer()
+    if layer.reduce_results and layer.tp_size > 1:
+        output = tensor_model_parallel_all_reduce(output)
+    if not layer.return_bias:
+        return output
+    return output, layer.bias if layer.skip_bias_add else None
 
 
 class CustomLinearOp:
@@ -513,8 +545,7 @@ class SequenceRowParallelOp(CustomRowParallelOp):
             return tensor_model_parallel_all_reduce(output_parallel)
 
         pad_size = _EXTRA_CTX.pad_size
-        dsa_cp_attn_out = enable_dsa_cp() and ("o_proj" in self.layer.prefix or "wo_b" in self.layer.prefix)
-        if pad_size > 0 and not dsa_cp_attn_out:
+        if pad_size > 0 and not (enable_dsa_cp() and "o_proj" in self.layer.prefix):
             x = F.pad(x, (0, 0, 0, pad_size))
 
         world_size = self.layer.tp_size
@@ -664,7 +695,11 @@ def _get_row_parallel_op(
     | None
 ):
     if enable_dsa_cp_with_layer_shard() and "o_proj" in prefix:
-        return ShardedCPRowParallelOp(layer)
+        from vllm.config import get_current_vllm_config
+
+        vllm_config = get_current_vllm_config()
+        if vllm_config.model_config.hf_config.model_type not in ["glm_moe_dsa"]:
+            return ShardedCPRowParallelOp(layer)
     if "down_proj" in prefix and mlp_tp_enable() and not is_moe_layer(prefix):
         return MLPRowParallelOp(layer)
     if "o_proj" in prefix and oproj_tp_enable():
@@ -682,7 +717,6 @@ def _get_row_parallel_op(
             "out_proj",  # attn output linear of Qwen3 Next
             "down_proj",  # second MLP of most LLMs
             "attention.dense",  # attn output linear of Bailing
-            "wo_b",  # attn output linear of v4
         ]
         for a_prefix in sp_row_prefixes:
             if a_prefix in prefix:

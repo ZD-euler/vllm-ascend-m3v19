@@ -1,12 +1,5 @@
 # Quickstart
 
-## Introduction
-
-This section guides you through container-based environment setup and large model inference, using the Qwen3-0.6B offline single-GPU inference script as an example.
-
-- For details on using different models, see the corresponding model tutorial in the "Model Tutorials" directory, for example, [Qwen3-30B-A3B](../../docs/source/tutorials/models/Qwen3-30B-A3B.md).
-- For details on using different functions, see the corresponding function tutorial in the "Function Tutorials" directory, for example, [Prefill-Decode Disaggregation (Deepseek)](../../docs/source/tutorials/features/pd_disaggregation_mooncake_multi_node.md).
-
 ## Prerequisites
 
 ### Supported Devices
@@ -18,8 +11,6 @@ This section guides you through container-based environment setup and large mode
 - [Experimental] Atlas 300I inference series (Atlas 300I Duo)
 
 ## Setup environment using container
-
-Before using containers, make sure Docker is installed on your system. If Docker is not installed, please refer to the [Docker installation guide](https://docs.docker.com/get-docker/) for installation instructions.
 
 :::::{tab-set}
 ::::{tab-item} Ubuntu
@@ -97,10 +88,10 @@ The default workdir is `/workspace`, vLLM and vLLM Ascend code are placed in `/v
 
 You can use ModelScope mirror to speed up download:
 
-<!-- tests/e2e/doctests/001-quickstart-test.sh should be considered updating as well -->
+<!-- tests/e2e/doctest/001-quickstart-test.sh should be considered updating as well -->
 
 ```bash
-export VLLM_USE_MODELSCOPE=True
+export VLLM_USE_MODELSCOPE=true
 ```
 
 There are two ways to start vLLM on Ascend NPU:

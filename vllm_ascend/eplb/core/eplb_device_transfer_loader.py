@@ -18,7 +18,6 @@ from enum import Enum
 
 import torch.distributed as dist
 from vllm.logger import logger
-from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_ascend.distributed.parallel_state import get_dynamic_eplb_group
 
@@ -93,10 +92,8 @@ class D2DExpertWeightLoader:
             return
 
         # Waiting for send/recv tasks finish
-        if reqs:
-            with record_function_or_nullcontext("EPLB weight D2D wait"):
-                for req in reqs:
-                    req.wait()
+        for req in reqs:
+            req.wait()
 
         if self.comm_op_list is not None:
             self.comm_op_list = None

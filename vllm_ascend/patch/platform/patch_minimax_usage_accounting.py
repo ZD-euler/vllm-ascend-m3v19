@@ -19,7 +19,6 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -93,15 +92,6 @@ def _count_reasoning_tokens_for_usage(
     return reasoning_parser.count_reasoning_tokens(token_ids)
 
 
-def _clamp_reasoning_tokens(
-    reasoning_tokens: int | None,
-    completion_tokens: int,
-) -> int | None:
-    if reasoning_tokens is None:
-        return None
-    return max(0, min(reasoning_tokens, completion_tokens))
-
-
 def _make_usage_info(
     self,
     *,
@@ -115,10 +105,11 @@ def _make_usage_info(
         completion_tokens=completion_tokens,
         total_tokens=prompt_tokens + completion_tokens,
     )
-    reasoning_tokens = _clamp_reasoning_tokens(reasoning_tokens, completion_tokens)
     if reasoning_tokens is not None:
-        usage.completion_tokens_details = CompletionTokenUsageInfo(reasoning_tokens=reasoning_tokens)
-    if self.enable_prompt_tokens_details and num_cached_tokens is not None:
+        usage.completion_tokens_details = CompletionTokenUsageInfo(
+            reasoning_tokens=max(0, min(reasoning_tokens, completion_tokens))
+        )
+    if self.enable_prompt_tokens_details and num_cached_tokens:
         usage.prompt_tokens_details = chat_serving.PromptTokenUsageInfo(cached_tokens=num_cached_tokens)
     return usage
 
@@ -132,7 +123,6 @@ class _UsageTrackingState:
     completion_tokens: list[int]
     raw_output_token_ids: list[list[int]]
     reasoning_parser: Any
-    enable_prompt_tokens_details: bool = False
     num_prompt_tokens: int = 0
     num_cached_tokens: int | None = None
     final_res: Any = None
@@ -141,13 +131,11 @@ class _UsageTrackingState:
 def _create_usage_tracking_state(
     num_choices: int,
     reasoning_parser,
-    enable_prompt_tokens_details: bool = False,
 ) -> _UsageTrackingState:
     return _UsageTrackingState(
         completion_tokens=[0] * num_choices,
         raw_output_token_ids=[[] for _ in range(num_choices)],
         reasoning_parser=reasoning_parser,
-        enable_prompt_tokens_details=enable_prompt_tokens_details,
     )
 
 
@@ -193,20 +181,6 @@ def _sum_reasoning_tokens_for_usage(
     )
 
 
-def _reasoning_tokens_for_choice(
-    state: _UsageTrackingState,
-    choice_index: int,
-) -> int | None:
-    if state.reasoning_parser is None:
-        return None
-    if not 0 <= choice_index < len(state.raw_output_token_ids):
-        return None
-    return _count_reasoning_tokens_for_usage(
-        state.raw_output_token_ids[choice_index],
-        state.reasoning_parser,
-    )
-
-
 def _make_full_response_usage(
     self,
     state: _UsageTrackingState,
@@ -225,119 +199,8 @@ def _make_full_response_usage(
     )
 
 
-def _usage_reasoning_tokens_for_stream_chunk(
-    state: _UsageTrackingState,
-    chunk: dict[str, Any],
-    completion_tokens: int,
-) -> int | None:
-    if state.reasoning_parser is None:
-        return None
-
-    choices = chunk.get("choices") or []
-    if choices:
-        choice_index = choices[0].get("index", 0)
-        reasoning_tokens = _reasoning_tokens_for_choice(state, choice_index)
-    else:
-        reasoning_tokens = _sum_reasoning_tokens_for_usage(
-            state.raw_output_token_ids,
-            state.reasoning_parser,
-        )
-    return _clamp_reasoning_tokens(reasoning_tokens, completion_tokens)
-
-
-def _inject_stream_usage_details(
-    data: str,
-    state: _UsageTrackingState,
-) -> str:
-    prefix = "data: "
-    suffix = "\n\n"
-    if not data.startswith(prefix):
-        return data
-
-    payload = data[len(prefix) :]
-    if payload.endswith(suffix):
-        payload = payload[: -len(suffix)]
-    if payload == "[DONE]":
-        return data
-
-    try:
-        chunk = json.loads(payload)
-    except json.JSONDecodeError:
-        return data
-
-    usage = chunk.get("usage")
-    if not isinstance(usage, dict):
-        return data
-
-    updated_usage = False
-    if state.enable_prompt_tokens_details and state.num_cached_tokens is not None:
-        usage["prompt_tokens_details"] = {
-            "cached_tokens": state.num_cached_tokens,
-        }
-        updated_usage = True
-
-    completion_tokens = usage.get("completion_tokens") or 0
-    reasoning_tokens = _usage_reasoning_tokens_for_stream_chunk(
-        state,
-        chunk,
-        completion_tokens,
-    )
-    if reasoning_tokens is not None:
-        usage["completion_tokens_details"] = {
-            "reasoning_tokens": reasoning_tokens,
-        }
-        updated_usage = True
-
-    if not updated_usage:
-        return data
-    return f"{prefix}{json.dumps(chunk, ensure_ascii=False)}{suffix}"
-
-
-if not hasattr(OpenAIServingChat, "_ascend_original_chat_completion_stream_generator"):
-    OpenAIServingChat._ascend_original_chat_completion_stream_generator = (
-        OpenAIServingChat.chat_completion_stream_generator
-    )
-
 if not hasattr(OpenAIServingChat, "_ascend_original_chat_completion_full_generator"):
     OpenAIServingChat._ascend_original_chat_completion_full_generator = OpenAIServingChat.chat_completion_full_generator
-
-
-async def _wrapped_chat_completion_stream_generator(
-    self,
-    request: chat_protocol.ChatCompletionRequest,
-    result_generator: AsyncIterator,
-    request_id: str,
-    model_name: str,
-    conversation,
-    tokenizer,
-    request_metadata: engine_protocol.RequestResponseMetadata,
-    reasoning_parser=None,
-    **extra_kwargs: Any,
-):
-    num_choices = 1 if request.n is None else request.n
-    state = _create_usage_tracking_state(
-        num_choices,
-        reasoning_parser,
-        enable_prompt_tokens_details=self.enable_prompt_tokens_details,
-    )
-
-    original_stream_generator = self._ascend_original_chat_completion_stream_generator
-    async for data in original_stream_generator(
-        request,
-        _tracked_result_generator(result_generator, state),
-        request_id,
-        model_name,
-        conversation,
-        tokenizer,
-        request_metadata,
-        reasoning_parser,
-        **extra_kwargs,
-    ):
-        yield _inject_stream_usage_details(data, state)
-
-    usage = _make_full_response_usage(self, state)
-    if usage is not None:
-        request_metadata.final_usage_info = usage
 
 
 async def _wrapped_chat_completion_full_generator(
@@ -352,11 +215,7 @@ async def _wrapped_chat_completion_full_generator(
     reasoning_parser=None,
 ):
     num_choices = 1 if request.n is None else request.n
-    state = _create_usage_tracking_state(
-        num_choices,
-        reasoning_parser,
-        enable_prompt_tokens_details=self.enable_prompt_tokens_details,
-    )
+    state = _create_usage_tracking_state(num_choices, reasoning_parser)
 
     original_full_generator = self._ascend_original_chat_completion_full_generator
     response = await original_full_generator(
@@ -382,14 +241,9 @@ async def _wrapped_chat_completion_full_generator(
     return response
 
 
-_wrapped_chat_completion_stream_generator.__module__ = OpenAIServingChat.__module__
-_wrapped_chat_completion_stream_generator.__qualname__ = (
-    f"{OpenAIServingChat.__qualname__}.chat_completion_stream_generator"
-)
 _wrapped_chat_completion_full_generator.__module__ = OpenAIServingChat.__module__
 _wrapped_chat_completion_full_generator.__qualname__ = (
     f"{OpenAIServingChat.__qualname__}.chat_completion_full_generator"
 )
 
-OpenAIServingChat.chat_completion_stream_generator = _wrapped_chat_completion_stream_generator
 OpenAIServingChat.chat_completion_full_generator = _wrapped_chat_completion_full_generator

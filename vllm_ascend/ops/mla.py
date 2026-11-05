@@ -20,6 +20,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
+
 import torch
 from torch import nn
 from vllm.config import CacheConfig, get_current_vllm_config
@@ -31,9 +33,10 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
 
+from vllm_ascend import envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-from vllm_ascend.utils import is_vl_model, parse_layer_idx
+from vllm_ascend.utils import is_vl_model, parse_layer_idx, vllm_version_is
 
 
 class IndexerWrapper(nn.Module):
@@ -41,7 +44,7 @@ class IndexerWrapper(nn.Module):
     A wrapper of Indexer for Deepseek v3.2.
     This wrapper is currently used to solve the fp8 hard code issue of vllm's deepseek_v2.py.
     It wraps the original Indexer, inherits its module weights
-    (including wq_b, wk_weights_proj or wk/weights_proj, k_norm)
+    (including wq_b, wk, weights_proj, k_norm)
     while deletes the unused topk_indices_buffer and k_cache to save memory.
     TODO: Will be removed once original Indexer supports different quantization methods.
     """
@@ -54,7 +57,8 @@ class IndexerWrapper(nn.Module):
         self.topk_tokens: int = vllm_indexer.topk_tokens  # 2048
         self.q_lora_rank: int = vllm_indexer.q_lora_rank  # 1536
         self.wq_b = vllm_indexer.wq_b
-        self.wk_weights_proj = vllm_indexer.wk_weights_proj
+        self.wk = vllm_indexer.wk
+        self.weights_proj = vllm_indexer.weights_proj
         self.k_norm = vllm_indexer.k_norm
         self.softmax_scale = vllm_indexer.softmax_scale
         vllm_indexer.topk_indices_buffer = None  # delete topk_indices_buffer
@@ -79,7 +83,6 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        skip_topk: bool = False,
     ) -> None:
         nn.Module.__init__(self)
         self.hidden_size = hidden_size
@@ -90,7 +93,6 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
         self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
         self.v_head_dim = v_head_dim
         self.prefix = prefix
-        self.skip_topk = skip_topk
         hf_config = get_current_vllm_config().model_config.hf_text_config
         self.enable_shared_expert_dp = get_ascend_config().enable_shared_expert_dp
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -99,6 +101,13 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
             ascend_indexer = IndexerWrapper(mla_modules.indexer)
         else:
             ascend_indexer = None
+        # Shared-indexer (GLM-5.2): IndexerWrapper drops the original Indexer's
+        # topk_indices_buffer, so the shared buffer must be captured from
+        # mla_modules (which holds an independent reference) and passed to the
+        # SFA impl explicitly. Shared-consumer layers (indexer=None, skip_topk)
+        # reach the producer-written buffer only through this path.
+        self.skip_topk = mla_modules.skip_topk
+        self.topk_indices_buffer = mla_modules.topk_indices_buffer
         self.mla_attn = MLAAttention(
             num_heads=num_heads,
             scale=scale,
@@ -113,8 +122,8 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
             prefix=f"{prefix}.attn",
             use_sparse=mla_modules.is_sparse,
             indexer=ascend_indexer,
-            skip_topk=skip_topk,
-            topk_indices_buffer=getattr(mla_modules, "topk_indices_buffer", None),
+            topk_indices_buffer=self.topk_indices_buffer,
+            skip_topk=self.skip_topk,
             # extra args
             rotary_emb=mla_modules.rotary_emb,
             fused_qkv_a_proj=mla_modules.fused_qkv_a_proj,
@@ -146,6 +155,19 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
         _is_vl = is_vl_model(vllm_config)
         _layer_idx = parse_layer_idx(prefix)
         self.is_vl_first_layer = bool(_is_vl and _layer_idx == 0)
+        self.next_layer_name = (
+            re.sub(r"layers\.\d+", f"layers.{_layer_idx + 1}", prefix, count=1) + ".attn"
+            if _layer_idx is not None and _layer_idx + 1 < self.layers
+            else ""
+        )
+        self.use_cross_layer_sfa = getattr(self.mla_attn.impl, "enable_staged_sfa_graph", False) is True
+        # Model profiling compiles before KV allocation. Select the operator
+        # from startup configuration, never from a late-created cache tensor.
+        self.use_retrieval_overlap = bool(envs_ascend.VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP)
+        self.target_sfa_debug = bool(
+            self.use_cross_layer_sfa
+            and envs_ascend.VLLM_ASCEND_MTP_DRAFT_DEBUG
+        )
 
         compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -159,7 +181,7 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
         kv_cache: torch.Tensor | None = None,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
-        hidden_dim = self.hidden_size
+        hidden_dim = hidden_states.shape[-1]
 
         if _EXTRA_CTX.flash_comm_v1_enabled and self.tp_size > 1 and self.is_vl_first_layer:
             need_gather_q_kv = False
@@ -167,11 +189,77 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
             output = torch.empty((n_out, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device)
         else:
             need_gather_q_kv = _EXTRA_CTX.flash_comm_v1_enabled
-            output = torch.empty(
-                (hidden_states.shape[0], hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
-            )
+            output = torch.empty(hidden_states.shape, dtype=hidden_states.dtype, device=hidden_states.device)
 
-        torch.ops.vllm.mla_forward(hidden_states, need_gather_q_kv, output, self.prefix)
+        if self.use_cross_layer_sfa:
+            impl = self.mla_attn.impl
+            if self.target_sfa_debug:
+                torch.ops.vllm.sfa_target_layer_diag(
+                    hidden_states,
+                    self.prefix,
+                    "input",
+                )
+            group = impl.shared_resident_plan
+            pre_op = torch.ops.vllm.sfa_forward_pre_shared if group is not None else torch.ops.vllm.sfa_forward_pre
+            resident_args = (
+                (group.reads if impl.skip_topk else [], group.writes if not impl.skip_topk else []) if group else ()
+            )
+            (
+                ql_nope,
+                q_pe,
+                topk_indices,
+                selected_packed,
+                selected_counts,
+                target_slots,
+            ) = pre_op(
+                hidden_states,
+                need_gather_q_kv,
+                output,
+                self.prefix,
+                impl.local_num_heads,
+                impl.kv_lora_rank,
+                impl.qk_rope_head_dim,
+                impl.index_topk,
+                impl._staged_sfa_graph_capture_sizes[-1],
+                (
+                    impl._staged_sfa_graph_capture_sizes[-1]
+                    // impl.decode_threshold
+                ),
+                impl.decode_threshold * impl.index_topk,
+                *resident_args,
+            )
+            torch.ops.vllm.sfa_lmcache_retrieve(
+                selected_packed,
+                selected_counts,
+                target_slots,
+                output,
+                self.prefix,
+                self.next_layer_name,
+            )
+            if self.use_retrieval_overlap:
+                torch.ops.vllm.sfa_forward_post_prefetch(
+                    ql_nope, q_pe, topk_indices, selected_packed, selected_counts,
+                    target_slots, output, self.prefix,
+                )
+            else:
+                torch.ops.vllm.sfa_forward_post(
+                    ql_nope,
+                    q_pe,
+                    topk_indices,
+                    selected_packed,
+                    selected_counts,
+                    target_slots,
+                    output,
+                    self.prefix,
+                )
+            if self.target_sfa_debug:
+                torch.ops.vllm.sfa_target_layer_diag(
+                    output,
+                    self.prefix,
+                    "output",
+                )
+        else:
+            torch.ops.vllm.mla_forward(hidden_states, need_gather_q_kv, output, self.prefix)
         output = output.view(-1, hidden_dim)
         return output
 
@@ -188,7 +276,7 @@ def mla_forward(
         attn_metadata = forward_context.attn_metadata[self.mla_attn.layer_name]
     else:
         attn_metadata = forward_context.attn_metadata
-    kv_cache = self.mla_attn.kv_cache
+    kv_cache = self.mla_attn.kv_cache[forward_context.virtual_engine if vllm_version_is("0.18.0") else 0]
     self.mla_attn.impl.forward(
         self.mla_attn.layer_name, hidden_states, kv_cache, attn_metadata, need_gather_q_kv, output
     )
@@ -209,5 +297,325 @@ direct_register_custom_op(
     op_func=mla_forward,
     mutates_args=["output"],
     fake_impl=mla_forward_fake,
+    dispatch_key="PrivateUse1",
+)
+
+
+def _mla_runtime_metadata(layer_name: str):
+    forward_context: ForwardContext = get_forward_context()
+    layer = forward_context.no_compile_layers[layer_name]
+    attn_metadata = (
+        forward_context.attn_metadata[layer.mla_attn.layer_name]
+        if forward_context.attn_metadata
+        else forward_context.attn_metadata
+    )
+    return forward_context, layer, attn_metadata
+
+
+def _mla_runtime_state(layer_name: str):
+    forward_context, layer, attn_metadata = _mla_runtime_metadata(layer_name)
+    virtual_engine = forward_context.virtual_engine if vllm_version_is("0.18.0") else 0
+    return layer.mla_attn.impl, layer.mla_attn.layer_name, layer.mla_attn.kv_cache[virtual_engine], attn_metadata
+
+
+StagedSFABridge = tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]
+
+
+def sfa_forward_pre(
+    hidden_states: torch.Tensor,
+    need_gather_q_kv: bool,
+    output: torch.Tensor,
+    layer_name: str,
+    local_num_heads: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    index_topk: int,
+    token_capacity: int,
+    request_capacity: int,
+    scratch_capacity: int,
+) -> StagedSFABridge:
+    impl, attn_layer_name, kv_cache, attn_metadata = _mla_runtime_state(layer_name)
+    return impl.cross_layer_graph_pre(
+        attn_layer_name,
+        hidden_states,
+        kv_cache,
+        attn_metadata,
+        need_gather_q_kv,
+        output,
+    )
+
+
+def sfa_forward_pre_fake(
+    hidden_states: torch.Tensor,
+    need_gather_q_kv: bool,
+    output: torch.Tensor,
+    layer_name: str,
+    local_num_heads: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    index_topk: int,
+    token_capacity: int,
+    request_capacity: int,
+    scratch_capacity: int,
+) -> StagedSFABridge:
+    return (
+        hidden_states.new_empty((token_capacity, local_num_heads, kv_lora_rank)),
+        hidden_states.new_empty((token_capacity, local_num_heads, qk_rope_head_dim)),
+        torch.empty(
+            (token_capacity, 1, index_topk),
+            dtype=torch.int32,
+            device=hidden_states.device,
+        ),
+        torch.empty(
+            (request_capacity, scratch_capacity),
+            dtype=torch.int32,
+            device=hidden_states.device,
+        ),
+        torch.empty(
+            (request_capacity,),
+            dtype=torch.int32,
+            device=hidden_states.device,
+        ),
+        torch.empty(
+            (request_capacity, scratch_capacity),
+            dtype=torch.long,
+            device=hidden_states.device,
+        ),
+    )
+
+
+def sfa_forward_pre_shared(
+    hidden_states: torch.Tensor,
+    need_gather_q_kv: bool,
+    output: torch.Tensor,
+    layer_name: str,
+    local_num_heads: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    index_topk: int,
+    token_capacity: int,
+    request_capacity: int,
+    scratch_capacity: int,
+    resident_reads: list[torch.Tensor],
+    resident_writes: list[torch.Tensor],
+) -> StagedSFABridge:
+    impl, attn_layer_name, kv_cache, attn_metadata = _mla_runtime_state(layer_name)
+    return impl.cross_layer_graph_pre(
+        attn_layer_name,
+        hidden_states,
+        kv_cache,
+        attn_metadata,
+        need_gather_q_kv,
+        output,
+        resident_reads=resident_reads or None,
+        resident_writes=resident_writes or None,
+    )
+
+
+def sfa_forward_pre_shared_fake(
+    hidden_states: torch.Tensor,
+    need_gather_q_kv: bool,
+    output: torch.Tensor,
+    layer_name: str,
+    local_num_heads: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    index_topk: int,
+    token_capacity: int,
+    request_capacity: int,
+    scratch_capacity: int,
+    resident_reads: list[torch.Tensor],
+    resident_writes: list[torch.Tensor],
+) -> StagedSFABridge:
+    return sfa_forward_pre_fake(
+        hidden_states,
+        need_gather_q_kv,
+        output,
+        layer_name,
+        local_num_heads,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        index_topk,
+        token_capacity,
+        request_capacity,
+        scratch_capacity,
+    )
+
+
+def sfa_lmcache_retrieve(
+    selected_packed: torch.Tensor,
+    selected_counts: torch.Tensor,
+    target_slots: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+    next_layer_name: str,
+) -> None:
+    context, layer, attn_metadata = _mla_runtime_metadata(layer_name)
+    layer.mla_attn.impl.cross_layer_lmcache_retrieve(
+        layer.mla_attn.layer_name,
+        next_layer_name,
+        selected_packed,
+        selected_counts,
+        target_slots,
+        attn_metadata,
+        context,
+    )
+
+
+def sfa_lmcache_retrieve_fake(
+    selected_packed: torch.Tensor,
+    selected_counts: torch.Tensor,
+    target_slots: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+    next_layer_name: str,
+) -> None:
+    return
+
+
+def sfa_forward_post(
+    ql_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    topk_indices: torch.Tensor,
+    selected_packed: torch.Tensor,
+    selected_counts: torch.Tensor,
+    target_slots: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    impl, attn_layer_name, kv_cache, attn_metadata = _mla_runtime_state(layer_name)
+    impl.cross_layer_graph_post(
+        attn_layer_name,
+        ql_nope,
+        q_pe,
+        topk_indices,
+        kv_cache,
+        attn_metadata,
+        output,
+    )
+
+
+def sfa_forward_post_prefetch(
+    ql_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    topk_indices: torch.Tensor,
+    selected_packed: torch.Tensor,
+    selected_counts: torch.Tensor,
+    target_slots: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    impl, attn_layer_name, kv_cache, attn_metadata = _mla_runtime_state(layer_name)
+    _, outgoing = impl._shared_retrieval_edges()
+    edge = outgoing.get(attn_layer_name)
+    prefetch = None
+    if edge is not None:
+        capacity = edge.transfer.request_capacity
+        prefetch = (edge, selected_packed[:capacity], selected_counts[:capacity],
+                    target_slots[:capacity], edge.destinations)
+    impl.cross_layer_graph_post(
+        attn_layer_name, ql_nope, q_pe, topk_indices, kv_cache, attn_metadata, output,
+        prefetch=prefetch,
+    )
+
+
+def sfa_forward_post_prefetch_fake(
+    ql_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    topk_indices: torch.Tensor,
+    selected_packed: torch.Tensor,
+    selected_counts: torch.Tensor,
+    target_slots: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
+def sfa_forward_post_fake(
+    ql_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    topk_indices: torch.Tensor,
+    selected_packed: torch.Tensor,
+    selected_counts: torch.Tensor,
+    target_slots: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
+def sfa_target_layer_diag(
+    tensor: torch.Tensor,
+    layer_name: str,
+    phase: str,
+) -> None:
+    context, layer, attn_metadata = _mla_runtime_metadata(layer_name)
+    layer.mla_attn.impl.target_sfa_diagnostic_boundary(
+        layer.mla_attn.layer_name,
+        phase,
+        tensor,
+        attn_metadata,
+        context,
+    )
+
+
+def sfa_target_layer_diag_fake(
+    tensor: torch.Tensor,
+    layer_name: str,
+    phase: str,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="sfa_forward_pre",
+    op_func=sfa_forward_pre,
+    mutates_args=["output"],
+    fake_impl=sfa_forward_pre_fake,
+    dispatch_key="PrivateUse1",
+)
+direct_register_custom_op(
+    op_name="sfa_forward_pre_shared",
+    op_func=sfa_forward_pre_shared,
+    mutates_args=["output", "resident_writes"],
+    fake_impl=sfa_forward_pre_shared_fake,
+    dispatch_key="PrivateUse1",
+)
+direct_register_custom_op(
+    op_name="sfa_lmcache_retrieve",
+    op_func=sfa_lmcache_retrieve,
+    mutates_args=["output"],
+    fake_impl=sfa_lmcache_retrieve_fake,
+    dispatch_key="PrivateUse1",
+)
+direct_register_custom_op(
+    op_name="sfa_forward_post_prefetch",
+    op_func=sfa_forward_post_prefetch,
+    # As with sfa_lmcache_retrieve, cache storage is resolved by layer at
+    # execution. The mutated output keeps model consumers ordered after us.
+    mutates_args=["output"],
+    fake_impl=sfa_forward_post_prefetch_fake,
+    dispatch_key="PrivateUse1",
+)
+direct_register_custom_op(
+    op_name="sfa_forward_post",
+    op_func=sfa_forward_post,
+    mutates_args=["output"],
+    fake_impl=sfa_forward_post_fake,
+    dispatch_key="PrivateUse1",
+)
+direct_register_custom_op(
+    op_name="sfa_target_layer_diag",
+    op_func=sfa_target_layer_diag,
+    mutates_args=["tensor"],
+    fake_impl=sfa_target_layer_diag_fake,
     dispatch_key="PrivateUse1",
 )

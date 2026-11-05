@@ -31,9 +31,9 @@ def register_connector():
     )
 
     KVConnectorFactory.register_connector(
-        "MooncakeHybridConnector",
-        "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_hybrid_connector",
-        "MooncakeConnector",
+        "MooncakeDSAIndexConnectorV1",
+        "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_dsa_index_connector",
+        "MooncakeDSAIndexConnector",
     )
 
     KVConnectorFactory.register_connector(

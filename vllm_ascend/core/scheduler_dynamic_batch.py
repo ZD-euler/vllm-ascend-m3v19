@@ -41,9 +41,8 @@ class BudgetRefiner:
         if not self.enabled:
             return
         logger.info(
-            "Dynamic batch is enabled with SLO limit: %s, and chunked prefill is "
-            "forced to be activated because dynamic batch relies on it",
-            slo_limit,
+            "Dynamic batch is enabled with SLO limit: {}, and chunked prefill is "
+            "forced to be activated because dynamic batch relies on it".format(str(slo_limit))
         )
         self.lookup: dict[tuple[int, int], int] = {}
         self.context_keys: set[int] = set()
@@ -95,7 +94,7 @@ class BudgetRefiner:
             return self.default_budget
         budget = self.lookup.get((aligned_ctx, aligned_dnum), None)
         if budget is None:
-            logger.warning("Table miss for ctx,dnum%s", (aligned_ctx, aligned_dnum))
+            logger.warn(f"Table miss for ctx,dnum{aligned_ctx, aligned_dnum}")
             budget = self.default_budget
         # For debug.
         # logger.info(
@@ -138,9 +137,9 @@ class SchedulerDynamicBatch(Scheduler):
             kv_cache_config,
             structured_output_manager,
             block_size,
-            mm_registry=mm_registry,
-            include_finished_set=include_finished_set,
-            log_stats=log_stats,
+            mm_registry,
+            include_finished_set,
+            log_stats,
         )
         self.running: list[Request] = []
         self.budget_refiner = BudgetRefiner(
@@ -325,7 +324,7 @@ class SchedulerDynamicBatch(Scheduler):
 
                 # Skip request if the structured output request is still waiting
                 # for FSM compilation.
-                if request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
+                if request.status == RequestStatus.WAITING_FOR_FSM:
                     structured_output_req = request.structured_output_request
                     if structured_output_req and structured_output_req.grammar:
                         request.status = RequestStatus.WAITING
@@ -351,6 +350,7 @@ class SchedulerDynamicBatch(Scheduler):
 
                 num_external_computed_tokens = 0
                 load_kv_async = False
+                dsa_compact_external_load = False
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
@@ -373,14 +373,34 @@ class SchedulerDynamicBatch(Scheduler):
                             skipped_waiting_requests.prepend_request(request)
                             continue
 
+                        request.num_external_computed_tokens = (
+                            num_external_computed_tokens
+                        )
+                        dsa_compact_external_load = load_kv_async and bool(
+                            getattr(
+                                self.connector,
+                                "supports_dsa_compact_external_load",
+                                False,
+                            )
+                        )
+
                     # Total computed tokens (local + external).
-                    num_computed_tokens = num_new_local_computed_tokens + num_external_computed_tokens
+                    num_computed_tokens = (
+                        num_new_local_computed_tokens
+                        + num_external_computed_tokens
+                    )
+                    assert num_computed_tokens <= request.num_tokens
                 # KVTransfer: WAITING reqs have num_computed_tokens > 0
                 # after async KV recvs are completed.
                 else:
-                    new_computed_blocks = self.kv_cache_manager.create_empty_block_list()
+                    new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
+
+                if self._reject_impossible_initial_dsa_request(
+                    request, compact_external_load=dsa_compact_external_load,
+                ):
+                    continue
 
                 encoder_inputs_to_schedule = None
                 new_encoder_compute_budget = encoder_compute_budget
@@ -438,12 +458,14 @@ class SchedulerDynamicBatch(Scheduler):
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
-                    num_new_tokens + num_external_computed_tokens,
-                    num_new_local_computed_tokens,
-                    new_computed_blocks,
+                    num_new_tokens,
+                    num_new_computed_tokens=num_new_local_computed_tokens,
+                    new_computed_blocks=new_computed_blocks,
                     num_lookahead_tokens=effective_lookahead_tokens,
+                    num_external_computed_tokens=num_external_computed_tokens,
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
+                    dsa_compact_external_load=dsa_compact_external_load,
                 )
 
                 if new_blocks is None:
@@ -457,7 +479,7 @@ class SchedulerDynamicBatch(Scheduler):
                 if self.connector is not None:
                     self.connector.update_state_after_alloc(
                         request,
-                        new_computed_blocks + new_blocks,
+                        self.kv_cache_manager.get_blocks(request.request_id),
                         num_external_computed_tokens,
                     )
 
@@ -469,6 +491,7 @@ class SchedulerDynamicBatch(Scheduler):
                     # into the WAITING_FOR_REMOTE_KV state.
                     skipped_waiting_requests.prepend_request(request)
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    request.num_computed_tokens = num_computed_tokens
                     continue
 
                 req_index += 1
@@ -489,6 +512,9 @@ class SchedulerDynamicBatch(Scheduler):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                # Count the number of prefix cached tokens.
+                if request.num_cached_tokens < 0:
+                    request.num_cached_tokens = num_computed_tokens
                 # Encoder-related.
                 if encoder_inputs_to_schedule:
                     scheduled_encoder_inputs[request.request_id] = encoder_inputs_to_schedule
@@ -518,8 +544,18 @@ class SchedulerDynamicBatch(Scheduler):
             any_request = self.running[0]
             num_common_prefix_blocks = self.kv_cache_manager.get_num_common_prefix_blocks(any_request.request_id)
         # Construct the scheduler output.
+        layerwise_prefill = getattr(
+            getattr(self.kv_cache_manager, "coordinator", None),
+            "layerwise_prefill_p_node",
+            False,
+        )
         new_reqs_data = [
-            NewRequestData.from_request(req, req_to_new_blocks[req.request_id].get_block_ids())
+            self._make_new_request_data(
+                req,
+                req_to_new_blocks[req.request_id],
+            )
+            if layerwise_prefill
+            else NewRequestData.from_request(req, req_to_new_blocks[req.request_id].get_block_ids())
             for req in scheduled_new_reqs
         ]
         cached_reqs_data = self._make_cached_request_data(

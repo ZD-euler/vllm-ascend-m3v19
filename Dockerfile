@@ -15,65 +15,87 @@
 # This file is a part of the vllm-ascend project.
 #
 
-FROM quay.io/ascend/cann:9.0.0-910b-ubuntu22.04-py3.12
+FROM quay.io/ascend/cann:8.5.1-910b-ubuntu22.04-py3.11
 
 ARG PIP_INDEX_URL="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
 ARG MOONCAKE_TAG="v0.3.8.post1"
+ARG SOC_VERSION="ascend910b1"
+
+# Define environments
+ENV DEBIAN_FRONTEND=noninteractive
+ENV SOC_VERSION=$SOC_VERSION \
+    TASK_QUEUE_ENABLE=1 \
+    OMP_NUM_THREADS=1
 
 WORKDIR /workspace
 
-COPY ./tools/mooncake_installer.sh /vllm-workspace/
+COPY . /vllm-workspace/vllm-ascend/
 
-# Install clang-15 (for triton-ascend) and Mooncake
+# Install Mooncake dependencies
 RUN apt-get update -y && \
-    apt-get install -y git vim wget net-tools gcc g++ cmake numactl libnuma-dev libjemalloc2 clang-15 && \
-    update-alternatives --install /usr/bin/clang clang /usr/bin/clang-15 20 && \
-    update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-15 20 && \
+    apt-get install -y git vim wget net-tools gcc g++ cmake numactl libnuma-dev libjemalloc2 && \
     git clone --depth 1 --branch ${MOONCAKE_TAG} https://github.com/kvcache-ai/Mooncake /vllm-workspace/Mooncake && \
-    mv /vllm-workspace/mooncake_installer.sh /vllm-workspace/Mooncake/ && \
+    cp /vllm-workspace/vllm-ascend/tools/mooncake_installer.sh /vllm-workspace/Mooncake/ && \
     cd /vllm-workspace/Mooncake && bash mooncake_installer.sh -y && \
     ARCH=$(uname -m) && \
     source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
     export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/${ARCH}-linux/devlib:/usr/local/Ascend/ascend-toolkit/latest/${ARCH}-linux/lib64:$LD_LIBRARY_PATH && \
     mkdir -p build && cd build && cmake .. -DUSE_ASCEND_DIRECT=ON && \
     make -j$(nproc) && make install && \
-    rm -rf /vllm-workspace/Mooncake/build && \
+    rm -fr /vllm-workspace/Mooncake/build && \
     rm -rf /var/cache/apt/* && \
     rm -rf /var/lib/apt/lists/*
 
-# Install modelscope (for fast download) and ray (for multinode)
-RUN pip config set global.index-url ${PIP_INDEX_URL} && \
-    python3 -m pip install modelscope 'ray>=2.47.1,<=2.48.0' 'protobuf>3.20.0' && \
-    python3 -m pip cache purge
+RUN pip config set global.index-url ${PIP_INDEX_URL}
 
 # Install vLLM
 ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
-ARG VLLM_TAG=v0.20.2
-RUN git clone --depth 1 -b $VLLM_TAG $VLLM_REPO /vllm-workspace/vllm
+ARG VLLM_TAG=v0.18.0
+RUN git clone --depth 1 $VLLM_REPO --branch $VLLM_TAG /vllm-workspace/vllm
 # In x86, triton will be installed by vllm. But in Ascend, triton doesn't work correctly. we need to uninstall it.
-RUN VLLM_TARGET_DEVICE="empty" python3 -m pip install -e /vllm-workspace/vllm/[audio] --extra-index https://download.pytorch.org/whl/cpu/ && \
+RUN VLLM_TARGET_DEVICE="empty" python3 -m pip install -v -e /vllm-workspace/vllm/[audio] --extra-index https://download.pytorch.org/whl/cpu/ && \
     python3 -m pip uninstall -y triton && \
     python3 -m pip cache purge
 
 # Install vllm-ascend
-ARG SOC_VERSION="ascend910b1"
-ARG COMPILE_CUSTOM_KERNELS=1
-ENV DEBIAN_FRONTEND=noninteractive
-ENV SOC_VERSION=$SOC_VERSION \
-    TASK_QUEUE_ENABLE=1 \
-    OMP_NUM_THREADS=1
-COPY . /vllm-workspace/vllm-ascend/
-
-RUN export PIP_EXTRA_INDEX_URL="https://mirrors.huaweicloud.com/ascend/repos/pypi" && \
+# Append `libascend_hal.so` path (devlib) to LD_LIBRARY_PATH
+# Installing vllm-ascend on x86 can pull upstream triton back in alongside triton-ascend. Remove it immediately after this step.
+RUN export PIP_EXTRA_INDEX_URL=https://mirrors.huaweicloud.com/ascend/repos/pypi && \
     source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
     source /usr/local/Ascend/nnal/atb/set_env.sh && \
-    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/Ascend/ascend-toolkit/latest/`uname -i`-linux/devlib && \
-    python3 -m pip install -e /vllm-workspace/vllm-ascend/ --extra-index https://download.pytorch.org/whl/cpu/ && \
-    python3 -m pip uninstall -y triton triton-ascend && \
-    python3 -m pip install triton-ascend==3.2.1 --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi && \
+    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/Ascend/ascend-toolkit/latest/$(uname -i)-linux/devlib && \
+    \
+    python3 -m pip install -v -e /vllm-workspace/vllm-ascend/ --extra-index https://download.pytorch.org/whl/cpu/ && \
+    \
+    if [ "$(uname -i)" = "x86_64" ]; then python3 -m pip uninstall -y triton; fi && \
+    \
+    PYTHON_TAG=$(python3 -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')") && \
+    ARCH=$(python3 -c "import platform; m=platform.machine().lower(); map={'x86_64':'x86_64','amd64':'x86_64','aarch64':'aarch64','arm64':'aarch64'}; print(map.get(m,m))") && \
+    \
+    if [ "$PYTHON_TAG" = "cp310" ] && [ "$ARCH" = "aarch64" ]; then PTA_WHEEL="torch_npu-2.9.0.post1%2Bgit4c901a4-${PYTHON_TAG}-${PYTHON_TAG}-manylinux_2_28_${ARCH}.whl"; \
+    elif [ "$PYTHON_TAG" = "cp311" ] && [ "$ARCH" = "x86_64" ]; then PTA_WHEEL="torch_npu-2.9.0.post1%2Bgitdc51c2d-${PYTHON_TAG}-${PYTHON_TAG}-manylinux_2_28_${ARCH}.whl"; \
+    elif [ "$PYTHON_TAG" = "cp310" ] && [ "$ARCH" = "x86_64" ]; then PTA_WHEEL="torch_npu-2.9.0.post1%2Bgita74051c-${PYTHON_TAG}-${PYTHON_TAG}-manylinux_2_28_${ARCH}.whl"; \
+    elif [ "$PYTHON_TAG" = "cp311" ] && [ "$ARCH" = "aarch64" ]; then PTA_WHEEL="torch_npu-2.9.0.post1%2Bgitee7ba04-${PYTHON_TAG}-${PYTHON_TAG}-manylinux_2_28_${ARCH}.whl"; \
+    else echo "Unsupported PYTHON_TAG=$PYTHON_TAG ARCH=$ARCH"; exit 1; fi && \
+    \
+    TRITON_ASCEND_WHEEL="triton_ascend-3.2.0.dev20260322-${PYTHON_TAG}-${PYTHON_TAG}-manylinux_2_27_${ARCH}.manylinux_2_28_${ARCH}.whl" && \
+    \
+    python3 -m pip install "https://vllm-ascend.obs.cn-north-4.myhuaweicloud.com/vllm-ascend/${TRITON_ASCEND_WHEEL}" && \
+    python3 -m pip install "https://vllm-ascend.obs.cn-north-4.myhuaweicloud.com/vllm-ascend/${PTA_WHEEL}" && \
     python3 -m pip cache purge
 
-# Append `libascend_hal.so` path (devlib) to LD_LIBRARY_PATH
+# Install clang-15 (for triton-ascend)
+RUN apt-get update -y && \
+    apt-get -y install clang-15 && \
+    update-alternatives --install /usr/bin/clang clang /usr/bin/clang-15 20 && \
+    update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-15 20 && \
+    rm -rf /var/cache/apt/* && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install modelscope (for fast download) and ray (for multinode)
+RUN python3 -m pip install modelscope 'ray>=2.47.1,<=2.48.0' 'protobuf>3.20.0' && \
+    python3 -m pip cache purge
+
 RUN echo "export LD_PRELOAD=/usr/lib/$(uname -m)-linux-gnu/libjemalloc.so.2:$LD_PRELOAD" >> ~/.bashrc
 RUN echo "export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib" >> ~/.bashrc
 

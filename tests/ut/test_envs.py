@@ -14,12 +14,14 @@
 
 import inspect
 import os
+from unittest.mock import patch
 
 import vllm_ascend.envs as envs_ascend
 from tests.ut.base import TestBase
 
 
 class TestEnvVariables(TestBase):
+
     def setUp(self):
         self.env_vars = list(envs_ascend.env_variables.keys())
 
@@ -32,19 +34,23 @@ class TestEnvVariables(TestBase):
                 try:
                     if var_name in os.environ:
                         del os.environ[var_name]
-                    self.assertEqual(getattr(envs_ascend, var_name), var_handler())
+                    self.assertEqual(getattr(envs_ascend, var_name),
+                                     var_handler())
 
                     handler_source = inspect.getsource(var_handler)
-                    if "int(" in handler_source:
-                        test_vals = ["123", "456"]
-                    elif "bool(int(" in handler_source:
+                    if 'bool(int(' in handler_source:
                         test_vals = ["0", "1"]
+                    elif 'int(' in handler_source:
+                        test_vals = ["123", "456"]
+                    elif 'float(' in handler_source:
+                        test_vals = ["1.25", "2.5"]
                     else:
                         test_vals = [f"test_{var_name}", f"custom_{var_name}"]
 
                     for test_val in test_vals:
                         os.environ[var_name] = test_val
-                        self.assertEqual(getattr(envs_ascend, var_name), var_handler())
+                        self.assertEqual(getattr(envs_ascend, var_name),
+                                         var_handler())
 
                 finally:
                     if original_val is None:
@@ -57,3 +63,37 @@ class TestEnvVariables(TestBase):
         for var_name in self.env_vars:
             with self.subTest(var=var_name):
                 getattr(envs_ascend, var_name)
+
+    def test_decode_window_save_commit_delay_windows(self):
+        name = "VLLM_ASCEND_LMCACHE_DECODE_WINDOW_SAVE_COMMIT_DELAY_WINDOWS"
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(name, None)
+            self.assertEqual(getattr(envs_ascend, name), 0)
+        with patch.dict(os.environ, {name: "3"}):
+            self.assertEqual(getattr(envs_ascend, name), 3)
+        with patch.dict(os.environ, {name: "-1"}):
+            self.assertEqual(getattr(envs_ascend, name), 0)
+
+    def test_dsa_resident_cache_defaults_on_and_can_be_disabled(self):
+        name = "VLLM_ASCEND_DSA_RESIDENT_CACHE"
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(name, None)
+            self.assertTrue(getattr(envs_ascend, name))
+        with patch.dict(os.environ, {name: "0"}):
+            self.assertFalse(getattr(envs_ascend, name))
+
+    def test_dsa_resident_shards_per_row_defaults_to_four(self):
+        name = "VLLM_ASCEND_DSA_RESIDENT_SHARDS_PER_ROW"
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(name, None)
+            self.assertEqual(getattr(envs_ascend, name), 4)
+        with patch.dict(os.environ, {name: "2"}):
+            self.assertEqual(getattr(envs_ascend, name), 2)
+
+    def test_staged_mtp_draft_graph_defaults_off_and_can_be_enabled(self):
+        name = "VLLM_ASCEND_SFA_STAGED_MTP_DRAFT_GRAPH"
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(name, None)
+            self.assertFalse(getattr(envs_ascend, name))
+        with patch.dict(os.environ, {name: "1"}):
+            self.assertTrue(getattr(envs_ascend, name))

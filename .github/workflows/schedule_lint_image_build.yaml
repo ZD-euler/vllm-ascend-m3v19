@@ -4,6 +4,12 @@ on:
     # Runs at 00:00 UTC+8 every day
     - cron: '0 20 * * *' 
   workflow_dispatch:
+    inputs:
+      vllm_hash:
+        description: 'vLLM base hash'
+        default: main
+        required: true
+        type: string
   push:
     paths:
       - '.github/workflows/dockerfiles/Dockerfile.lint'
@@ -41,7 +47,7 @@ jobs:
           latest=false
 
     - name: Build - Set up QEMU
-      uses: docker/setup-qemu-action@v4
+      uses: docker/setup-qemu-action@v3
 
     - name: Build - Set up Docker Buildx
       uses: docker/setup-buildx-action@v4
@@ -79,3 +85,5 @@ jobs:
         labels: ${{ steps.meta.outputs.labels }}
         tags: ${{ steps.meta.outputs.tags }}
         provenance: false
+        build-args: |
+          VLLM_HASH=${{ inputs.vllm_hash }}

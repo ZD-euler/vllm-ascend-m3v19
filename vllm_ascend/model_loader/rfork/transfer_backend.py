@@ -36,24 +36,17 @@ class RForkTransferBackend:
         try:
             from yr.datasystem import TransferEngine  # type: ignore[import-not-found]
         except ImportError as e:
-            err_msg = (
-                "Failed to import TransferEngine from yr.datasystem. "
-                "Please install @yuanrong-datasystem/transfer_engine."
-            )
-            logger.error(err_msg)
-            raise ImportError(err_msg) from e
+            raise ImportError("Please install @yuanrong-datasystem/transfer_engine first.") from e
 
         transfer_engine = TransferEngine()
         local_hostname = join_host_port(get_ip(), get_open_port())
         ret = transfer_engine.initialize(local_hostname, "ascend", f"npu:{torch.npu.current_device()}")
         if ret.is_error():
-            err_msg = (
-                f"TransferEngine initialization failed: "
-                f"initialize({local_hostname}, 'ascend', "
-                f"'npu:{int(torch.npu.current_device())}') -> {ret.to_string()}"
+            raise RuntimeError(
+                "TransferEngine initialization failed: "
+                f"initialize({local_hostname}, ascend"
+                f"npu:{int(torch.npu.current_device())}) -> {ret.to_string()}"
             )
-            logger.error(err_msg)
-            raise RuntimeError(err_msg)
 
         self.rfork_transfer_engine = transfer_engine
         self.rfork_transfer_engine_session_id = local_hostname
@@ -190,12 +183,7 @@ class RForkTransferBackend:
             client_len_list,
         )
         if ret.is_error():
-            logger.error(
-                "Failed to transfer weights from remote instance seed_ip=%s, seed_port=%s, ret=%s",
-                seed_instance_ip,
-                seed_instance_service_port,
-                ret.to_string(),
-            )
+            logger.error("Failed to transfer weights from remote instance, ret=%s", ret.to_string())
             return False
 
         logger.info("transfer weights time: %.4fs", time.time() - start_transfer_tic)
@@ -209,11 +197,7 @@ def get_remote_instance_transfer_engine_info(seed_url: str, local_seed_key: str)
             params={"seed_key": local_seed_key},
         )
         if response.status_code != 200:
-            logger.error(
-                "GET %s/get_rfork_transfer_engine_info failed: %s",
-                seed_url,
-                response.status_code,
-            )
+            logger.error("request.get failed: %s", response.status_code)
             return None, None
 
         data = response.json()
@@ -221,11 +205,8 @@ def get_remote_instance_transfer_engine_info(seed_url: str, local_seed_key: str)
         if info is not None and isinstance(info, list) and len(info) == 2:
             return info[0], info[1]
 
-        logger.error(
-            "Failed to get rfork_transfer_engine_info in response from %s.",
-            seed_url,
-        )
+        logger.error("Failed to get `rfork_transfer_engine_info` in response.")
         return None, None
     except Exception as e:
-        logger.error("Exception getting transfer engine info from %s: %s", seed_url, e)
+        logger.error("Exception: %s", e)
         return None, None

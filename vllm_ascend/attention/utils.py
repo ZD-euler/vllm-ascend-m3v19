@@ -7,10 +7,80 @@ import torch.nn.functional as F
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group, is_v1_kv_transfer_group
 from vllm.forward_context import ForwardContext, get_forward_context
+from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
-from vllm_ascend.utils import AscendDeviceType, get_ascend_config, get_ascend_device_type
-from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
+from vllm_ascend import envs
+from vllm_ascend.utils import (
+    AscendDeviceType,
+    StagedSFARouteReason,
+    get_ascend_config,
+    get_ascend_device_type,
+)
+
+logger = init_logger(__name__)
+
+
+class ColdResumeMarkers(tuple):
+    """Existing boolean row mask with verified cold-resume KV frontiers.
+
+    Only a cold resume constructs this tuple. Existing metadata copying and
+    unpadding carry its proof without extra fields/checks in ordinary decoding.
+    """
+
+    def __new__(cls, markers: tuple[bool, ...], computed_ends: tuple[int, ...]):
+        result = super().__new__(cls, markers)
+        if len(result) != len(computed_ends):
+            raise ValueError("Cold resume markers and frontiers must have equal lengths")
+        result.computed_ends = tuple(computed_ends)
+        return result
+
+    def __getitem__(self, index):
+        result = super().__getitem__(index)
+        return type(self)(result, self.computed_ends[index]) if isinstance(index, slice) else result
+
+    def __getnewargs__(self):
+        return tuple(self), self.computed_ends
+
+_DSA_LMCACHE_TRACE = envs.VLLM_ASCEND_DSA_LMCACHE_TRACE
+
+
+def _dsa_lmcache_log_layer(layer_name: str) -> bool:
+    return _DSA_LMCACHE_TRACE and "layers.0." in layer_name
+
+
+def _tensor_like_debug(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        flat = value.flatten()
+        try:
+            head = flat[:4].tolist() if flat.numel() else None
+            tail = flat[-4:].tolist() if flat.numel() > 4 else head
+        except Exception as exc:
+            head = None
+            tail = None
+            value_error = f"{type(exc).__name__}: {exc}"
+        else:
+            value_error = None
+        return {
+            "type": "Tensor",
+            "shape": list(value.shape),
+            "numel": int(value.numel()),
+            "device": str(value.device),
+            "dtype": str(value.dtype),
+            "head": head,
+            "tail": tail,
+            "value_error": value_error,
+        }
+    if isinstance(value, (list, tuple)):
+        first = value[0] if value else None
+        return {
+            "type": type(value).__name__,
+            "len": len(value),
+            "first": _tensor_like_debug(first),
+        }
+    return {"type": type(value).__name__}
 
 
 def ascend_chunked_prefill_workspace_size(vllm_config: VllmConfig) -> int:
@@ -87,21 +157,11 @@ class AscendPrefillContextParallelMetadata:
 
     kv_with_q_tail_mask_idx_tensor: torch.Tensor = None
 
-    kv_tail_proj_idx_tensor: torch.Tensor = None
-
-    kv_with_q_head_attn_idx_in_tail_tensor: torch.Tensor = None
-
-    kv_with_q_tail_attn_idx_in_tail_tensor: torch.Tensor = None
-
     attn_mask_seqlens: torch.Tensor = None
 
     head_attn_nomask_seqlens: torch.Tensor = None
 
     tail_attn_nomask_seqlens: torch.Tensor = None
-
-    head_actual_seq_lengths_kv: list[int] | None = None
-
-    tail_actual_seq_lengths_kv: list[int] | None = None
 
     q_full_idx: torch.Tensor = None
 
@@ -130,18 +190,6 @@ class AscendPrefillContextParallelMetadata:
     # the number of tokens padded in linear-attn per rank
     pcp_padded_tokens_fla: int = 0
 
-    # the max number of unpadded tokens in all ranks
-    max_num_tokens_across_pcp: int = 0
-
-    # the number of scheduled tokens on the current rank before padding
-    total_num_scheduled_tokens: int = 0
-
-    # Because the sequence shard in linear attention layers does not include padding,
-    # the full attention layers cannot obtain the correct query_lens with pcp pad for
-    # chunked prefill calculation. Therefore, this value needs to be passed to the backend.
-    # TODO:To be refactored.
-    attn_chunk_seqlens: torch.Tensor = None
-
 
 @dataclass
 class AscendCommonAttentionMetadata(CommonAttentionMetadata):
@@ -155,6 +203,8 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # CPU tensor of sequence lengths for host-side operations.
     # E.g., tensor([128, 256, 64]) for 3 requests with different seq lengths.
     seq_lens_cpu: torch.Tensor = None
+    # Target decode uses fixed planner lanes and an attention-only padding row.
+    sfa_full_graph: bool = False
 
     # CPU tensor of already computed tokens count per request.
     # E.g., tensor([100, 200, 50]) means req0 has 100 tokens already computed.
@@ -171,7 +221,6 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # NPU tensor of position indices for rotary embeddings computation.
     # E.g., tensor([0, 1, 2, ...]) indicating token positions in sequence.
     positions: torch.Tensor = None
-    positions_cpu: torch.Tensor = None
 
     # Current attention state (e.g., ChunkedPrefill, DecodeOnly).
     attn_state: Any = None
@@ -184,21 +233,34 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
 
     # Metadata for Prefill Context Parallelism (PCP) operations.
     prefill_context_parallel_metadata: AscendPrefillContextParallelMetadata | None = None
-    kvcomp_metadata: KVCompMetaData | None = None
+
+    # DSA two-group mode: the indexer KV group's own block table / slot mapping
+    # (the indexer cache has its own block ids when latent and indexer are
+    # separate groups). None in single-group mode.
+    indexer_block_table_tensor: torch.Tensor | None = None
+    indexer_slot_mapping: torch.Tensor | None = None
+    # DSA shrink-latent: per-request prompt lengths (CPU, length num_reqs); the
+    # SFA builder expands them per ROW (decode rows -> plen, prefill/padding
+    # rows -> 0 = no remap).
+    prompt_lens_cpu: Any = None
+    request_ids: list[str] | None = None
+    cold_compact_resumes: tuple[bool, ...] = ()
+    # Stable request-owned rows for the experimental persistent sparse
+    # scratch cache. Padding/graph-dummy rows contain -1.
+    resident_state_indices: torch.Tensor | None = None
+    resident_state_generations: torch.Tensor | None = None
+    resident_state_indices_cpu: Any = None
+    resident_state_generations_cpu: Any = None
 
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
         # This only use to eagle now. It will be use to enforce_eager in future.
-        # Helper to slice optional per-request tensors to ``num_actual_reqs``.
-        def _slice_reqs(x):
-            return x[:num_actual_reqs] if x is not None else None
-
         return AscendCommonAttentionMetadata(
             query_start_loc=self.query_start_loc[: num_actual_reqs + 1],
             query_start_loc_cpu=self.query_start_loc_cpu[: num_actual_reqs + 1],
             seq_lens=self.seq_lens[:num_actual_reqs],
-            seq_lens_cpu=_slice_reqs(self.seq_lens_cpu),
-            num_computed_tokens_cpu=_slice_reqs(self.num_computed_tokens_cpu),
+            seq_lens_cpu=self.seq_lens_cpu[:num_actual_reqs],
+            num_computed_tokens_cpu=self.num_computed_tokens_cpu[:num_actual_reqs],
             num_reqs=num_actual_reqs,
             num_actual_tokens=num_actual_tokens,
             max_query_len=self.max_query_len,
@@ -208,35 +270,49 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             # This is really strange since vLLM slices them as well
             block_table_tensor=self.block_table_tensor,
             slot_mapping=self.slot_mapping,
+            # Preserve the independent Group-1 address space for the MTP
+            # drafter. Dropping either field here makes the SFA draft layer
+            # fall back to Group-0 addresses after padded target metadata is
+            # converted to its unpadded view.
+            indexer_block_table_tensor=self.indexer_block_table_tensor,
+            indexer_slot_mapping=self.indexer_slot_mapping,
             causal=self.causal,
             actual_seq_lengths_q=self.actual_seq_lengths_q[:num_actual_tokens],
             positions=self.positions,
-            positions_cpu=self.positions_cpu,
             attn_state=self.attn_state,
             graph_pad_size=-1,  # It should be -1 when not run in fullgraph mode.
             num_input_tokens=self.num_input_tokens,
             prefill_context_parallel_metadata=self.prefill_context_parallel_metadata,
-            seq_lens_cpu_upper_bound=self.seq_lens_cpu_upper_bound[:num_actual_reqs]
-            if self.seq_lens_cpu_upper_bound is not None
-            else None,
             max_seq_len=self.max_seq_len,
-            # Propagate parent-class fields so the unpadded view is a
-            # faithful sub-batch of the original. Missing any of these
-            # would silently break downstream consumers (e.g. NPU
-            # backends preferring ``_seq_lens_cpu`` over ``seq_lens_cpu``,
-            # DCP backends needing ``dcp_local_seq_lens(_cpu)``,
-            # encoder-decoder layers needing ``encoder_seq_lens``, the
-            # mamba ``is_prefilling`` flag, and FastPrefill's
-            # ``logits_indices_padded`` / ``num_logits_indices``).
-            _seq_lens_cpu=_slice_reqs(self._seq_lens_cpu),
-            _num_computed_tokens_cpu=_slice_reqs(self._num_computed_tokens_cpu),
-            dcp_local_seq_lens=_slice_reqs(self.dcp_local_seq_lens),
-            dcp_local_seq_lens_cpu=_slice_reqs(self.dcp_local_seq_lens_cpu),
-            is_prefilling=_slice_reqs(self.is_prefilling),
-            encoder_seq_lens=_slice_reqs(self.encoder_seq_lens),
-            encoder_seq_lens_cpu=_slice_reqs(self.encoder_seq_lens_cpu),
-            logits_indices_padded=self.logits_indices_padded,
-            num_logits_indices=self.num_logits_indices,
+            prompt_lens_cpu=(
+                self.prompt_lens_cpu[:num_actual_reqs]
+                if self.prompt_lens_cpu is not None
+                else None
+            ),
+            request_ids=(self.request_ids[:num_actual_reqs] if self.request_ids is not None else None),
+            cold_compact_resumes=self.cold_compact_resumes[
+                :num_actual_reqs
+            ],
+            resident_state_indices=(
+                self.resident_state_indices[:num_actual_reqs]
+                if self.resident_state_indices is not None
+                else None
+            ),
+            resident_state_generations=(
+                self.resident_state_generations[:num_actual_reqs]
+                if self.resident_state_generations is not None
+                else None
+            ),
+            resident_state_indices_cpu=(
+                self.resident_state_indices_cpu[:num_actual_reqs]
+                if self.resident_state_indices_cpu is not None
+                else None
+            ),
+            resident_state_generations_cpu=(
+                self.resident_state_generations_cpu[:num_actual_reqs]
+                if self.resident_state_generations_cpu is not None
+                else None
+            ),
         )
 
 
@@ -310,7 +386,489 @@ def split_decodes_and_prefills(
     return (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens)
 
 
-def wait_for_kv_layer_from_connector(layer_name: str):
+def staged_sfa_connector_supports_sparse_load() -> bool:
+    """Whether the active v1 connector satisfies the staged SFA contract."""
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return False
+    try:
+        connector = get_kv_transfer_group()
+        return bool(
+            getattr(connector, "supports_staged_sfa_sparse_load", False)
+            and getattr(connector, "uses_layerwise_model_callbacks", False)
+            and callable(getattr(connector, "wait_for_layer_load", None))
+        )
+    except Exception:
+        return False
+
+
+def unwrap_staged_sfa_connector_metadata(metadata: Any) -> Any:
+    """Select staged-SFA child metadata when the active connector is wrapped."""
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return metadata
+    connector = get_kv_transfer_group()
+    unwrap = getattr(
+        connector, "_unwrap_staged_sfa_connector_metadata", None
+    )
+    return unwrap(metadata) if callable(unwrap) else metadata
+
+
+def _dsa_remap_frontier(load_spec: Any) -> int:
+    """Derive the operator boundary without changing LMCache commit progress."""
+    if load_spec is None:
+        return 0
+    cold_compact_resume = bool(
+        getattr(load_spec, "dsa_cold_compact_resume", False)
+    )
+    if not getattr(load_spec, "can_load", False) and not cold_compact_resume:
+        return 0
+    remap_value = getattr(load_spec, "dsa_remap_frontier", None)
+    committed_value = (
+        remap_value
+        if remap_value is not None
+        else getattr(load_spec, "dsa_committed_end", None)
+    )
+    committed_value = (
+        committed_value
+        if committed_value is not None
+        else getattr(load_spec, "lmcache_cached_tokens", 0)
+    )
+    committed_end = int(committed_value or 0)
+    scratch_capacity = getattr(load_spec, "dsa_scratch_capacity", None)
+    if scratch_capacity is not None and committed_end < int(scratch_capacity):
+        return 0
+    return committed_end
+
+
+def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int]:
+    """Return a proven remap frontier for every active request.
+
+    Sparse-decode metadata contributes a boundary derived from committed
+    LMCache progress and the fixed scratch capacity. A loadable dense-prefix
+    request contributes zero because its first decoder step intentionally
+    waits for the full prefix to become resident before attention.
+    """
+    if request_ids is None:
+        raise RuntimeError("[SFA sparse remap] active request IDs are unavailable.")
+    normalized_request_ids = [str(req_id) for req_id in list(request_ids)]
+    if len(set(normalized_request_ids)) != len(normalized_request_ids):
+        raise RuntimeError("[SFA sparse remap] frontier lookup requires unique native request IDs.")
+    if not normalized_request_ids:
+        return []
+    if not staged_sfa_connector_supports_sparse_load():
+        raise RuntimeError(
+            "[SFA sparse remap] the active connector does not advertise the "
+            "staged sparse selective-load/frontier contract."
+        )
+
+    connector = get_kv_transfer_group()
+    get_metadata = getattr(connector, "_get_connector_metadata", None)
+    if not callable(get_metadata):
+        raise RuntimeError("[SFA sparse remap] connector frontier metadata is unavailable.")
+    try:
+        metadata = get_metadata()
+    except Exception as exc:
+        raise RuntimeError("[SFA sparse remap] connector frontier metadata lookup failed.") from exc
+    metadata = unwrap_staged_sfa_connector_metadata(metadata)
+
+    reason, frontiers, _ = staged_sfa_metadata_sparse_route(
+        metadata,
+        normalized_request_ids,
+    )
+    if reason not in (
+        StagedSFARouteReason.ELIGIBLE,
+        StagedSFARouteReason.DENSE_PREFIX_HIT,
+        StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
+    ):
+        raise RuntimeError(
+            "[SFA sparse remap] connector frontier validation failed: "
+            f"{reason.value}."
+        )
+    return list(frontiers)
+
+
+def staged_sfa_metadata_sparse_route(
+    metadata: Any,
+    request_ids: Any,
+) -> tuple[StagedSFARouteReason, tuple[int, ...], tuple[bool, ...]]:
+    """Validate main request metadata and resolve ordered remap frontiers."""
+    if metadata is None or request_ids is None:
+        return StagedSFARouteReason.MISSING_CONNECTOR_METADATA, (), ()
+    active_request_ids = [str(req_id) for req_id in request_ids]
+    if not active_request_ids or len(set(active_request_ids)) != len(active_request_ids):
+        return StagedSFARouteReason.INVALID_REQUEST_IDS, (), ()
+    active_request_id_set = set(active_request_ids)
+    main_by_req: dict[str, Any] = {}
+    try:
+        metadata_requests = tuple(getattr(metadata, "requests", ()))
+    except (TypeError, ValueError):
+        return StagedSFARouteReason.INVALID_FRONTIER, (), ()
+    for request in metadata_requests:
+        req_id = str(getattr(request, "req_id", ""))
+        if req_id not in active_request_id_set:
+            continue
+        if getattr(request, "is_decode_window_save", False):
+            continue
+        if req_id in main_by_req:
+            return StagedSFARouteReason.DUPLICATE_MAIN_METADATA, (), ()
+        main_by_req[req_id] = request
+
+    if set(main_by_req) != active_request_id_set:
+        return StagedSFARouteReason.MISSING_CONNECTOR_METADATA, (), ()
+
+    dense_request_ids: set[str] = set()
+    sparse_request_ids: set[str] = set()
+    frontiers: list[int] = []
+    cold_resumes: list[bool] = []
+    resident_computed_ends: dict[int, int] | None = None
+    for req_id in active_request_ids:
+        request = main_by_req[req_id]
+        try:
+            current_released = int(request.dsa_current_released_frontier)
+            nonresident = int(request.dsa_nonresident_frontier)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return StagedSFARouteReason.INVALID_FRONTIER, (), ()
+        if current_released < 0 or nonresident < 0 or current_released > nonresident:
+            return StagedSFARouteReason.INVALID_FRONTIER, (), ()
+
+        if not getattr(request, "is_sparse_decode", False):
+            if current_released != 0 or nonresident != 0:
+                return StagedSFARouteReason.DENSE_PREFIX_NOT_RESIDENT, (), ()
+            dense_request_ids.add(req_id)
+            frontiers.append(0)
+            cold_resumes.append(False)
+            continue
+
+        sparse_request_ids.add(req_id)
+        load_spec = getattr(request, "load_spec", None)
+        if load_spec is None:
+            return StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE, (), ()
+        can_load = bool(getattr(load_spec, "can_load", False))
+        try:
+            cached = int(getattr(load_spec, "lmcache_cached_tokens", 0) or 0)
+            committed_raw = getattr(load_spec, "dsa_committed_end", None)
+            committed = int(
+                committed_raw
+                if committed_raw is not None
+                else (cached if can_load else 0)
+            )
+            remap_frontier = _dsa_remap_frontier(load_spec)
+        except (TypeError, ValueError, OverflowError):
+            return StagedSFARouteReason.INVALID_FRONTIER, (), ()
+        if (
+            cached < 0
+            or committed < 0
+            or committed > cached
+            or remap_frontier < 0
+            or remap_frontier > committed
+        ):
+            return StagedSFARouteReason.INVALID_FRONTIER, (), ()
+        if can_load:
+            if nonresident > remap_frontier:
+                return StagedSFARouteReason.INVALID_FRONTIER, (), ()
+        elif current_released > 0 or nonresident > 0:
+            return StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE, (), ()
+        frontiers.append(remap_frontier if can_load else 0)
+        cold_resume = bool(getattr(load_spec, "dsa_cold_compact_resume", False))
+        if cold_resume and getattr(load_spec, "dsa_cold_resident_load", False):
+            try:
+                computed_end = int(load_spec.dsa_cold_resume_computed_end)
+                resident_remap = int(load_spec.dsa_remap_frontier)
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                return StagedSFARouteReason.INVALID_FRONTIER, (), ()
+            if not can_load or resident_remap != 0 or nonresident != 0 or not 0 < computed_end <= committed:
+                return StagedSFARouteReason.INVALID_FRONTIER, (), ()
+            if resident_computed_ends is None:
+                resident_computed_ends = {}
+            resident_computed_ends[len(cold_resumes)] = computed_end
+        cold_resumes.append(cold_resume)
+
+    cold_resume_tuple = tuple(cold_resumes) if any(cold_resumes) else ()
+    if resident_computed_ends is not None:
+        computed_ends = tuple(
+            resident_computed_ends.get(i, frontier)
+            for i, frontier in enumerate(frontiers)
+        )
+        cold_resume_tuple = ColdResumeMarkers(cold_resume_tuple, computed_ends)
+    if dense_request_ids and sparse_request_ids:
+        return (
+            StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
+            tuple(frontiers),
+            cold_resume_tuple,
+        )
+    if sparse_request_ids:
+        return (
+            StagedSFARouteReason.ELIGIBLE,
+            tuple(frontiers),
+            cold_resume_tuple,
+        )
+    return StagedSFARouteReason.DENSE_PREFIX_HIT, tuple(frontiers), ()
+
+
+def native_sfa_cold_resume_layout(
+    metadata: Any, request_ids: Any, num_computed_tokens: Any,
+) -> tuple[tuple[int, ...], tuple[bool, ...]]:
+    """Preserve cold-load proofs even when other batch rows require prefill."""
+    cold_ids = {
+        str(request.req_id)
+        for request in getattr(metadata, "requests", ())
+        if not getattr(request, "is_decode_window_save", False)
+        and getattr(getattr(request, "load_spec", None), "dsa_cold_compact_resume", False)
+    }
+    if not cold_ids:
+        return (), ()
+    active_ids = [str(req_id) for req_id in request_ids] if request_ids is not None else []
+    ordered_cold_ids = [req_id for req_id in active_ids if req_id in cold_ids]
+    if not ordered_cold_ids:
+        return (), ()
+    # Other prefill rows can legitimately have no connector load/save entry.
+    # Validate cold sources with the same resolver used by the graph route.
+    reason, cold_frontiers, cold_markers = staged_sfa_metadata_sparse_route(metadata, ordered_cold_ids)
+    if reason != StagedSFARouteReason.ELIGIBLE:
+        raise RuntimeError(f"Invalid native cold-resume metadata: {reason.value}")
+    if num_computed_tokens is None or len(num_computed_tokens) != len(active_ids):
+        raise RuntimeError("Native cold-resume computed tokens do not match active requests")
+    by_request = dict(zip(ordered_cold_ids, cold_frontiers))
+    frontiers = tuple(by_request.get(req_id, 0) for req_id in active_ids)
+    markers = tuple(req_id in by_request for req_id in active_ids)
+    computed_ends = frontiers
+    if isinstance(cold_markers, ColdResumeMarkers):
+        expected = dict(zip(ordered_cold_ids, cold_markers.computed_ends))
+        computed_ends = tuple(expected.get(req_id, 0) for req_id in active_ids)
+    if any(marker and int(num_computed_tokens[i]) != computed_ends[i] for i, marker in enumerate(markers)):
+        raise RuntimeError("Native cold-resume frontier does not match computed tokens")
+    return frontiers, ColdResumeMarkers(markers, computed_ends)
+
+
+def staged_sfa_metadata_sparse_load(
+    metadata: Any,
+    request_ids: Any,
+) -> tuple[StagedSFARouteReason, tuple[int, ...]]:
+    """Preserve the existing frontier-only helper contract."""
+    reason, frontiers, _ = staged_sfa_metadata_sparse_route(
+        metadata, request_ids
+    )
+    return reason, frontiers if reason == StagedSFARouteReason.ELIGIBLE else ()
+
+
+def wait_for_kv_layer_from_connector(
+    layer_name: str,
+    selected_tokens=None,
+    token_start_index=None,
+    request_ids=None,
+    target_slot_mapping=None,
+    selected_token_counts=None,
+    payload_event=None,
+):
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return
+
+    connector = get_kv_transfer_group()
+    should_log = _dsa_lmcache_log_layer(layer_name)
+    wait_kwargs = {}
+    if target_slot_mapping is not None:
+        wait_kwargs["target_slot_mapping"] = target_slot_mapping
+    if selected_token_counts is not None:
+        wait_kwargs["selected_token_counts"] = selected_token_counts
+    if payload_event is not None:
+        wait_kwargs["payload_event"] = payload_event
+    if selected_tokens is not None and request_ids is not None and not should_log:
+        try:
+            connector.wait_for_layer_load(
+                layer_name,
+                selected_tokens,
+                token_start_index,
+                request_ids,
+                **wait_kwargs,
+            )
+        except Exception:
+            logger.exception(
+                "[DSA_INDEX_LMCACHE] connector_wait_error layer=%s "
+                "connector=%s selected=%s token_start_index=%s request_ids=%s "
+                "target_slot_mapping=%s attn_metadata=%s",
+                layer_name,
+                type(connector).__name__,
+                _tensor_like_debug(selected_tokens),
+                _tensor_like_debug(token_start_index),
+                request_ids,
+                _tensor_like_debug(target_slot_mapping),
+                None,
+            )
+            raise
+        return
+
+    forward_context: ForwardContext = get_forward_context()
+    attn_metadata = forward_context.attn_metadata
+    if attn_metadata is None:
+        return
+
+    if should_log:
+        logger.info(
+            "[DSA_INDEX_LMCACHE] connector_wait_enter layer=%s "
+            "connector=%s selected=%s token_start_index=%s request_ids=%s "
+            "target_slot_mapping=%s attn_metadata=%s",
+            layer_name,
+            type(connector).__name__,
+            _tensor_like_debug(selected_tokens),
+            _tensor_like_debug(token_start_index),
+            request_ids,
+            _tensor_like_debug(target_slot_mapping),
+            type(attn_metadata).__name__,
+        )
+
+    # DSA selective load: pass the indexer's top-k positions so LMCache loads only the
+    # selected prefill latent for this decode step. Falls back to a whole-layer load when
+    # not provided (prefill / non-sparse).
+    try:
+        if selected_tokens is not None:
+            # Per-row request identity, in the SAME order as `selected_tokens` (both are
+            # sliced from input_batch-row-ordered data). LMCache uses this to pair each
+            # decode request to its own selected-token row by req_id instead of by loop
+            # position, so a divergence between the connector-metadata order and the
+            # runner's batch order can no longer mis-pair (or IndexError) at higher batch.
+            dsa_req_ids = getattr(forward_context, "dsa_req_ids", None)
+            if request_ids is None and dsa_req_ids is not None:
+                request_ids = list(dsa_req_ids[: selected_tokens.shape[0]])
+            connector.wait_for_layer_load(
+                layer_name,
+                selected_tokens,
+                token_start_index,
+                request_ids,
+                **wait_kwargs,
+            )
+        else:
+            connector.wait_for_layer_load(layer_name)
+    except Exception:
+        logger.exception(
+            "[DSA_INDEX_LMCACHE] connector_wait_error layer=%s "
+            "connector=%s selected=%s token_start_index=%s request_ids=%s "
+            "target_slot_mapping=%s attn_metadata=%s",
+            layer_name,
+            type(connector).__name__,
+            _tensor_like_debug(selected_tokens),
+            _tensor_like_debug(token_start_index),
+            request_ids,
+            _tensor_like_debug(target_slot_mapping),
+            type(attn_metadata).__name__,
+        )
+        raise
+
+    if should_log:
+        logger.info(
+            "[DSA_INDEX_LMCACHE] connector_wait_done layer=%s connector=%s",
+            layer_name,
+            type(connector).__name__,
+        )
+
+
+def layerwise_prefill_transfer_window_supported() -> bool:
+    """Return whether the active connector exposes split wait/submit loads."""
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return False
+
+    connector = get_kv_transfer_group()
+    submit_load = getattr(
+        connector,
+        "submit_layerwise_prefill_load",
+        None,
+    )
+    finish_save = getattr(
+        connector,
+        "finish_layerwise_prefill_save",
+        None,
+    )
+    capability = getattr(
+        connector,
+        "supports_layerwise_prefill_transfer_window",
+        False,
+    )
+    return capability is True and callable(submit_load) and callable(finish_save)
+
+
+def record_layerwise_prefill_bank_use(layer_name: str) -> None:
+    """Record a P bank's final access and order its next DMA after that event."""
+    connector = get_kv_transfer_group()
+    record = getattr(connector, "record_layerwise_prefill_bank_use", None)
+    if not callable(record):
+        raise RuntimeError(
+            "Layerwise prefill requires the bank-use event API; update LMCache "
+            "and LMCache-Ascend together with vllm-ascend"
+        )
+    event = torch.npu.Event()
+    event.record(torch.npu.current_stream())
+    record(layer_name, event)
+
+
+def layerwise_kv_trace_enabled() -> bool:
+    """Read the existing hash switch without loading LMCache for other connectors."""
+    if not has_kv_transfer_group():
+        return False
+    # Lazy import avoids loading LMCache for other cache connectors.
+    from lmcache.v1.prefill_kv_hash import kv_hash_enabled
+
+    return kv_hash_enabled()
+
+
+def trace_layerwise_kv(layer_name: str, **kwargs) -> None:
+    """Forward hash-only diagnostics without reading device values on the host."""
+    if not layerwise_kv_trace_enabled():
+        return
+    connector = get_kv_transfer_group()
+    trace = getattr(connector, "trace_attention_kv", None)
+    if callable(trace):
+        trace(layer_name, **kwargs)
+
+
+def maybe_submit_layerwise_prefill_load(layer_name: str | int) -> bool:
+    """Submit N+2; ``-1`` is the first-layer, load-only trigger."""
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return False
+
+    connector = get_kv_transfer_group()
+    submit_load = getattr(
+        connector,
+        "submit_layerwise_prefill_load",
+        None,
+    )
+    capability = getattr(
+        connector,
+        "supports_layerwise_prefill_transfer_window",
+        False,
+    )
+    if capability is not True or not callable(submit_load):
+        return False
+
+    submit_load(layer_name)
+    return True
+
+
+def maybe_finish_layerwise_prefill_save(layer_name: str) -> bool:
+    """Run post-HCOM host work for a pre-HCOM layer save."""
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return False
+
+    connector = get_kv_transfer_group()
+    finish_save = getattr(
+        connector,
+        "finish_layerwise_prefill_save",
+        None,
+    )
+    capability = getattr(
+        connector,
+        "supports_layerwise_prefill_transfer_window",
+        False,
+    )
+    if capability is not True or not callable(finish_save):
+        return False
+
+    finish_save(layer_name)
+    return True
+
+
+def _maybe_save_kv_layer_to_connector_with_method(
+    layer_name: str,
+    kv_cache_layer: list[torch.Tensor],
+    method_name: str,
+):
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
         return
 
@@ -321,7 +879,38 @@ def wait_for_kv_layer_from_connector(layer_name: str):
     if attn_metadata is None:
         return
     # TODO: assert ascendMetadata
-    connector.wait_for_layer_load(layer_name)
+    should_log = _dsa_lmcache_log_layer(layer_name)
+    if should_log:
+        logger.info(
+            "[DSA_INDEX_LMCACHE] connector_save_enter layer=%s connector=%s kv_cache_layer=%s attn_metadata=%s",
+            layer_name,
+            type(connector).__name__,
+            _tensor_like_debug(kv_cache_layer),
+            type(attn_metadata).__name__,
+        )
+    try:
+        save_layer = getattr(connector, method_name, None)
+        if not callable(save_layer):
+            raise RuntimeError(
+                f"KV connector {type(connector).__name__} does not expose "
+                f"required save method {method_name}"
+            )
+        save_layer(layer_name, kv_cache_layer, attn_metadata)
+    except Exception:
+        logger.exception(
+            "[DSA_INDEX_LMCACHE] connector_save_error layer=%s connector=%s kv_cache_layer=%s attn_metadata=%s",
+            layer_name,
+            type(connector).__name__,
+            _tensor_like_debug(kv_cache_layer),
+            type(attn_metadata).__name__,
+        )
+        raise
+    if should_log:
+        logger.info(
+            "[DSA_INDEX_LMCACHE] connector_save_done layer=%s connector=%s",
+            layer_name,
+            type(connector).__name__,
+        )
 
 
 def maybe_save_kv_layer_to_connector(
@@ -338,7 +927,54 @@ def maybe_save_kv_layer_to_connector(
     if attn_metadata is None:
         return
     # TODO: assert ascendMetadata
-    connector.save_kv_layer(layer_name, kv_cache_layer, attn_metadata)
+    should_log = _dsa_lmcache_log_layer(layer_name)
+    if should_log:
+        logger.info(
+            "[DSA_INDEX_LMCACHE] connector_save_enter layer=%s connector=%s kv_cache_layer=%s attn_metadata=%s",
+            layer_name,
+            type(connector).__name__,
+            _tensor_like_debug(kv_cache_layer),
+            type(attn_metadata).__name__,
+        )
+    try:
+        connector.save_kv_layer(layer_name, kv_cache_layer, attn_metadata)
+    except Exception:
+        logger.exception(
+            "[DSA_INDEX_LMCACHE] connector_save_error layer=%s connector=%s kv_cache_layer=%s attn_metadata=%s",
+            layer_name,
+            type(connector).__name__,
+            _tensor_like_debug(kv_cache_layer),
+            type(attn_metadata).__name__,
+        )
+        raise
+    if should_log:
+        logger.info(
+            "[DSA_INDEX_LMCACHE] connector_save_done layer=%s connector=%s",
+            layer_name,
+            type(connector).__name__,
+        )
+
+
+def maybe_save_kv_layer_in_layerwise_prefill_transfer_window(
+    layer_name: str,
+    kv_cache_layer: list[torch.Tensor],
+):
+    _maybe_save_kv_layer_to_connector_with_method(
+        layer_name,
+        kv_cache_layer,
+        "save_kv_layer_in_layerwise_prefill_transfer_window",
+    )
+
+
+def maybe_save_kv_layer_outside_layerwise_prefill_transfer_window(
+    layer_name: str,
+    kv_cache_layer: list[torch.Tensor],
+):
+    _maybe_save_kv_layer_to_connector_with_method(
+        layer_name,
+        kv_cache_layer,
+        "save_kv_layer_outside_layerwise_prefill_transfer_window",
+    )
 
 
 def round_up(val: int, align: int) -> int:
@@ -374,13 +1010,9 @@ def transdata(nd_mat, block_size: tuple = (16, 16)):
 
 
 def enabling_mlapo(vllm_config: VllmConfig) -> bool:
-    config_val = get_ascend_config().enable_mlapo
-    if get_ascend_device_type() == AscendDeviceType.A5:
-        return bool(config_val)
-
     is_decode_instance = (
         vllm_config.kv_transfer_config is not None
         and vllm_config.kv_transfer_config.is_kv_consumer
         and not vllm_config.kv_transfer_config.is_kv_producer
     )
-    return bool(config_val and is_decode_instance)
+    return bool(envs.VLLM_ASCEND_ENABLE_MLAPO and is_decode_instance)

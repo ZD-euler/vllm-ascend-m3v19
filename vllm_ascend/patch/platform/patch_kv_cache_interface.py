@@ -4,16 +4,10 @@
 from dataclasses import dataclass
 
 import torch
-import vllm.model_executor.layers.attention.mla_attention
 import vllm.v1.kv_cache_interface
 from typing_extensions import Self
-from vllm.config import VllmConfig
-from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
-from vllm.v1.kv_cache_interface import (
-    MLAAttentionSpec,
-    SlidingWindowMLASpec,
-)
+from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 
 @dataclass(frozen=True)
@@ -42,17 +36,53 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
        and is therefore saved in kv_cache[3].
     """
 
-    scale_dim: int = 0
-    scale_dtype: torch.dtype = torch.int8
     sparse_head_dim: tuple[int, ...] | None = None
     cache_sparse_c8: bool = False
     c8_k_cache_dtype: torch.dtype = torch.int8
     c8_k_scale_cache_dtype: torch.dtype = torch.float16
+    # None is the original homogeneous layout; a tuple selects C8 owners in
+    # a mixed group while retaining common logical block IDs for every layer.
+    indexer_c8_layer_names: tuple[str, ...] | None = None
+
+    indexer_paired_banks: bool = False
+    shared_pool_alignment_bytes: int = 0
+    # Verified external compact-D residency policy; latent group only.
+    dsa_compact_startup_scratch_tokens: int = 0
+    dsa_compact_startup_dense_tokens: int = 0
+
+    @property
+    def shared_indexer_key_dtype(self) -> torch.dtype:
+        return self.dtype if self.indexer_c8_layer_names is not None else self.c8_k_cache_dtype
+
+    @property
+    def indexer_scale_layer_count(self) -> int | None:
+        return len(self.indexer_c8_layer_names) if self.indexer_c8_layer_names is not None else None
+
+    def is_indexer_c8_layer(self, name: str) -> bool:
+        return self.cache_sparse_c8 and (
+            self.indexer_c8_layer_names is None or name in self.indexer_c8_layer_names
+        )
+
+    @property
+    def indexer_scale_page_size_bytes(self) -> int:
+        """Scale sidecar charged separately from shared Group-1 key storage."""
+        if self.cache_sparse_c8 and self.sparse_head_dim is not None and len(self.sparse_head_dim) == 1:
+            factor = 2 if self.indexer_c8_layer_names is not None and not self.indexer_paired_banks else 1
+            return factor * self.block_size * self.num_kv_heads * get_dtype_size(self.c8_k_scale_cache_dtype)
+        return 0
 
     @property
     def page_size_bytes(self) -> int:
         if self.cache_sparse_c8:
             assert self.sparse_head_dim is not None
+            if len(self.sparse_head_dim) == 1:
+                return (
+                    self.block_size
+                    * self.num_kv_heads
+                    * self.sparse_head_dim[0]
+                    * get_dtype_size(self.shared_indexer_key_dtype)
+                    + self.indexer_scale_page_size_bytes
+                )
             assert len(self.sparse_head_dim) == 3
             num_heads_per_page = self.block_size * self.num_kv_heads
             # kv_cache[0]: bfloat16, kv_cache[1]: bfloat16
@@ -69,11 +99,7 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             )
             return k_pe_nope_bytes + indexer_k_bytes + indexer_k_scale_bytes
 
-        return (
-            self.block_size
-            * self.num_kv_heads
-            * (self.head_size * get_dtype_size(self.dtype) + self.scale_dim * get_dtype_size(self.scale_dtype))
-        )
+        return self.block_size * self.num_kv_heads * self.head_size * get_dtype_size(self.dtype)
 
     @property
     def sparse_kv_cache_ratio(self) -> tuple[float, float, float, float | None]:
@@ -136,99 +162,55 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
         assert len(cache_dtype_str_set) == 1, (
             "All attention layers in the same KV cache group must use the same quantization method."
         )
-        cache_sparse_c8_set = set(spec.cache_sparse_c8 for spec in specs)
-        assert len(cache_sparse_c8_set) == 1, (
-            "All attention layers in the same KV cache group must use the same sparse C8 setting."
+        # Layers with different per-token sizes (e.g. DSA un-bundled latent head_size=576
+        # vs indexer head_size=128) must NOT collapse into one merged spec — otherwise the
+        # smaller page is applied to all layers, mis-sizing the larger ones and over-counting
+        # num_blocks. Asserting here makes is_kv_cache_spec_uniform() route them to the
+        # per-layer UniformTypeKVCacheSpecs path instead.
+        assert len({spec.head_size for spec in specs}) == 1, (
+            "All attention layers in the same KV cache group must have the same head_size."
         )
+        assert len({spec.sparse_head_dim for spec in specs}) == 1, (
+            "All attention layers in the same KV cache group must have the same sparse_head_dim."
+        )
+        assert (
+            len(
+                {
+                    (
+                        spec.cache_sparse_c8,
+                        spec.indexer_c8_layer_names,
+                        spec.indexer_paired_banks,
+                        spec.shared_pool_alignment_bytes,
+                        spec.dsa_compact_startup_scratch_tokens,
+                        spec.dsa_compact_startup_dense_tokens,
+                    )
+                    for spec in specs
+                }
+            )
+            == 1
+        ), "All layers in a KV group must share one indexer precision policy."
         return cls(
             block_size=specs[0].block_size,
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
-            scale_dim=specs[0].scale_dim,
-            scale_dtype=specs[0].scale_dtype,
             sparse_head_dim=specs[0].sparse_head_dim,
             dtype=specs[0].dtype,
             cache_dtype_str=cache_dtype_str_set.pop(),
             cache_sparse_c8=specs[0].cache_sparse_c8,
-        )
-
-    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
-        max_model_len = vllm_config.model_config.max_model_len
-        dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
-        pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
-        # Note(hc): each dcp rank only need save
-        # (max_model_len//dcp_world_size) tokens locally.
-        if dcp_world_size * pcp_world_size > 1:
-            max_model_len = cdiv(max_model_len, dcp_world_size * pcp_world_size)
-        return cdiv(max_model_len, self.block_size * self.compress_ratio) * self.page_size_bytes
-
-
-def _init_mla_cache_fields(spec: MLAAttentionSpec | SlidingWindowMLASpec):
-    """Shared MLA cache init logic for quantiztion format across different models."""
-    FP8_DTYPE = "fp8_ds_mla"
-    MODEL_VERSIONS = ["v32", "deepseek_v4"]
-    if spec.cache_dtype_str != FP8_DTYPE:
-        return
-    assert spec.model_version in MODEL_VERSIONS, "Invalid model version."
-    assert (spec.model_version == "v32" and spec.compress_ratio == 1) or (
-        spec.model_version == "deepseek_v4" and spec.compress_ratio in [0, 4, 128]
-    ), "Invalid compress ratio."
-    if spec.compress_ratio > 1:
-        assert spec.block_size % spec.compress_ratio == 0, (
-            f"Block size {spec.block_size} must be divisible by compress ratio."
-        )
-
-
-@dataclass(frozen=True, kw_only=True)
-class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
-    """Sliding window attention with MLA cache format."""
-
-    cache_dtype_str: str | None = None
-    # DeepseekV4-only: see MLAAttentionSpec.model_version.
-    alignment: int | None = None  # Default to None for no padding.
-    compress_ratio: int = 1
-    model_version: str | None = None
-
-    @property
-    def storage_block_size(self) -> int:
-        return self.block_size
-
-    @property
-    def real_page_size_bytes(self) -> int:
-        return self.storage_block_size * self.num_kv_heads * self.head_size * get_dtype_size(self.dtype)
-
-    @classmethod
-    def merge(cls, specs: list[Self]) -> Self:
-        assert all(isinstance(spec, SlidingWindowMLASpec) for spec in specs), (
-            "All attention layers in the same KV cache group must be SlidingWindowMLASpec."
-        )
-        cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
-        compress_ratio_set = set(spec.compress_ratio for spec in specs)
-        model_version_set = set(spec.model_version for spec in specs)
-        sliding_window_set = set(spec.sliding_window for spec in specs)
-        assert (
-            len(cache_dtype_str_set) == 1
-            and len(compress_ratio_set) == 1
-            and len(model_version_set) == 1
-            and len(sliding_window_set) == 1
-        ), (
-            "All attention layers in the same KV cache group must use the same "
-            "quantization method, compress ratio, model version and sliding "
-            "window size."
-        )
-        return cls(
-            block_size=specs[0].block_size,
-            num_kv_heads=specs[0].num_kv_heads,
-            head_size=specs[0].head_size,
-            dtype=specs[0].dtype,
-            page_size_padded=specs[0].page_size_padded,
-            sliding_window=sliding_window_set.pop(),
-            cache_dtype_str=cache_dtype_str_set.pop(),
-            compress_ratio=compress_ratio_set.pop(),
-            model_version=model_version_set.pop(),
+            indexer_c8_layer_names=specs[0].indexer_c8_layer_names,
+            indexer_paired_banks=specs[0].indexer_paired_banks,
+            shared_pool_alignment_bytes=specs[0].shared_pool_alignment_bytes,
+            dsa_compact_startup_scratch_tokens=specs[0].dsa_compact_startup_scratch_tokens,
+            dsa_compact_startup_dense_tokens=specs[0].dsa_compact_startup_dense_tokens,
         )
 
 
 vllm.v1.kv_cache_interface.MLAAttentionSpec = AscendMLAAttentionSpec
-vllm.v1.kv_cache_interface.SlidingWindowMLASpec = AscendSlidingWindowMLASpec
-vllm.model_executor.layers.attention.mla_attention.MLAAttentionSpec = AscendMLAAttentionSpec
+
+# The upstream DeepseekV32IndexerBackend reports CUDA kernel block sizes ([64]).
+# On Ascend the indexer cache layout uses 128-token kernel blocks; in DSA
+# two-group mode the runner queries this to split logical blocks into kernel
+# blocks, so it must report 128 (single-group mode never queries it).
+import vllm.v1.attention.backends.mla.indexer as _vllm_dsv32_indexer  # noqa: E402
+
+_vllm_dsv32_indexer.DeepseekV32IndexerBackend.get_supported_kernel_block_sizes = staticmethod(lambda: [128])

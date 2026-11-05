@@ -86,11 +86,7 @@ def start_rfork_server(local_seed_key, rfork_transfer_engine_info, health_timeou
         if port == -1:
             raise RuntimeError("Child process failed to start server")
     except Exception as e:
-        logger.error(
-            "[RFork Seed] start server error for seed_key=%s: %s",
-            local_seed_key,
-            e,
-        )
+        logger.error("[RFork Seed] start server error: %s", e)
         return -1
 
     deadline = time.time() + health_timeout_sec

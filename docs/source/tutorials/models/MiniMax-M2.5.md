@@ -7,21 +7,13 @@ MiniMax‑M2.5 is MiniMax’s flagship large language model, reinforced for high
 This document provides a unified deployment guide for `MiniMax-M2.5` on vLLM Ascend, covering both:
 
 - **A3 single-node** deployment (Atlas 800 A3)
-- **A2 single-node** deployment (Atlas 800I A2)
-
-## Supported Features
-
-Refer to [supported features](../../user_guide/support_matrix/supported_models.md) to get the model's supported feature matrix.
-
-Refer to [feature guide](../../user_guide/feature_guide/index.md) to get the feature's configuration.
+- **A2 dual-node** deployment (2× Atlas 800I A2)
 
 ## Environment Preparation
 
 ### Model Weights
 
-- `MiniMax-M2.5` (fp8 checkpoint): recommended to use **1× Atlas 800 A3** or **1× Atlas 800I A2** nodes. Download the model weights from [MiniMax/MiniMax-M2.5](https://modelscope.cn/models/MiniMax/MiniMax-M2.5).
-- `MiniMax-M2.5-w8a8-QuaRot` : Download the model weights from [Eco-Tech/MiniMax-M2.5-w8a8-QuaRot](https://modelscope.cn/models/Eco-Tech/MiniMax-M2.5-w8a8-QuaRot).
-- `Eagle3` : Download the model weights from [vllm-ascend/MiniMax-M2.5-eagel-model](https://modelscope.cn/models/vllm-ascend/MiniMax-M2.5-eagel-model-0318).
+- `MiniMax-M2.5` (fp8 checkpoint): recommended to use **1× Atlas 800 A3** or **2× Atlas 800I A2** nodes. Download the model weights from [MiniMax/MiniMax-M2.5](https://modelscope.cn/models/MiniMax/MiniMax-M2.5).
 
 It is recommended to download the model weights to a shared directory, such as `/mnt/sfs_turbo/.cache/`. The current release automatically detects the MiniMax-M2 fp8 checkpoint, disables fp8 quantization kernels on NPU, and loads the weights by dequantizing to bf16. This behavior may be removed once public bf16 weights are available.
 
@@ -76,9 +68,9 @@ docker run --rm \
 -it $IMAGE bash
 ```
 
-### A2 (single node)
+### A2 (dual node, run on both nodes)
 
-Create and run `minimax25-docker-run.sh`.
+Create and run `minimax25-docker-run.sh` on **both** A2 nodes.
 
 Notes:
 
@@ -120,121 +112,170 @@ docker run -itd -u 0 --ipc=host --privileged \
 
 ## Online Inference on Multi-NPU
 
-### A3 (single node)
+### A3 (single node, tp=16)
 
-Below is a recommended startup configuration for short-context condition like 3.5k/1.5k to reach a good performance.
+Below is a recommended startup configuration (default performance profile: full context + Tool Calling + Reasoning).
 
 Notes:
 
-- If you only care about short-context low latency, you can explicitly set `--max-model-len 32768`. You may also set `tensor-parallel-size` to 16 and set `data-parallel-size` to 1.
-- `export VLLM_ASCEND_BALANCE_SCHEDULING=1` is used to enhance scheduling capacity between prefill and decode. This will work remarkably with a larger `data-parallel-size`. This can increace performance when concurrency gets closer to values equals to `data-parallel-size` times `max-num-seqs`.
+- By default, `--max-model-len` is not explicitly set. The server reads the model config (M2.5 uses `196608`) and enables verified performance parameters.
+- If you only care about short-context low latency, you can explicitly set `--max-model-len 32768`.
 
 ```{code-block} bash
-export HCCL_OP_EXPANSION_MODE="AIV"
-export HCCL_BUFFSIZE=1024
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export OMP_NUM_THREADS=1
-echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-sysctl -w vm.swappiness=0
-sysctl -w kernel.numa_balancing=0
-sysctl kernel.sched_migration_cost_ns=50000
-export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
-export TASK_QUEUE_ENABLE=1
-
-export VLLM_ASCEND_ENABLE_FUSED_MC2=1
+cd /workspace
 export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
-export VLLM_ASCEND_BALANCE_SCHEDULING=1
 
-vllm serve /path/to/weight/MiniMax-M2.5-w8a8-QuaRot \
-    --served-model-name "MiniMax-M2.5" \
-    --host 0.0.0.0 \
-    --port 8000 \
-    --trust-remote-code \
-    --quantization ascend \
-    --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
-    --additional-config '{"enable_cpu_binding":true}' \
-    --enable-expert-parallel \
-    --tensor-parallel-size 4 \
-    --data-parallel-size 4 \
-    --max-num-seqs 48 \
-    --max-model-len 40690 \
-    --max-num-batched-tokens 16384 \
-    --gpu-memory-utilization 0.85 \
-    --speculative_config '{"enforce_eager": true, "method": "eagle3", "model": "/path/to/weight/Eagle3/", "num_speculative_tokens": 3}' \
+vllm serve /models/MiniMax-M2.5 \
+  --served-model-name MiniMax-M2.5 \
+  --trust-remote-code \
+  --dtype bfloat16 \
+  --tensor-parallel-size 16 \
+  --enable-expert-parallel \
+  --max-num-seqs 32 \
+  --max-num-batched-tokens 32768 \
+  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+  --enable-auto-tool-choice \
+  --tool-call-parser minimax_m2 \
+  --reasoning-parser minimax_m2_append_think \
+  --port 8000 \
+  > /tmp/minimax-m25-serve.log 2>&1 &
+
+tail -f /tmp/minimax-m25-serve.log
 ```
 
 Remarks:
 
 - `minimax_m2_append_think` keeps `<think>...</think>` inside `content`.
 - If you mainly rely on the reasoning semantics of `/v1/responses`, it is recommended to use `--reasoning-parser minimax_m2` instead.
-- To receive a better performance on long-context like 128k or 64k, we recommend to do changes as shown below, and you can remove `export VLLM_ASCEND_BALANCE_SCHEDULING=1`.
+
+### A2 (dual node, tp=8 + dp=2)
+
+Since cross-node tensor parallelism (TP) can be unstable, the dual-node guide uses a **tp=8 + dp=2** setup (8 NPUs per node, 16 NPUs total).
+
+#### Node0 (primary) startup script
+
+Edit `minimax25_service_node0.sh` inside the node0 container, and replace the placeholders with your actual values:
+
+- `{PrimaryNodeIP}`: the primary node's IP address (public/cluster network)
+- `{NIC}`: the NIC name for the public/cluster network (check via `ifconfig`, e.g., `enp67s0f0np0`)
+- `VLLM_TORCH_PROFILER_DIR`: optional, directory to store profiling outputs
 
 ```{code-block} bash
-    --tensor-parallel-size 8 \
-    --data-parallel-size 1 \
-    --decode-context-parallel-size 1 \
-    --prefill-context-parallel-size 2 \
-    --cp-kv-cache-interleave-size 128 \
-    --max-num-seqs 16 \
-    --max-model-len 138000 \
-    --max-num-batched-tokens 65536 \
-    --gpu-memory-utilization 0.85 \
-    --speculative_config '{"enforce_eager": true, "method": "eagle3", "model": "/path/to/weight/Eagle3/", "num_speculative_tokens": 1}' \
-```
+# Primary node (node0)
+export HCCL_IF_IP={PrimaryNodeIP}
+export GLOO_SOCKET_IFNAME="{NIC}"
+export TP_SOCKET_IFNAME="{NIC}"
+export HCCL_SOCKET_IFNAME="{NIC}"
+export HCCL_BUFFSIZE=1024
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
-- If you will to test with `curl` command, you can add following commands addition to start up command above.
-
-```{code-block} bash
-    --enable-auto-tool-choice \
-    --tool-call-parser minimax_m2 \
-    --reasoning-parser minimax_m2_append_think \
-```
-
-### A2 (single node)
-
-```{code-block} bash
-export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
 export HCCL_OP_EXPANSION_MODE="AIV"
-export HCCL_BUFFSIZE=512
-sysctl -w vm.swappiness=0
-sysctl -w kernel.numa_balancing=0
-sysctl kernel.sched_migration_cost_ns=50000
-export TASK_QUEUE_ENABLE=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
-export HCCL_INTRA_PCIE_ENABLE=1
-export HCCL_INTRA_ROCE_ENABLE=0
+
 export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=1
+export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
 
-vllm serve /path/to/weight/MiniMax-M2.5-w8a8-QuaRot \
-    --served-model-name MiniMax-M2.5 \
-    --host 0.0.0.0 \
-    --port 8000 \
-    --trust-remote-code \
-    --tensor-parallel-size 8 \
-    --quantization ascend \
-    --enable-expert-parallel \
-    --max-num-seqs 32 \
-    --seed 1024 \
-    --max-num-batched-tokens 32768 \
-    --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY","cudagraph_capture_sizes":[4,16,20,32,80,96,128,200,256,320]}' \
-    --gpu-memory-utilization 0.9 \
-    --enable-auto-tool-choice \
-    --tool-call-parser minimax_m2 \
-    --reasoning-parser minimax_m2_append_think \
-    --enable-force-include-usage \
-    --additional-config '{"enable_cpu_binding":true}' \
-    --model-loader-extra-config '{"enable_multithread_load":true,"num_threads":16}' \
-    --speculative_config '{"method": "eagle3", "model": "/path/to/weight/Eagle3/",  "num_speculative_tokens":3}'
+export HCCL_INTRA_PCIE_ENABLE=1
+export HCCL_INTRA_ROCE_ENABLE=0
+
+# profiling (optional)
+export VLLM_TORCH_PROFILER_WITH_STACK=0
+export VLLM_TORCH_PROFILER_DIR="{profiling_dir}"
+
+vllm serve /opt/data/verification/models/MiniMax-M2.5/ \
+  --served-model-name "minimax25" \
+  --host {PrimaryNodeIP} \
+  --port 20004 \
+  --tensor-parallel-size 8 \
+  --data-parallel-size 2 \
+  --data-parallel-size-local 1 \
+  --data-parallel-start-rank 0 \
+  --data-parallel-address {PrimaryNodeIP} \
+  --data-parallel-rpc-port 2347 \
+  --max-num-seqs 128 \
+  --max-num-batched-tokens 65536 \
+  --gpu-memory-utilization 0.92 \
+  --enable-expert-parallel \
+  --trust-remote-code \
+  --enable-auto-tool-choice \
+  --tool-call-parser minimax_m2 \
+  --reasoning-parser minimax_m2_append_think \
+  --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
+  --mm_processor_cache_type="shm" \
+  --async-scheduling \
+  --additional-config '{"enable_cpu_binding":true}'
 ```
 
-Remarks:
+#### Node1 (secondary) startup script
 
-- `--max-num-seqs` parameter can be adjusted according to actual request conditions.
-- `--max-num-batched-tokens 32768` is applicable to the input sequence length of 32k or longer.
-- `--max-num-batched-tokens 16384` is applicable to the input sequence length of 16k.
-- `--max-num-batched-tokens 6144` is applicable to short sequence input scenarios such as 2k and 3.5k.
+Edit `minimax25_service_node1.sh` inside the node1 container:
+
+- `{SecondaryNodeIP}`: the secondary node's IP address
+- `{PrimaryNodeIP}`: the primary node's IP address (same as node0)
+- `{NIC}`: same as above
+
+```{code-block} bash
+# Secondary node (node1)
+export HCCL_IF_IP={SecondaryNodeIP}
+export GLOO_SOCKET_IFNAME="{NIC}"
+export TP_SOCKET_IFNAME="{NIC}"
+export HCCL_SOCKET_IFNAME="{NIC}"
+export HCCL_BUFFSIZE=1024
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
+export HCCL_OP_EXPANSION_MODE="AIV"
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=1
+export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
+
+export HCCL_INTRA_PCIE_ENABLE=1
+export HCCL_INTRA_ROCE_ENABLE=0
+
+# profiling (optional)
+export VLLM_TORCH_PROFILER_WITH_STACK=0
+export VLLM_TORCH_PROFILER_DIR="{profiling_dir}"
+
+vllm serve /opt/data/verification/models/MiniMax-M2.5/ \
+  --served-model-name "minimax25" \
+  --host {SecondaryNodeIP} \
+  --port 20004 \
+  --headless \
+  --tensor-parallel-size 8 \
+  --data-parallel-size 2 \
+  --data-parallel-size-local 1 \
+  --data-parallel-start-rank 1 \
+  --data-parallel-address {PrimaryNodeIP} \
+  --data-parallel-rpc-port 2347 \
+  --max-num-seqs 128 \
+  --max-num-batched-tokens 65536 \
+  --gpu-memory-utilization 0.92 \
+  --enable-expert-parallel \
+  --trust-remote-code \
+  --enable-auto-tool-choice \
+  --tool-call-parser minimax_m2 \
+  --reasoning-parser minimax_m2_append_think \
+  --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
+  --mm_processor_cache_type="shm" \
+  --async-scheduling \
+  --additional-config '{"enable_cpu_binding":true}'
+```
+
+#### Startup order
+
+Start the service on both nodes:
+
+```{code-block} bash
+# node0
+bash minimax25_service_node0.sh
+
+# node1
+bash minimax25_service_node1.sh
+```
+
+After node0 prints `service start` in logs, you can verify the service.
 
 ## Verify the Service
 
@@ -284,15 +325,15 @@ curl http://localhost:8000/v1/chat/completions \
   }'
 ```
 
-### A2 (single node)
+### A2 (dual node)
 
-Run the following from any machine that can reach the service node (replace `{NodeIP}` with the real IP):
+Run the following from any machine that can reach the primary node (replace `{PrimaryNodeIP}` with the real IP):
 
 ```{code-block} bash
-curl http://{NodeIP}:8000/v1/chat/completions \
+curl http://{PrimaryNodeIP}:20004/v1/chat/completions \
   -H "Content-type: application/json" \
   -d '{
-    "model": "MiniMax-M2.5",
+    "model": "minimax25",
     "messages": [{"role": "user", "content": "Hello, who are you?"}],
     "stream": false,
     "ignore_eos": true,
@@ -301,6 +342,68 @@ curl http://{NodeIP}:8000/v1/chat/completions \
     "max_tokens": 200
   }'
 ```
+
+## Performance Reference
+
+### A3 (single node, tp=16, 4k/1k@bs16)
+
+#### Results
+
+**Baseline** (`4k/1k@bs=16`)
+
+| Metric | Result |
+| --- | --- |
+| Success/Failure | `16/0` |
+| Mean TTFT | `616.20 ms` |
+| Mean TPOT | `31.92 ms` |
+| Mean ITL | `31.92 ms` |
+| Output tok/s | `492.39` |
+| Total tok/s | `2461.95` |
+
+**Long-context reference** (`190k/1k@bs=4`)
+
+| Metric | Result |
+| --- | --- |
+| Output tok/s | `37.12` |
+| Mean TTFT | `2002.37 ms` |
+| Mean TPOT | `105.54 ms` |
+| Mean ITL | `105.54 ms` |
+
+### A2 (dual node, 190k/1k, concurrency=4, 16 prompts)
+
+#### Benchmark method
+
+Use vLLM bench for the **190k/1k, concurrency=4, 16 prompts** scenario:
+
+```{code-block} bash
+vllm bench serve --backend vllm \
+  --dataset-name prefix_repetition \
+  --prefix-repetition-prefix-len 175104 \   # Input: 190×1024 tokens with 90% prefix repetition
+  --prefix-repetition-suffix-len 19440 \    # Input: 190×1024 tokens minus the prefix length above
+  --prefix-repetition-output-len 1024 \     # Output: 1024 tokens
+  --prefix-repetition-num-prefixes 1 \
+  --num-prompts 16 \
+  --max-concurrency 4 \
+  --ignore-eos \
+  --model minimax25 \
+  --tokenizer {model_path} \
+  --endpoint /v1/completions \
+  --request-rate inf \
+  --seed 1000 \
+  --host {service_ip} \
+  --port 20004
+```
+
+#### Results
+
+**190k/1k, concurrency=4, 16 prompts**
+
+| Metric | Result |
+| --- | --- |
+| TTFT (avg) | 3305.25 ms |
+| TPOT (avg) | 109.83 ms |
+| Output throughput | 35.29 tok/s |
+| Prefix hit rate | 85% |
 
 ## FAQ
 
@@ -320,10 +423,14 @@ curl http://{NodeIP}:8000/v1/chat/completions \
 
   A: Reduce `--max-num-seqs` and `--max-num-batched-tokens` first. If needed, reduce concurrency and load-testing pressure (e.g., `max-concurrency` / `num-prompts`).
 
+- **Q: Why not use cross-node tp=16?**
+
+  A: The referenced practice noted that cross-node TP may be unstable, so `tp=8, dp=2` is recommended for dual-node deployment.
+
 - **Q: How should I choose `--reasoning-parser`?**
 
   A: This guide uses `minimax_m2_append_think` so that `<think>...</think>` is kept in `content`. If you mainly rely on the reasoning semantics of `/v1/responses`, consider using `--reasoning-parser minimax_m2`.
 
 - **Q: Which ports must be accessible?**
 
-  A: At minimum, expose the serving port (e.g., `8000`)
+  A: At minimum, expose the serving port (e.g., `20004`) and the data-parallel RPC port (e.g., `2347`), and ensure the two nodes can reach each other over the network.
