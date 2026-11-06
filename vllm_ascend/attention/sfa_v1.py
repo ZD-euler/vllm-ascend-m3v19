@@ -2092,7 +2092,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             self.is_kv_producer and envs.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
         )
         self._prefill_sfa_input_fence = (
-            self._layerwise_prefill_p_node and "p_sfa" in envs.LMCACHE_PREFILL_FENCE_DEBUG.split(",")
+            self._layerwise_prefill_p_node
+            and bool({"p_sfa", "trace"} & set(envs.LMCACHE_PREFILL_FENCE_DEBUG.split(",")))
         )
         self._prefill_vup_output_fence = (
             self._layerwise_prefill_p_node and "p_vup" in envs.LMCACHE_PREFILL_FENCE_DEBUG.split(",")

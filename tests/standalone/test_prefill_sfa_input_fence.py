@@ -81,7 +81,8 @@ def test_helper_routes_to_live_connector_and_rejects_missing_api():
 
 
 @pytest.mark.parametrize("p_node", [False, True])
-@pytest.mark.parametrize("mode", ["", "0", "p_load", "p_use", "p_sfa", "p_sfa,check"])
+@pytest.mark.parametrize("mode", ["", "0", "p_load", "p_use", "p_sfa", "p_sfa,check",
+                                  "trace", "p_sfa,trace", "p_use,trace"])
 def test_mode_is_cached_at_initialization_and_never_enabled_on_d(p_node, mode):
     tree = ast.parse((ROOT / "attention/sfa_v1.py").read_text(encoding="utf-8"))
     assignment = next(
@@ -95,4 +96,4 @@ def test_mode_is_cached_at_initialization_and_never_enabled_on_d(p_node, mode):
         compile(ast.fix_missing_locations(ast.Module(body=[assignment], type_ignores=[])), "<mode>", "exec"),
         {"self": impl, "envs": NS(LMCACHE_PREFILL_FENCE_DEBUG=mode)},
     )
-    assert impl._prefill_sfa_input_fence == (p_node and "p_sfa" in mode.split(","))
+    assert impl._prefill_sfa_input_fence == (p_node and bool({"p_sfa", "trace"} & set(mode.split(","))))

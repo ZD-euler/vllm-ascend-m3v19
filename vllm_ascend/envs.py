@@ -43,6 +43,8 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Mirror LMCache's existing non-secret diagnostic selector; default off.
     # p_sfa fences before P latent SFA; p_vup fences after its v_up projection.
     # Other stages are handled by LMCache. The model caches this at startup.
+    # Add "trace" to report event dependencies and sync timings; "trace" alone
+    # observes the pre-SFA boundary without adding a host synchronization.
     "LMCACHE_PREFILL_FENCE_DEBUG": lambda: os.getenv("LMCACHE_PREFILL_FENCE_DEBUG", "").strip().lower(),
     # Raw tensors for real PD diagnostics. Empty (default) disables all hooks.
     # Otherwise an absolute run directory, e.g. /repo/pd-tensor-dump/case-on.
