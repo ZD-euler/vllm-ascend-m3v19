@@ -181,8 +181,11 @@ class Fixture:
         connector._layerwise_prefill_transfer_generations = {0: 0}
         connector._layerwise_prefill_dma_streams = {(0, b): s for b, s in enumerate(streams)}
         connector.load_stream = streams[0]
+        fence_mode = "p_vup" if mode == "p_vup_hold" else mode
         connector.fence_debug = (
-            rt.fence_cls("P", 0, {"LMCACHE_PREFILL_FENCE_DEBUG": mode}) if mode in ("p_sfa", "p_use", "p_vup") else None
+            rt.fence_cls("P", 0, {"LMCACHE_PREFILL_FENCE_DEBUG": fence_mode})
+            if fence_mode in ("p_sfa", "p_use", "p_vup")
+            else None
         )
         _, _, _, loads = connector._layerwise_prefill_transfer_state()
         request_ids = tuple(f"r{r}" for r in range(self.requests))
@@ -291,11 +294,19 @@ class Fixture:
                     # The final layer has no following entry callback. Serving
                     # submits its save before V-up, after the last-use event.
                     save_and_advance(layer)
+                if mode == "before_vup":
+                    # Complete the same SFA event after all bank handoff/save
+                    # submissions, but before any projection work is submitted.
+                    used.synchronize()
                 # Assignment releases the original SFA output as in serving.
                 # Do not keep it in outputs or another local in ordinary modes.
+                sfa_owner = result if mode == "p_vup_hold" else None
                 result = rt.projection(result, self.v_up_weight)
-                if mode == "p_vup":
+                if fence_mode == "p_vup":
                     connector.synchronize_prefill_vup_output(layer, 0)
+                # This case has exactly p_vup's fences. Keep just this layer's
+                # original output alive through the fence, not all layers.
+                del sfa_owner
                 outputs.append(result)
         finally:
             # Also retain raw-pointer owners until partial submissions finish on error.
@@ -348,6 +359,7 @@ class Fixture:
             vup_shape=[self.total_q, args.heads * V_WIDTH],
             output_stage="vup_output",
             retain_sfa_output=mode == "hold_sfa",
+            retain_sfa_until_vup=mode == "p_vup_hold",
             observe_inputs=observe,
             passed=not failures,
             seconds=round(time.perf_counter() - started, 3),
@@ -371,7 +383,16 @@ def main():
     parser.add_argument(
         "--modes",
         nargs="+",
-        choices=("event", "p_sfa", "p_use", "after_bank_wait", "p_vup", "hold_sfa"),
+        choices=(
+            "event",
+            "p_sfa",
+            "p_use",
+            "after_bank_wait",
+            "before_vup",
+            "p_vup",
+            "p_vup_hold",
+            "hold_sfa",
+        ),
         default=["event", "p_sfa", "p_use", "after_bank_wait", "p_vup", "hold_sfa"],
     )
     parser.add_argument("--output", default="prefill-sfa-race.json")

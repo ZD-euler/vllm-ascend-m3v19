@@ -224,7 +224,10 @@ def cpu_runtime(production_classes, damage=None):
     )
 
 
-@pytest.mark.parametrize("mode", ["serial", "event", "p_sfa", "p_use", "p_vup", "after_bank_wait", "hold_sfa"])
+@pytest.mark.parametrize(
+    "mode",
+    ["serial", "event", "p_sfa", "p_use", "p_vup", "after_bank_wait", "before_vup", "p_vup_hold", "hold_sfa"],
+)
 def test_full_probe_with_real_bank_methods_and_cpu_attention(production_classes, mode):
     rt = cpu_runtime(production_classes)
     args = NS(queries=[2, 3, 1], history=2048, topk=8, heads=2, banks=2, layers=5)
@@ -298,6 +301,31 @@ def test_hold_sfa_is_explicit_and_checks_original_output(production_classes):
     assert "vup_output" in result["first_by_stage"]
 
 
+@pytest.mark.parametrize("mode,owners_at_fence", [("p_vup", 0), ("p_vup_hold", 1)])
+def test_bounded_output_retention_changes_only_owner_lifetime(production_classes, mode, owners_at_fence):
+    rt = cpu_runtime(production_classes)
+    args = NS(queries=[2, 3, 1], history=2048, topk=8, heads=2, banks=2, layers=5)
+    fixture = PROBE.Fixture(rt, args)
+    alive_at_fence = []
+    original_sync = rt.npu.current.synchronize
+
+    def inspect_fence():
+        alive_at_fence.append(sum(ref() is not None for ref in rt.sfa_refs))
+        original_sync()
+
+    rt.npu.current.synchronize = inspect_fence
+    rt.npu.actions.clear()
+    result = fixture.run(mode)
+    assert result["passed"]
+    assert result["retain_sfa_until_vup"] == (mode == "p_vup_hold")
+    assert alive_at_fence == [owners_at_fence] * args.layers
+    assert rt.alive_at_sfa == [0] * args.layers
+    assert all(ref() is None for ref in rt.sfa_refs)
+    assert sum(action[0] == "stream_sync" for action in rt.npu.actions) == args.layers
+    assert sum(action[0] == "device_sync" for action in rt.npu.actions) == 2
+    assert rt.npu.event_syncs == 0
+
+
 def test_used_events_have_only_the_production_bank_owners(production_classes):
     rt = cpu_runtime(production_classes)
     args = NS(queries=[2, 3, 1], history=2048, topk=8, heads=2, banks=2, layers=7)
@@ -307,7 +335,10 @@ def test_used_events_have_only_the_production_bank_owners(production_classes):
     assert all(ref() is None for ref in rt.npu.event_refs)
 
 
-@pytest.mark.parametrize("mode", ["event", "p_sfa", "p_use", "p_vup", "after_bank_wait", "hold_sfa"])
+@pytest.mark.parametrize(
+    "mode",
+    ["event", "p_sfa", "p_use", "p_vup", "after_bank_wait", "before_vup", "p_vup_hold", "hold_sfa"],
+)
 def test_fence_and_final_save_order_matches_serving(production_classes, mode):
     rt = cpu_runtime(production_classes)
     args = NS(queries=[2, 3, 1], history=2048, topk=8, heads=2, banks=2, layers=5)
@@ -325,21 +356,23 @@ def test_fence_and_final_save_order_matches_serving(production_classes, mode):
         recorded = next(action for action in between if action[0] == "record")
         wait = ("wait", 1 + layer % args.banks, recorded[2])
         assert wait in between
-        if mode in ("p_use", "after_bank_wait"):
+        if mode in ("p_use", "after_bank_wait", "before_vup"):
             sync = ("event_sync", recorded[2])
             assert sync in between
             if mode == "p_use":
                 assert between.index(sync) < between.index(wait)
             else:
                 assert between.index(sync) > between.index(wait)
+            if mode == "before_vup":
+                assert between[-1] == sync
         else:
             assert not any(action[0] == "event_sync" for action in between)
         if mode == "p_sfa":
             assert actions[sfa - 1] == ("stream_sync", 0)
-        if mode == "p_vup":
+        if mode in ("p_vup", "p_vup_hold"):
             assert actions[projected + 1] == ("stream_sync", 0)
         if layer == args.layers - 1:
-            assert between[-1][0] == "save"
+            assert between[-2 if mode == "before_vup" else -1][0] == "save"
             assert not any(action[0] == "save" for action in actions[projected + 1 :])
         else:
             next_sfa = actions.index(("sfa", layer + 1))

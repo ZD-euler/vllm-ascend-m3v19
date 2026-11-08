@@ -1,5 +1,62 @@
 # SFA / bank handoff numerical reproduction
 
+## Focused run after `p_use` passes and `p_vup` fails
+
+Run this bounded operator check in the serving container on an idle NPU.
+It uses the installed SFA operator, the serving `_v_up_proj` method, and
+the production bank event handoff. The 64 heads match GLM-5.3 with DSA-CP.
+Both V-up branches are exercised: 384 local tokens use the custom transpose
+matmul, and 1536 local tokens use `torch.bmm`. Four banks and 12 layer calls
+exercise repeated bank reuse. Model weights and service startup are absent.
+
+From the updated `vllm-ascend` checkout, with its usual CANN environment:
+
+```bash
+export TASK_QUEUE_ENABLE=1
+export ASCEND_LAUNCH_BLOCKING=0
+
+for case in small large; do
+  if [ "$case" = small ]; then
+    queries="128 127 129"
+  else
+    queries="512 511 513"
+  fi
+  timeout --signal=INT --kill-after=10s 150s python3 tools/prefill_sfa_race.py \
+    --device 0 --history 8192 --layers 12 --banks 4 --heads 64 \
+    --queries $queries --repeat 2 \
+    --modes p_use p_vup before_vup p_vup_hold \
+    --output "sfa-vup-${case}.json" > "sfa-vup-${case}.log" 2>&1
+  status=$?
+  echo "$case exit=$status"
+done
+```
+
+Use a fresh output directory for each run. Each case has a 150-second budget
+plus a 10-second termination grace period. `exit=124` marks a time budget
+expiration, while exit 1 reports numerical differences and exit 2 reports
+invalid command-line arguments or a failed serial oracle. Inspect the log
+to distinguish these cases. Partial JSON is
+saved after each completed mode.
+
+The extra names below are this tool's `--modes` values:
+
+| Mode | Intervention |
+| --- | --- |
+| `p_use` | Wait for the SFA completion event before handing it to bank DMA. |
+| `p_vup` | Hand off the event, submit V-up, release the original SFA output, then wait for the compute stream. |
+| `before_vup` | Hand off the event and submit any final-layer save, then wait for the same SFA event immediately before V-up. |
+| `p_vup_hold` | Use exactly the `p_vup` waits, retaining the current layer's SFA output through that wait. Release it before starting the next layer. |
+
+When the fixture reproduces the serving pattern (`p_use` passes and `p_vup`
+fails), `before_vup` passing focuses investigation on projection submission
+and input lifetime; `before_vup` failing focuses it on bank handoff and final
+save submission. `p_vup_hold` passing provides a direct lifetime intervention
+for the original SFA output, with the same synchronization as `p_vup`.
+Compare modes within the same token shape. If all cases pass, retain the
+serving workload's allocation, CP communication and input context in the next
+diagnostic. The operator fixture is then a regression test for its covered
+shapes, rather than the serving reproducer.
+
 `prefill_sfa_race.py` exercises the installed **real NPU SFA operator**, the
 LMCache-Ascend raw H2D/D2H copy operator, and the connector's production
 per-request load waits and final-reader handoffs. It does not load model
