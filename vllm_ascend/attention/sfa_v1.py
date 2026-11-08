@@ -3455,7 +3455,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         self,
         save_operations: list[tuple[str, list[torch.Tensor]]],
     ) -> list[str]:
-        """Release N's latent bank, then submit its save and next bank load."""
+        """Release N's KV banks, then submit their saves and next bank loads."""
         layer_names = [layer_name for layer_name, _ in save_operations]
         if len(layer_names) != len(set(layer_names)):
             raise RuntimeError(
@@ -3463,14 +3463,13 @@ class AscendSFAImpl(MLAAttentionImpl):
                 f"groups: {layer_names}"
             )
 
-        # save_operations always lists the latent layer before its optional
-        # indexer sibling. Defer only the latent handoff: indexer banks already
-        # have their own events at the end of indexer use.
-        # At N+1 entry this event covers N's projection/FFN and the work queued
-        # before this attention call. Every TP rank records it before any DMA.
+        # Release the source layer's latent and optional indexer banks at the
+        # same boundary, including when N+1 has no indexer of its own.
+        # At N+1 entry these events cover N's projection/FFN and work queued
+        # before this attention call. Every TP rank records them before DMA.
         # Final target/MTP layers call here after their own output projection.
-        if layer_names:
-            record_layerwise_prefill_bank_use(layer_names[0])
+        for layer_name in layer_names:
+            record_layerwise_prefill_bank_use(layer_name)
         self._submit_sfa_transfer_window_save_operations(save_operations)
         for layer_name in layer_names:
             if not maybe_submit_layerwise_prefill_load(layer_name):
@@ -5224,8 +5223,8 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         kv_hash_trace = self._layerwise_prefill_p_node and layerwise_kv_trace_enabled()
 
-        # Keep N's latent bank owned until entry to N+1. Record its release
-        # event and submit its save/next bank load here, before N+1's first
+        # Keep N's KV banks owned until entry to N+1. Record their release
+        # events and submit their saves/next bank loads here, before N+1's first
         # connector wait. The saved source name selects N, not this layer.
         transfer_context = (
             get_forward_context().additional_kwargs
@@ -5703,8 +5702,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                     actual_seq_lengths_key=actual_seq_lengths_key,
                 )
                 if self._layerwise_prefill_p_node and index_lmcache_enabled:
-                    # The indexer has finished reading its own bank. Record
-                    # before top-k publication and latent SFA are submitted.
+                    # Trace here while the indexer bank remains owned. Its
+                    # release event is deferred to the next transfer window.
                     if kv_hash_trace:
                         trace_layerwise_kv(
                             index_layer_name,
@@ -5719,7 +5718,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                             metadata=attn_metadata,
                             produced=(k_li, k_li_scale) if self.use_sparse_c8_indexer else (k_li,),
                         )
-                    record_layerwise_prefill_bank_use(index_layer_name)
                 if self.index_cache_enabled:
                     # Publish this batch's top-k so downstream skip layers
                     # read it from the stable shared buffer.
@@ -5741,7 +5739,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                         metadata=attn_metadata,
                         produced=(k_li, k_li_scale) if self.use_sparse_c8_indexer else (k_li,),
                     )
-                record_layerwise_prefill_bank_use(index_layer_name)
             if content_diagnostics_enabled:
                 queue_selected_topk_fingerprint(
                     req_ids=attn_metadata.req_ids,
@@ -6574,7 +6571,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
 
         attn_output = self._v_up_proj(attn_output)
-        # This diagnostic waits after v_up. The latent bank remains owned
+        # This diagnostic waits after v_up. The KV banks remain owned
         # until the next layer's entry (or this final layer's projection tail).
         if self._prefill_vup_output_fence:
             synchronize_prefill_vup_output(layer_name)
@@ -6636,7 +6633,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self._layerwise_prefill_p_node:
                 # Legacy P connectors save immediately and have no deferred
                 # transfer window. Protect the whole attention computation.
-                record_layerwise_prefill_bank_use(layer_name)
+                for source_name, _ in save_operations:
+                    record_layerwise_prefill_bank_use(source_name)
             if pending_transfers is not None:
                 self._finish_sfa_layerwise_transfer_window(
                     pending_transfers, pending_transfer_names

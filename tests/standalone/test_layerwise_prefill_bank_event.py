@@ -40,7 +40,7 @@ def marker_runtime():
 
 @pytest.mark.parametrize("p_node", [True, False])
 @pytest.mark.parametrize("skip_topk,has_indexer", [(False, True), (True, True), (True, False)])
-def test_indexer_handoff_precedes_topk_publication_and_latent_attention(p_node, skip_topk, has_indexer):
+def test_indexer_bank_stays_owned_through_topk_publication_and_latent_attention(p_node, skip_topk, has_indexer):
     namespace, operations, events, _ = marker_runtime()
     tree = ast.parse((ROOT / "sfa_v1.py").read_text(encoding="utf-8"))
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "AscendSFAImpl")
@@ -77,15 +77,9 @@ def test_indexer_handoff_precedes_topk_publication_and_latent_attention(p_node, 
     )
     compile_nodes([indexer], namespace)
     operations.append("latent SFA")
-    assert len(events) == int(p_node and has_indexer)
-    if events:
-        name, event = events[0]
-        assert name == "indexer"
-        assert "scatter index KV" in event.predecessors
-        assert "publish topk" not in event.predecessors
-        assert "latent SFA" not in event.predecessors
-        if not skip_topk:
-            assert event.predecessors[-1] == "read index KV"
+    assert events == []
+    assert ("reuse topk" in operations) == skip_topk
+    assert ("publish topk" in operations) == (not skip_topk)
 
 
 @pytest.mark.parametrize("p_node", [True, False])

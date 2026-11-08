@@ -2,12 +2,14 @@
 
 ## Current serving handoff
 
-P latent group 0 keeps layer N's bank until the entry to layer N+1's
-attention, before N+1's bank wait and QKV preparation. At that entry, it
-records N's event and queues the bank DMA wait, save and next load. The event
-covers N's V-up, output projection, FFN and work preceding N+1's attention.
+P groups 0 and 1 keep layer N's banks until the entry to layer N+1's
+attention, before N+1's bank wait and QKV preparation. At that entry, each
+source group records N's event and queues its bank DMA wait, save and next
+load. The events cover N's V-up, output projection, FFN and work preceding
+N+1's attention. A layer with no indexer still releases its predecessor's
+indexer bank; it creates no group-1 event for itself.
 Final target and one-layer MTP forwards record and flush after their own
-output projection. Group 1 retains its indexer-completion boundary.
+output projection.
 
 The standalone probe modes below retain the earlier SFA-end event schedule
 as a reference. The serving boundary is exercised on CPU by
