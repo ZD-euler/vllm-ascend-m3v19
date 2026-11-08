@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Probe V-up's first tiling allocation against an outstanding same-stream read.
+"""Probe serving or legacy V-up against an outstanding same-stream read.
 
 Run each mode in a fresh process on an idle NPU. No model or P server is used.
 The read uses LMCache's raw-pointer DMA on the allocation's own stream. Freeing
 the source then reusing its cached storage is safe for stream-ordered writes;
-this probes the custom V-up's direct, unstreamed aclrtMemcpy instead.
+the legacy custom V-up used a direct, unstreamed aclrtMemcpy instead.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ import os
 import struct
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 # csrc/batch_matmul_transpose/op_host/{batch_matmul_transpose.h,tiling/tiling_data.h}.
 # A CPU regression checks these against the C++ declarations.
@@ -38,6 +39,7 @@ def emit(**record):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", required=True, choices=MODES)
+    parser.add_argument("--operator", choices=("serving", "legacy"), default="serving")
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--tokens", type=int, default=384)
     parser.add_argument("--heads", type=int, default=64)
@@ -45,8 +47,9 @@ def parse_args(argv=None):
     parser.add_argument("--backlog-ops", type=int, default=128)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
-    if not 1 <= args.tokens <= TILING_SLOTS:
-        parser.error(f"tokens must be in [1, {TILING_SLOTS}]")
+    max_tokens = TILING_SLOTS if args.operator == "legacy" else 4096
+    if not 1 <= args.tokens <= max_tokens:
+        parser.error(f"tokens must be in [1, {max_tokens}]")
     if not 1 <= args.heads <= 128:
         parser.error("heads must be in [1, 128]")
     if not 16 <= args.backlog_size <= 8192 or args.backlog_size % 16:
@@ -63,9 +66,10 @@ def parse_args(argv=None):
 
 
 class NpuRuntime:
-    def __init__(self, torch, ops):
+    def __init__(self, torch, ops, projection=None, projection_branch="legacy_batch_matmul_transpose"):
         self.torch, self.ops = torch, ops
         self.npu, self.device = torch.npu, "npu"
+        self.projection, self.projection_branch = projection, projection_branch
 
     def copy_out(self, destination, source):
         # pybind.cpp submits aclrtMemcpyAsync on getCurrentNPUStream().stream().
@@ -73,7 +77,11 @@ class NpuRuntime:
         self.ops.layerwise_prefill_dma_copy([(destination.data_ptr(), source.data_ptr(), source.numel())], True)
 
     def project(self, a, b, out):
-        self.torch.ops._C_ascend.batch_matmul_transpose(a, b, out)
+        if self.projection is None:
+            self.torch.ops._C_ascend.batch_matmul_transpose(a, b, out)
+        else:
+            state = SimpleNamespace(local_num_heads=a.shape[1], kv_lora_rank=a.shape[2], v_head_dim=b.shape[2], W_UV=b)
+            out.copy_(self.projection(state, a).view_as(out))
 
 
 def load_runtime(args):
@@ -86,28 +94,39 @@ def load_runtime(args):
     torch.npu.set_device(args.device)
     importlib.import_module("vllm_ascend.vllm_ascend_C")
     ops = importlib.import_module("lmcache_ascend.c_ops")
-    if not hasattr(torch.ops._C_ascend, "batch_matmul_transpose"):
+    if args.operator == "legacy" and not hasattr(torch.ops._C_ascend, "batch_matmul_transpose"):
         raise RuntimeError("Rebuild vllm-ascend with batch_matmul_transpose before running this probe")
     if not hasattr(ops, "layerwise_prefill_dma_copy"):
         raise RuntimeError("Rebuild LMCache-Ascend with layerwise_prefill_dma_copy before running this probe")
+    projection = None
+    branch = "legacy_batch_matmul_transpose"
+    if args.operator == "serving":
+        from vllm_ascend.attention.sfa_v1 import AscendSFAImpl
+
+        projection = AscendSFAImpl._v_up_proj
+        branch = "npu_transpose_batchmatmul" if hasattr(torch_npu, "npu_transpose_batchmatmul") else "native_torch_bmm"
     emit(
         event="runtime",
         torch=torch.__version__,
         torch_npu=torch_npu.__version__,
         task_queue=os.getenv("TASK_QUEUE_ENABLE"),
         allocator_config=os.getenv("PYTORCH_NPU_ALLOC_CONF"),
+        operator=args.operator,
+        projection_branch=branch,
         scope="first V-up tiling allocation and same-stream temporary reuse",
     )
-    return NpuRuntime(torch, ops)
+    return NpuRuntime(torch, ops, projection, branch)
 
 
 def inspect_readback(payload, tokens, heads):
     if len(payload) != CANARY_BYTES:
         raise ValueError(f"expected {CANARY_BYTES} readback bytes, got {len(payload)}")
-    offset = (tokens - 1) * TILING_BYTES
+    # The retired custom operator only had 1024 slots. Larger serving probes
+    # still audit all bytes, with no legacy slot/signature to interpret.
+    offset = (tokens - 1) * TILING_BYTES if tokens <= TILING_SLOTS else None
     changed = [i for i, value in enumerate(payload) if value != CANARY_VALUE]
-    outside = sum(not offset <= i < offset + TILING_BYTES for i in changed)
-    shape = list(struct.unpack_from("<4I", payload, offset))
+    outside = sum(offset is None or not offset <= i < offset + TILING_BYTES for i in changed)
+    shape = list(struct.unpack_from("<4I", payload, offset)) if offset is not None else None
     signature = shape == [heads, tokens, K_WIDTH, V_WIDTH]
     return dict(
         changed_bytes=len(changed),
@@ -178,7 +197,9 @@ def run_probe(rt, args):
             event.synchronize()
         owner = source if args.mode == "hold" else None
         del source
+        project_start = time.monotonic()
         rt.project(a, b, out)
+        project_call_ms = (time.monotonic() - project_start) * 1000
         pending_after = not event.query()
     finally:
         # Keep pinned destination, guard and held source alive even on failure.
@@ -189,16 +210,45 @@ def run_probe(rt, args):
     status, exit_code = classify(args.mode, audit, pending, output_zero)
     return dict(
         mode=args.mode,
+        operator=args.operator,
+        projection_branch=getattr(rt, "projection_branch", "cpu_test"),
+        project_call_ms=round(project_call_ms, 3),
         status=status,
         exit_code=exit_code,
         reader_pending_before_vup=pending,
         reader_pending_after_vup=pending_after,
         output_zero=output_zero,
         source_address=hex(address),
-        candidate_write_address=hex(address + audit["slot_offset"]),
+        candidate_write_address=hex(address + audit["slot_offset"]) if audit["slot_offset"] is not None else None,
         seconds=round(time.monotonic() - start, 3),
         **audit,
     )
+
+
+def validate_projection(rt, args):
+    """Check nonzero values after the cold probe, without a reference matmul.
+
+    Each weight column selects one input column with a head-dependent sign.
+    Small and >1024-token cases exercise both sides of the retired dispatch.
+    """
+    t = rt.torch
+    token_counts = sorted({1, args.tokens, 1536} if args.operator == "serving" else {1, args.tokens})
+    checks = []
+    for tokens in token_counts:
+        rows = (t.arange(tokens * args.heads).reshape(tokens, args.heads, 1) % 29).to(t.int16)
+        columns = t.arange(K_WIDTH, dtype=t.int16)
+        source = ((rows + columns) % 29 - 14).to(t.bfloat16) / 16
+        selected = t.arange(V_WIDTH) * 3 % K_WIDTH
+        signs = (1 - 2 * (t.arange(args.heads) % 2)).to(t.bfloat16)
+        weight = t.zeros((args.heads, K_WIDTH, V_WIDTH), dtype=t.bfloat16)
+        weight[:, selected, t.arange(V_WIDTH)] = signs[:, None]
+        expected = source[:, :, selected] * signs[None, :, None]
+        a, b = source.to(rt.device), weight.to(rt.device)
+        out = t.empty((tokens, args.heads, V_WIDTH), dtype=t.bfloat16, device=rt.device)
+        rt.project(a, b, out)
+        actual = out.cpu()
+        checks.append(dict(tokens=tokens, passed=bool(t.equal(actual, expected))))
+    return dict(passed=all(check["passed"] for check in checks), cases=checks)
 
 
 def main(argv=None):
@@ -206,6 +256,11 @@ def main(argv=None):
     rt = load_runtime(args)
     with rt.torch.inference_mode():
         result = run_probe(rt, args)
+        # Do this last so numerical validation never warms the race probe.
+        if args.operator == "serving":
+            result["numerical"] = validate_projection(rt, args)
+            if not result["numerical"]["passed"]:
+                result.update(status="projection_failed", exit_code=2)
     emit(event="result", **result)
     if args.output:
         args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")

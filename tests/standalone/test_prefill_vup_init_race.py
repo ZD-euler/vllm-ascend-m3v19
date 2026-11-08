@@ -142,7 +142,9 @@ def test_cpp_first_allocation_fence_is_checked_and_outside_the_hot_path():
 @pytest.mark.parametrize("mode", PROBE.MODES)
 def test_first_allocation_fence_preserves_queued_reads_and_only_waits_once(mode):
     rt = CpuRuntime(fence_first_allocation=True)
-    args = PROBE.parse_args(["--mode", mode, "--tokens", "384", "--heads", "64", "--backlog-size", "16"])
+    args = PROBE.parse_args(
+        ["--operator", "legacy", "--mode", mode, "--tokens", "384", "--heads", "64", "--backlog-size", "16"]
+    )
     report = PROBE.run_probe(rt, args)
     assert report["exit_code"] == 0
     assert report["changed_bytes"] == 0
@@ -165,6 +167,8 @@ def test_full_cli_with_real_cpu_buffers_and_deferred_dma(monkeypatch, tmp_path, 
     output = tmp_path / "nested" / f"{mode}.json"
     code = PROBE.main(
         [
+            "--operator",
+            "legacy",
             "--mode",
             mode,
             "--tokens",
@@ -211,7 +215,9 @@ def test_full_cli_with_real_cpu_buffers_and_deferred_dma(monkeypatch, tmp_path, 
     ],
 )
 def test_distinguishes_no_overlap_other_corruption_and_projection_failure(options, status, code):
-    args = PROBE.parse_args(["--mode", "cold", "--tokens", "2", "--heads", "1", "--backlog-size", "16"])
+    args = PROBE.parse_args(
+        ["--operator", "legacy", "--mode", "cold", "--tokens", "2", "--heads", "1", "--backlog-size", "16"]
+    )
     report = PROBE.run_probe(CpuRuntime(**options), args)
     assert report["status"] == status
     assert report["exit_code"] == code
@@ -219,14 +225,18 @@ def test_distinguishes_no_overlap_other_corruption_and_projection_failure(option
 
 @pytest.mark.parametrize("mode", ["sync", "hold", "warm"])
 def test_control_corruption_is_a_failure(mode):
-    args = PROBE.parse_args(["--mode", mode, "--tokens", "2", "--heads", "1", "--backlog-size", "16"])
+    args = PROBE.parse_args(
+        ["--operator", "legacy", "--mode", mode, "--tokens", "2", "--heads", "1", "--backlog-size", "16"]
+    )
     report = PROBE.run_probe(CpuRuntime(bad_read=True), args)
     assert report["status"] == "control_failed"
     assert report["exit_code"] == 2
 
 
 def test_operator_exception_still_drains_dma_with_destination_alive():
-    args = PROBE.parse_args(["--mode", "cold", "--tokens", "2", "--heads", "1", "--backlog-size", "16"])
+    args = PROBE.parse_args(
+        ["--operator", "legacy", "--mode", "cold", "--tokens", "2", "--heads", "1", "--backlog-size", "16"]
+    )
     rt = CpuRuntime(raise_projection=True)
     with pytest.raises(RuntimeError, match="operator failure"):
         PROBE.run_probe(rt, args)
@@ -253,14 +263,14 @@ def test_invalid_cli_fails_before_runtime_loading(monkeypatch, option, value):
 
     monkeypatch.setattr(PROBE, "load_runtime", unexpected_load)
     with pytest.raises(SystemExit) as error:
-        PROBE.main(["--mode", "cold", f"--{option}", value])
+        PROBE.main(["--operator", "legacy", "--mode", "cold", f"--{option}", value])
     assert error.value.code == 2
 
 
 def test_rejects_blocking_launch(monkeypatch):
     monkeypatch.setenv("ASCEND_LAUNCH_BLOCKING", "1")
     with pytest.raises(SystemExit) as error:
-        PROBE.parse_args(["--mode", "cold"])
+        PROBE.parse_args(["--operator", "legacy", "--mode", "cold"])
     assert error.value.code == 2
 
 

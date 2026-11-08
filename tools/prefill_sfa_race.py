@@ -433,7 +433,7 @@ def load_runtime(args):
     from lmcache_ascend.v1.kv_fence_debug import KVFenceDebug
     from lmcache_ascend.v1.npu_connector.npu_connectors import VLLMPagedMemLayerwiseNPUConnector
 
-    from vllm_ascend.attention.sfa_v1 import BMM_TRANS_MAX_SUPPORTED_TOKENS, AscendSFAImpl
+    from vllm_ascend.attention.sfa_v1 import AscendSFAImpl
 
     # The serving method only needs these dimensions and W_UV; no model or
     # alternate implementation of the projection is constructed here.
@@ -448,10 +448,7 @@ def load_runtime(args):
         return AscendSFAImpl._v_up_proj(projection_state, x)
 
     projection_branch = (
-        "custom_batch_matmul_transpose"
-        if sum(args.queries) <= BMM_TRANS_MAX_SUPPORTED_TOKENS
-        and hasattr(torch.ops._C_ascend, "batch_matmul_transpose")
-        else "native_torch_bmm"
+        "npu_transpose_batchmatmul" if hasattr(torch_npu, "npu_transpose_batchmatmul") else "native_torch_bmm"
     )
 
     rt = SimpleNamespace(

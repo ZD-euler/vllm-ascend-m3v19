@@ -614,15 +614,16 @@ def real_vup_method():
     return ast.Module(body=[method], type_ignores=[])
 
 
-@pytest.mark.parametrize("query_count,expected_branch", [(6, "custom"), (1146, "bmm")])
-def test_real_vup_dispatch_preserves_the_independent_oracle(real_vup_method, query_count, expected_branch):
+@pytest.mark.parametrize("query_count", [6, 1146])
+@pytest.mark.parametrize("native_available", [True, False])
+def test_real_vup_dispatch_preserves_the_independent_oracle(real_vup_method, query_count, native_available):
     # Executes serving's actual Python method. Its NPU custom kernel is replaced
     # by CPU BMM here; this test verifies wiring, shapes and the oracle only.
     branches = []
 
-    def cpu_custom(x, weight, output):
-        branches.append("custom")
-        output.copy_(torch.bmm(x.transpose(0, 1), weight).transpose(0, 1))
+    def cpu_native(x, weight, *, perm_x1, perm_y):
+        branches.append("native")
+        return torch.bmm(x.permute(perm_x1), weight).permute(perm_y)
 
     def cpu_bmm(x, weight):
         branches.append("bmm")
@@ -634,9 +635,9 @@ def test_real_vup_dispatch_preserves_the_independent_oracle(real_vup_method, que
             bfloat16=torch.bfloat16,
             empty=torch.empty,
             bmm=cpu_bmm,
-            ops=NS(_C_ascend=NS(batch_matmul_transpose=cpu_custom)),
         ),
-        "BMM_TRANS_MAX_SUPPORTED_TOKENS": 1024,
+        "torch_npu": NS(npu_transpose_batchmatmul=cpu_native) if native_available else NS(),
+        "TRANSPOSE_BMM_MAX_SUPPORTED_DIM": 65536,
     }
     exec(compile(real_vup_method, "<serving _v_up_proj>", "exec"), namespace)
     attention = torch.linspace(-0.71, 1.21, query_count * PROBE.WIDTH).reshape(query_count, PROBE.WIDTH)
@@ -647,7 +648,7 @@ def test_real_vup_dispatch_preserves_the_independent_oracle(real_vup_method, que
             weight[head, column * 3 % PROBE.WIDTH, column] = 1 if head % 2 == 0 else -1
     module = NS(W_UV=weight, local_num_heads=2, kv_lora_rank=PROBE.WIDTH, v_head_dim=128)
     actual = namespace["_v_up_proj"](module, operand)
-    assert branches == [expected_branch]
+    assert branches == ["native" if native_available else "bmm"]
     assert actual.untyped_storage().data_ptr() != operand.untyped_storage().data_ptr()
     expected = PROBE.expected_projected(torch, attention, 2)
     torch.testing.assert_close(actual.float(), expected.float(), rtol=0, atol=0)
