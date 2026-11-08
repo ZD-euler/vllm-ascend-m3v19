@@ -69,15 +69,25 @@ def values(torch, positions, request, width=WIDTH):
 def selected_positions(torch, history, count, query_sizes):
     """Spread distinct indices across history, plus each query's own new KV.
 
-    The two residues avoid averaging away the layer fingerprint. Every index
-    is causal, including for the first query in each packed request.
+    Prefer two residues, widening them into bands for short histories, to
+    preserve the layer fingerprint. Every index is causal, including for the
+    first query in each packed request.
     """
+    if history < count - 1:
+        raise ValueError("history must contain at least topk - 1 distinct positions")
     pairs = math.ceil((count - 1) / 2)
     blocks = (history - 129) // PERIOD
-    if blocks < pairs - 1:
-        raise ValueError("history too short for distinct patterned top-k positions")
-    j = torch.arange(count - 1)
-    base = (j // 2) * blocks // max(1, pairs - 1) * PERIOD + (j % 2) * 128
+    if blocks >= pairs - 1:
+        j = torch.arange(count - 1)
+        base = (j // 2) * blocks // max(1, pairs - 1) * PERIOD + (j % 2) * 128
+    else:
+        # Fill each residue across history before widening the two bands.
+        # A uniform sample of all residues would average away layer shifts.
+        half = PERIOD // 2
+        low = torch.arange(half)
+        residues = torch.cat((torch.stack((low, low + half), dim=1).flatten(), torch.tensor([PERIOD - 1])))
+        candidates = (residues[:, None] + torch.arange(0, history, PERIOD)[None, :]).flatten()
+        base = candidates[candidates < history][: count - 1].sort().values
     return torch.cat(
         [torch.cat((base.expand(q, -1), (history + torch.arange(q))[:, None]), dim=1) for q in query_sizes]
     ).to(torch.int32)
@@ -370,7 +380,7 @@ class Fixture:
         )
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--history", type=int, default=499712)
@@ -396,13 +406,19 @@ def main():
         default=["event", "p_sfa", "p_use", "after_bank_wait", "p_vup", "hold_sfa"],
     )
     parser.add_argument("--output", default="prefill-sfa-race.json")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if min(args.history, args.layers, args.banks, args.heads, args.repeat, *args.queries) <= 0:
         parser.error("sizes/repetitions must be positive")
     if args.layers <= args.banks or args.topk < 3:
         parser.error("layers must exceed banks; topk must be at least 3")
+    if args.history < args.topk - 1:
+        parser.error("history must contain at least topk - 1 distinct positions")
     if os.getenv("ASCEND_LAUNCH_BLOCKING", "0") != "0":
         parser.error("ASCEND_LAUNCH_BLOCKING must be 0 for an asynchronous test")
+    return args
+
+
+def load_runtime(args):
     import torch
     import torch_npu
 
@@ -462,6 +478,12 @@ def main():
             "no indexer, FFN, TP communication, graph capture/replay or PD transport"
         ),
     )
+    return rt
+
+
+def main():
+    args = parse_args()
+    rt = load_runtime(args)
     fixture = Fixture(rt, args)
     results = []
     output = Path(args.output)

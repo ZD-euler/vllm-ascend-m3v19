@@ -8,6 +8,7 @@ import ast
 import contextlib
 import ctypes
 import importlib.util
+import json
 import weakref
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -38,18 +39,65 @@ def test_memory_sources_do_not_scale_as_full_copies_of_each_layer():
     assert 1 < memory["hold_sfa_extra_device_gib"] < 2
 
 
-def test_topk_is_causal_distinct_and_spans_real_history():
-    queries = [378, 385, 383]
-    topk = PROBE.selected_positions(torch, 499712, 2048, queries)
+@pytest.mark.parametrize(
+    "history,queries",
+    [(499712, [378, 385, 383]), (8192, [128, 127, 129]), (8192, [512, 511, 513])],
+)
+def test_topk_is_causal_distinct_and_spans_real_history(history, queries):
+    topk = PROBE.selected_positions(torch, history, 2048, queries)
     cursor = 0
     for q in queries:
         part = topk[cursor : cursor + q]
         assert part.shape == (q, 2048)
-        assert torch.equal(part[:, -1], 499712 + torch.arange(q))
-        assert part[:, :-1].max() < 499712
+        assert torch.equal(part[:, -1], history + torch.arange(q))
+        assert part[:, :-1].min() >= 0
+        assert part[:, :-1].max() < history
         assert part[0, :-1].unique().numel() == 2047
-        assert part[0, :-1].max() > 490000
+        assert part[0, :-1].max() > history * 0.98
         cursor += q
+
+
+@pytest.mark.parametrize("queries", [[128, 127, 129], [512, 511, 513]])
+def test_short_history_fixture_and_bank_reuse_fingerprint(production_classes, queries):
+    args = NS(queries=queries, history=8192, topk=2048, heads=64, banks=4, layers=12)
+    fixture = PROBE.Fixture(cpu_runtime(production_classes), args)
+    assert fixture.indices.shape == (sum(queries), 1, args.topk)
+    cursor = 0
+    for request, q in enumerate(queries):
+        # Check both ends of every request, including its last causal KV row.
+        selected = fixture.indices_cpu[[cursor, cursor + q - 1]]
+        expected = [
+            PROBE.expected_attention(torch, selected, layer, request, column_count=8) for layer in range(args.layers)
+        ]
+        for layer in range(args.layers):
+            explicit = (
+                PROBE.values(torch, selected.long().flatten() + layer * PROBE.LAYER_SHIFT, request, width=8)
+                .float()
+                .reshape(2, args.topk, 8)
+                .mean(1)
+            )
+            torch.testing.assert_close(expected[layer], explicit)
+            # A stale or prematurely overwritten bank must fail the same
+            # BF16-aware comparator used by the numerical probe.
+            for other in range(layer % args.banks, args.layers, args.banks):
+                if other != layer:
+                    assert PROBE.compare(torch, expected[other].bfloat16(), expected[layer])["different_values"] > 0
+        cursor += q
+
+
+def test_topk_rejects_insufficient_distinct_history():
+    with pytest.raises(ValueError, match="at least topk - 1"):
+        PROBE.selected_positions(torch, 2046, 2048, [1])
+    selected = PROBE.selected_positions(torch, 2047, 2048, [1])
+    assert selected.unique().numel() == 2048
+
+
+def test_cli_rejects_insufficient_history_before_loading_npu(monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["prefill_sfa_race.py", "--history", "2046", "--topk", "2048"])
+    with pytest.raises(SystemExit) as error:
+        PROBE.main()
+    assert error.value.code == 2
+    assert "history must contain at least topk - 1" in capsys.readouterr().err
 
 
 def test_oracle_matches_explicit_attention_and_tolerates_roundoff():
@@ -162,7 +210,7 @@ def production_classes():
     return module, fences.KVFenceDebug
 
 
-def cpu_runtime(production_classes, damage=None):
+def cpu_runtime(production_classes, damage=None, structured=False):
     device = CPUDevice()
     sfa_refs, alive_at_sfa, alive_use_at_sfa = [], [], []
     module, fence = production_classes
@@ -186,30 +234,64 @@ def cpu_runtime(production_classes, damage=None):
         alive_at_sfa.append(sum(ref() is not None for ref in sfa_refs))
         alive_use_at_sfa.append(sum(ref() is not None and ref().stream_index == 0 for ref in device.event_refs))
         table, key, indices = kw["block_table"], kw["key"], kw["sparse_indices"][:, 0]
-        output = torch.empty_like(kw["query"])
+        output = torch.empty_like(kw["query"][:, :1]) if structured else torch.empty_like(kw["query"])
         begin = 0
         for r, end in enumerate(kw["actual_seq_lengths_query"].tolist()):
-            for i in range(begin, end):
-                selected = indices[i].long()
-                kv = key[table[r, selected // PROBE.BLOCK].long(), selected % PROBE.BLOCK, 0].float()
-                result = ((kw["query"][i].float() @ kv.T) * kw["scale_value"]).softmax(-1) @ kv
-                output[i] = result.to(output.dtype)
+            if structured:
+                # Exact zero-query attention from the actual bank payloads.
+                # Read the common history once instead of once per head/token.
+                selected = indices[begin:end].long()
+                assert torch.count_nonzero(kw["query"][begin:end]) == 0
+                assert torch.equal(selected[:, :-1], selected[:1, :-1].expand(end - begin, -1))
+                prefix, tail = selected[0, :-1], selected[:, -1]
+                history = key[table[r, prefix // PROBE.BLOCK].long(), prefix % PROBE.BLOCK, 0].float()
+                current = key[table[r, tail // PROBE.BLOCK].long(), tail % PROBE.BLOCK, 0].float()
+                mean = (history.sum(0)[None, :] + current) / selected.shape[1]
+                output[begin:end] = mean[:, None, :].to(output.dtype)
+            else:
+                for i in range(begin, end):
+                    selected = indices[i].long()
+                    kv = key[table[r, selected // PROBE.BLOCK].long(), selected % PROBE.BLOCK, 0].float()
+                    result = ((kw["query"][i].float() @ kv.T) * kw["scale_value"]).softmax(-1) @ kv
+                    output[i] = result.to(output.dtype)
             begin = end
         if damage == "sfa":
             output.fill_(-5)
+        if structured:
+            output = output.expand_as(kw["query"])
         sfa_refs.append(weakref.ref(output))
         return output
 
     def projection(operand, weight):
         device.actions.append(("projection", len(sfa_refs) - 1))
-        result = torch.bmm(operand.transpose(0, 1), weight).transpose(0, 1).reshape(operand.shape[0], -1)
+        if structured:
+            # Evaluate the actual one-hot weight tensor as a sparse projection.
+            # Do not call the diagnostic's expected_projected oracle.
+            assert torch.all(torch.count_nonzero(weight, dim=1) == 1)
+            columns = weight.abs().argmax(dim=1)
+            coefficients = weight.gather(1, columns[:, None, :]).squeeze(1)
+            result = (
+                operand.gather(2, columns[None, :, :].expand(operand.shape[0], -1, -1)) * coefficients[None, :, :]
+            ).reshape(operand.shape[0], -1)
+        else:
+            result = torch.bmm(operand.transpose(0, 1), weight).transpose(0, 1).reshape(operand.shape[0], -1)
         assert result.untyped_storage().data_ptr() != operand.untyped_storage().data_ptr()
         if damage == "projection":
             result.fill_(7)
         return result
 
+    class StructuredCPUOps:
+        def __getattr__(self, name):
+            return getattr(torch, name)
+
+        def mm(self, a, b):
+            # All query-weight columns are identical in this fixture.
+            assert torch.equal(b, b[:, :1].expand_as(b))
+            column = torch.mm(a.float(), b[:, :1].float()).to(a.dtype)
+            return column.expand(a.shape[0], b.shape[1])
+
     return NS(
-        torch=torch,
+        torch=StructuredCPUOps() if structured else torch,
         npu=device,
         device="cpu",
         ops=NS(layerwise_prefill_dma_copy=dma),
@@ -238,6 +320,150 @@ def test_full_probe_with_real_bank_methods_and_cpu_attention(production_classes,
     assert result["projection_branch"] == "cpu_reference"
     assert result["sfa_shape"] == [6, 2, PROBE.WIDTH]
     assert result["vup_shape"] == [6, 256]
+
+
+def test_structured_cpu_operators_match_dense_cpu_operators(production_classes):
+    dense = cpu_runtime(production_classes)
+    structured = cpu_runtime(production_classes, structured=True)
+    a = torch.arange(24, dtype=torch.float32).reshape(3, 8).bfloat16()
+    b = torch.arange(8, dtype=torch.float32)[:, None].expand(8, 16).bfloat16()
+    torch.testing.assert_close(structured.torch.mm(a, b), dense.torch.mm(a, b), rtol=0, atol=0)
+    key = torch.arange(2 * PROBE.BLOCK * 16, dtype=torch.float32).reshape(2, PROBE.BLOCK, 1, 16).bfloat16()
+    kw = dict(
+        query=torch.zeros(3, 2, 16, dtype=torch.bfloat16),
+        key=key,
+        sparse_indices=torch.tensor([[[0, 3, 129]], [[0, 3, 130]], [[131, 135, 8]]]),
+        block_table=torch.tensor([[1, 0], [0, 1]]),
+        actual_seq_lengths_query=torch.tensor([2, 3]),
+        scale_value=0.125,
+    )
+    torch.testing.assert_close(structured.sfa(**kw), dense.sfa(**kw), rtol=0, atol=0)
+    operand = torch.arange(3 * 2 * 16, dtype=torch.float32).reshape(3, 2, 16).bfloat16()
+    weight = torch.zeros(2, 16, 4, dtype=torch.bfloat16)
+    weight[0, [2, 7, 10, 15], torch.arange(4)] = 1
+    weight[1, [1, 3, 5, 9], torch.arange(4)] = -1
+    torch.testing.assert_close(
+        structured.projection(operand, weight), dense.projection(operand, weight), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("queries", [[128, 127, 129], [512, 511, 513]], ids=["small", "large"])
+def test_exact_server_commands_on_cpu(production_classes, queries, monkeypatch, tmp_path, capsys):
+    report = tmp_path / "results with spaces.json"
+    modes = ["p_use", "p_vup", "before_vup", "p_vup_hold"]
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "prefill_sfa_race.py",
+            "--device",
+            "0",
+            "--history",
+            "8192",
+            "--layers",
+            "12",
+            "--banks",
+            "4",
+            "--heads",
+            "64",
+            "--queries",
+            *map(str, queries),
+            "--repeat",
+            "2",
+            "--modes",
+            *modes,
+            "--output",
+            str(report),
+        ],
+    )
+    monkeypatch.setenv("ASCEND_LAUNCH_BLOCKING", "0")
+    rt = cpu_runtime(production_classes, structured=True)
+    monkeypatch.setattr(PROBE, "load_runtime", lambda args: rt)
+    assert PROBE.main() == 0
+    results = json.loads(report.read_text(encoding="utf-8"))
+    assert [r["mode"] for r in results] == ["serial", *modes, *modes]
+    assert [r["repeat"] for r in results[1:]] == [0] * 4 + [1] * 4
+    checked = 12 * (sum(queries) * 64 * PROBE.V_WIDTH + (sum(queries) + 3 * 8) * PROBE.WIDTH)
+    for result in results:
+        assert result["passed"] and result["failures"] == 0
+        assert result["sfa_shape"] == [sum(queries), 64, PROBE.WIDTH]
+        assert result["vup_shape"] == [sum(queries), 64 * PROBE.V_WIDTH]
+        assert result["checked_values"] == checked
+        assert not result["observe_inputs"]
+    records = [
+        json.loads(line.removeprefix("[SFA_RACE] "))
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("[SFA_RACE] ")
+    ]
+    assert sum(r["event"] == "result" for r in records) == 9
+    assert records[-1]["event"] == "complete"
+    assert records[-1]["status"] == "selected_modes_passed"
+    assert records[-1]["failed_modes"] == []
+    assert all(ref() is None for ref in rt.sfa_refs)
+
+
+@pytest.mark.parametrize("failure", ["control", "selected", "event"])
+def test_command_failure_exit_and_json(production_classes, failure, monkeypatch, tmp_path, capsys):
+    report = tmp_path / "failure.json"
+    mode = "event" if failure == "event" else "p_vup"
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "prefill_sfa_race.py",
+            "--history",
+            "2048",
+            "--layers",
+            "5",
+            "--banks",
+            "2",
+            "--heads",
+            "2",
+            "--topk",
+            "8",
+            "--queries",
+            "2",
+            "3",
+            "1",
+            "--repeat",
+            "1",
+            "--modes",
+            mode,
+            "--output",
+            str(report),
+        ],
+    )
+    monkeypatch.setenv("ASCEND_LAUNCH_BLOCKING", "0")
+    rt = cpu_runtime(production_classes)
+    project = rt.projection
+    calls = 0
+
+    def damage_projection(operand, weight):
+        nonlocal calls
+        calls += 1
+        result = project(operand, weight)
+        if failure == "control" or calls > 5:
+            result.fill_(7)
+        return result
+
+    rt.projection = damage_projection
+    monkeypatch.setattr(PROBE, "load_runtime", lambda args: rt)
+    assert PROBE.main() == (2 if failure == "control" else 1)
+    results = json.loads(report.read_text(encoding="utf-8"))
+    records = [
+        json.loads(line.removeprefix("[SFA_RACE] "))
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("[SFA_RACE] ")
+    ]
+    if failure == "control":
+        assert len(results) == 1 and not results[0]["passed"]
+        assert records[-1]["event"] == "control_failed"
+    else:
+        assert results[0]["passed"] and not results[1]["passed"]
+        assert results[1]["first_failures"][0]["stage"] == "vup_output"
+        assert records[-1]["status"] == ("reproduced" if failure == "event" else "selected_modes_failed")
+        assert records[-1]["failed_modes"] == [mode]
+        assert len(results) == (3 if failure == "event" else 2)
+        if failure == "event":
+            assert results[2]["observe_inputs"] and not results[2]["passed"]
 
 
 def test_unobserved_event_path_has_no_intermediate_host_fence(production_classes):

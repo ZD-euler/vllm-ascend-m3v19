@@ -1,5 +1,25 @@
 # SFA / bank handoff numerical reproduction
 
+## CPU preflight before handing off an NPU command
+
+Run the complete CPU regression suite before asking for a device run:
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=2 python3 -m pytest -q \
+  --confcutdir=tests/standalone tests/standalone/test_prefill_sfa_race.py
+```
+
+The suite invokes the actual command parser and main loop with both focused
+commands below, including 64 heads, 12 layers, four banks and two repeats.
+It checks data construction, the production connector's bank methods, every
+result, saved KV, JSON reports and exit codes. Injected errors also exercise
+serial-control failure, selected-mode failure and the event audit rerun.
+CPU operator substitutes evaluate zero-query attention from the actual bank
+contents and the actual one-hot projection weights; separate tests compare
+them with dense CPU operations. Shared views keep the repeated CPU values
+compact while preserving the full logical tensor shapes. Real NPU kernels,
+runtime initialization and asynchronous device execution are device checks.
+
 ## Focused run after `p_use` passes and `p_vup` fails
 
 Run this bounded operator check in the serving container on an idle NPU.
@@ -8,6 +28,9 @@ the production bank event handoff. The 64 heads match GLM-5.3 with DSA-CP.
 Both V-up branches are exercised: 384 local tokens use the custom transpose
 matmul, and 1536 local tokens use `torch.bmm`. Four banks and 12 layer calls
 exercise repeated bank reuse. Model weights and service startup are absent.
+The short-history generator supports `history=8192` with `topk=2048` by
+widening the two sampled residue bands while retaining distinct causal
+indices and a detectable layer fingerprint across bank reuse.
 
 From the updated `vllm-ascend` checkout, with its usual CANN environment:
 
