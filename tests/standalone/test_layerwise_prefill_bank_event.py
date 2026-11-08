@@ -40,7 +40,7 @@ def marker_runtime():
 
 @pytest.mark.parametrize("p_node", [True, False])
 @pytest.mark.parametrize("skip_topk,has_indexer", [(False, True), (True, True), (True, False)])
-def test_indexer_bank_stays_owned_through_topk_publication_and_latent_attention(p_node, skip_topk, has_indexer):
+def test_indexer_handoff_precedes_topk_publication_and_latent_attention(p_node, skip_topk, has_indexer):
     namespace, operations, events, _ = marker_runtime()
     tree = ast.parse((ROOT / "sfa_v1.py").read_text(encoding="utf-8"))
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "AscendSFAImpl")
@@ -77,14 +77,20 @@ def test_indexer_bank_stays_owned_through_topk_publication_and_latent_attention(
     )
     compile_nodes([indexer], namespace)
     operations.append("latent SFA")
-    assert events == []
-    assert ("reuse topk" in operations) == skip_topk
-    assert ("publish topk" in operations) == (not skip_topk)
+    assert len(events) == int(p_node and has_indexer)
+    if events:
+        name, event = events[0]
+        assert name == "indexer"
+        assert "scatter index KV" in event.predecessors
+        assert "publish topk" not in event.predecessors
+        assert "latent SFA" not in event.predecessors
+        if not skip_topk:
+            assert event.predecessors[-1] == "read index KV"
 
 
 @pytest.mark.parametrize("p_node", [True, False])
 @pytest.mark.parametrize("layer_name", ["layer0", "last_target", "mtp"])
-def test_latent_bank_stays_owned_after_sfa(p_node, layer_name):
+def test_latent_handoff_follows_sfa_before_projection(p_node, layer_name):
     namespace, operations, events, _ = marker_runtime()
     tree = ast.parse((ROOT / "sfa_v1.py").read_text(encoding="utf-8"))
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "AscendSFAImpl")
@@ -112,7 +118,10 @@ def test_latent_bank_stays_owned_after_sfa(p_node, layer_name):
     )
     compile_nodes(forward.body[index : index + 2], namespace)
     operations.extend(["v_up/o_proj", "FFN", "N+1 norm"])
-    assert events == []
+    assert len(events) == int(p_node)
+    if events:
+        assert events[0][0] == layer_name
+        assert events[0][1].predecessors == ("read latent KV",)
 
 
 def test_missing_connector_handoff_api_fails_before_event_recording():

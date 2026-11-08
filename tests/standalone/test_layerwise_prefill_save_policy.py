@@ -52,10 +52,10 @@ def api():
     entry_end = next(i for i, n in enumerate(forward.body) if assigns(n, "pending_transfer_names"))
     pure_decode = next(n for n in forward.body if assigns(n, "_is_pure_decode"))
     save_start = next(i for i, n in enumerate(forward.body) if assigns(n, "save_operations"))
-    projection_start = next(
+    final_flush = next(
         i
         for i, n in enumerate(forward.body)
-        if assigns(n, "attn_output") and ast.unparse(n.value) == "self._v_up_proj(attn_output)"
+        if isinstance(n, ast.If) and isinstance(n.test, ast.Name) and n.test.id == "is_last_transfer_layer"
     )
     tail = next(
         n
@@ -65,11 +65,8 @@ def api():
     profile_return = next(
         n for n in forward.body if isinstance(n, ast.If) and ast.unparse(n.test) == "attn_metadata is None"
     )
-    sfa_start = next(
-        i for i, n in enumerate(forward.body) if isinstance(n, ast.If) and ast.unparse(n.test) == "attn_output is None"
-    )
-    # Execute the actual transfer entry, post-SFA handoff, save policy and
-    # projection tail together. Device math contributes stream-order markers.
+    # Run production transfer entry, policy, final-layer flush, and projection
+    # tail together. Device attention/projection math is outside this contract.
     control = ast.parse(
         "def control(self, attn_metadata, layer_name, kv_cache, index_layer_name, "
         "index_lmcache_enabled, attn_output, output):\n    pass\n"
@@ -78,10 +75,7 @@ def api():
         profile_return,
         *forward.body[entry_start : entry_end + 1],
         pure_decode,
-        *ast.parse("stream_work('SFA', layer_name)").body,
-        *forward.body[sfa_start + 1 : save_start],
-        *forward.body[save_start:projection_start],
-        *ast.parse("stream_work('v_up', layer_name)").body,
+        *forward.body[save_start : final_flush + 1],
         tail,
     ]
     helper_names = {
@@ -95,22 +89,11 @@ def api():
     assert len(helpers) == len(helper_names)
     impl_class = ast.ClassDef(name="Impl", bases=[], keywords=[], body=[*helpers, control], decorator_list=[])
     context = NS(additional_kwargs={})
-    events, operations, bank_events = [], [], []
-
-    class Event:
-        def record(self, stream):
-            assert stream is operations
-            self.predecessors = tuple(stream)
-
-    def handoff(name, event):
-        bank_events.append((name, event))
-        events.append(("use", name))
-        operations.append(("use", name))
+    events = []
 
     def record(kind):
         def callback(name, *args):
             events.append((kind, name))
-            operations.append((kind, name))
             return True
 
         return callback
@@ -119,10 +102,6 @@ def api():
         np=np,
         sfa_full_graph_enabled=lambda config: False,
         Enum=Enum,
-        torch=NS(npu=NS(Event=Event, current_stream=lambda: operations)),
-        get_kv_transfer_group=lambda: NS(record_layerwise_prefill_bank_use=handoff),
-        stream_work=lambda kind, name: operations.append((kind, name)),
-        kv_hash_trace=False,
         get_forward_context=lambda: context,
         maybe_save_kv_layer_to_connector=record("legacy_save"),
         maybe_save_kv_layer_in_layerwise_prefill_transfer_window=record("save"),
@@ -130,9 +109,7 @@ def api():
         maybe_submit_layerwise_prefill_load=record("load"),
         maybe_finish_layerwise_prefill_save=record("finish"),
     )
-    utils = ast.parse((ROOT / "attention/utils.py").read_text(encoding="utf-8"))
-    marker = next(n for n in utils.body if getattr(n, "name", None) == "record_layerwise_prefill_bank_use")
-    execute([state, runner_class, marker, impl_class], namespace)
+    execute([state, runner_class, impl_class], namespace)
     return NS(
         namespace=namespace,
         states=namespace["AscendAttentionState"],
@@ -141,8 +118,6 @@ def api():
         prepare_nodes=prepare.body[prepare_start : prepare_end + 1],
         context=context,
         events=events,
-        operations=operations,
-        bank_events=bank_events,
     )
 
 
@@ -178,29 +153,26 @@ def impl(api, *, p_node=True, window=0, shrink=2):
     obj.dsa_offload_unbundle = True
     obj.enable_dsa_cp_with_o_proj_tp = False
     obj.enable_dsa_cp_with_layer_shard = False
-    obj.o_proj = lambda value: (api.operations.append(("o_proj", obj.control_layer_name)) or value,)
+    obj.o_proj = lambda value: (value,)
     api.namespace["_decode_window_save_window_size"] = lambda: window
     api.namespace["layerwise_prefill_transfer_window_supported"] = lambda: p_node
     return obj
 
 
-def step(api, obj, state, *, layer=0, has_indexer=True, decode_rows=0, index_lmcache_enabled=None):
+def step(api, obj, state, *, layer=0, has_indexer=True, decode_rows=0):
     name = f"model.layers.{layer}.self_attn.attn"
     indexer = f"model.layers.{layer}.self_attn.indexer.k_cache" if has_indexer else None
-    if index_lmcache_enabled is None:
-        index_lmcache_enabled = has_indexer
     caches = [object(), object(), object()]
-    obj.control_layer_name = name
     obj.control(
         NS(attn_state=state, num_decode_tokens=decode_rows),
         name,
         caches,
         indexer,
-        index_lmcache_enabled,
+        has_indexer,
         np.ones(1),
         np.zeros(1),
     )
-    return [name, indexer] if has_indexer and index_lmcache_enabled else [name]
+    return [name, indexer] if has_indexer else [name]
 
 
 @pytest.mark.parametrize(
@@ -229,125 +201,6 @@ def test_p_prefill_keeps_saves_for_real_runner_state(api, computed, scheduled, m
     assert [name for kind, name in api.events if kind == "finish"] == names
 
 
-@pytest.mark.parametrize("num_layers", [1, 3, 78])
-@pytest.mark.parametrize("has_indexer", [False, True])
-@pytest.mark.parametrize("cached_layer_flags", [False, True])
-def test_both_groups_release_at_next_layer_entry_and_final_projection(api, num_layers, has_indexer, cached_layer_flags):
-    obj = impl(api)
-    obj._last_layerwise_prefill_layer_index = num_layers - 1
-    names = [f"model.layers.{i}.self_attn.attn" for i in range(num_layers)]
-    expected = []
-    for layer, name in enumerate(names):
-        if cached_layer_flags:
-            obj.layer_name = name
-            obj._last_layerwise_prefill_layer = layer == num_layers - 1
-        api.operations.append(("entry", name))
-        source_names = step(api, obj, api.states.ChunkedPrefill, layer=layer, has_indexer=has_indexer)
-        if layer < num_layers - 1:
-            # Both current banks stay owned throughout the rest of this layer.
-            assert [n for n, _ in api.bank_events] == expected
-            api.operations.append(("FFN", name))
-            api.operations.append(("norm", names[layer + 1]))
-        expected.extend(source_names)
-
-    assert [name for name, _ in api.bank_events] == expected
-    assert "sfa_layerwise_prefill_pending" not in api.context.additional_kwargs
-    for name, event in api.bank_events:
-        layer = int(name.split(".")[2])
-        attention_name = names[layer]
-        assert ("SFA", attention_name) in event.predecessors
-        assert ("v_up", attention_name) in event.predecessors
-        assert ("o_proj", attention_name) in event.predecessors
-        if layer < num_layers - 1:
-            assert ("FFN", attention_name) in event.predecessors
-            assert ("norm", names[layer + 1]) in event.predecessors
-            assert ("entry", names[layer + 1]) in event.predecessors
-            assert ("SFA", names[layer + 1]) not in event.predecessors
-        assert api.operations.index(("use", name)) < api.operations.index(("save", name))
-        assert api.operations.index(("save", name)) < api.operations.index(("load", name))
-        if has_indexer:
-            # Both waits are submitted before either group's DMA begins.
-            sibling = f"model.layers.{layer}.self_attn.indexer.k_cache"
-            assert api.operations.index(("use", sibling)) < api.operations.index(("save", attention_name))
-
-
-@pytest.mark.parametrize("has_indexer", [False, True])
-def test_separate_prefill_chunks_record_fresh_events_and_leave_no_pending_release(api, has_indexer):
-    obj = impl(api)
-    obj._last_layerwise_prefill_layer_index = 2
-    for chunk in range(2):
-        api.operations.append(("chunk", chunk))
-        for layer in range(3):
-            step(api, obj, api.states.ChunkedPrefill, layer=layer, has_indexer=has_indexer)
-        assert "sfa_layerwise_prefill_pending" not in api.context.additional_kwargs
-    per_chunk = 3 * (2 if has_indexer else 1)
-    assert len(api.bank_events) == 2 * per_chunk
-    for layer in range(per_chunk):
-        name, first = api.bank_events[layer]
-        second_name, second = api.bank_events[layer + per_chunk]
-        assert name == second_name and first is not second
-        assert ("chunk", 1) not in first.predecessors
-        assert ("chunk", 1) in second.predecessors
-
-
-@pytest.mark.parametrize("has_indexer", [False, True])
-def test_legacy_p_without_transfer_window_releases_after_projection(api, has_indexer):
-    obj = impl(api)
-    api.namespace["layerwise_prefill_transfer_window_supported"] = lambda: False
-    names = step(api, obj, api.states.ChunkedPrefill, has_indexer=has_indexer)
-    assert [name for name, _ in api.bank_events] == names
-    for name, event in api.bank_events:
-        assert ("o_proj", names[0]) in event.predecessors
-        assert api.operations.index(("use", name)) < api.operations.index(("legacy_save", name))
-    assert not api.context.additional_kwargs
-
-
-def test_shared_indexer_consumers_release_the_previous_producer_at_immediate_next_layer(api):
-    obj = impl(api)
-    obj._last_layerwise_prefill_layer_index = 13
-    producers = {0, 1, 2, 6, 10}
-    expected = []
-    for layer in range(14):
-        attention = f"model.layers.{layer}.self_attn.attn"
-        api.operations.append(("entry", attention))
-        names = step(api, obj, api.states.ChunkedPrefill, layer=layer, has_indexer=layer in producers)
-        if layer < 13:
-            assert [name for name, _ in api.bank_events] == expected
-        expected.extend(names)
-        api.operations.append(("FFN", attention))
-
-    assert [name for name, _ in api.bank_events] == expected
-    index_events = [(name, event) for name, event in api.bank_events if name.endswith("indexer.k_cache")]
-    assert len(index_events) == len(producers)
-    for name, event in index_events:
-        layer = int(name.split(".")[2])
-        successor = f"model.layers.{layer + 1}.self_attn.attn"
-        assert ("entry", successor) in event.predecessors
-        assert ("SFA", successor) not in event.predecessors
-        assert ("FFN", f"model.layers.{layer}.self_attn.attn") in event.predecessors
-    assert not api.context.additional_kwargs
-
-
-@pytest.mark.parametrize("transfer_window", [False, True])
-def test_disabled_index_transfer_releases_only_latent_group(api, transfer_window):
-    obj = impl(api)
-    api.namespace["layerwise_prefill_transfer_window_supported"] = lambda: transfer_window
-    obj._last_layerwise_prefill_layer_index = 1
-    expected = []
-    for layer in range(2):
-        expected.extend(step(api, obj, api.states.ChunkedPrefill, layer=layer, index_lmcache_enabled=False))
-    assert [name for name, _ in api.bank_events] == expected
-    assert all(name.endswith("self_attn.attn") for name in expected)
-    assert not api.context.additional_kwargs
-
-
-def test_duplicate_transfer_names_fail_before_releasing_any_bank(api):
-    obj = impl(api)
-    with pytest.raises(RuntimeError, match="duplicate KV groups"):
-        obj._submit_sfa_layerwise_transfer_window([("layer0", []), ("layer0", [])])
-    assert api.bank_events == [] and api.events == []
-
-
 @pytest.mark.parametrize("has_indexer", [True, False])
 def test_one_token_p_tail_flushes_all_target_layers_before_mtp(api, has_indexer):
     state = classify(api, computed=4096, scheduled=1)
@@ -361,8 +214,6 @@ def test_one_token_p_tail_flushes_all_target_layers_before_mtp(api, has_indexer)
         assert [name for event, name in api.events if event == kind] == expected
     assert [name for kind, name in api.events if kind == "load"] == [-1, *expected]
     assert not any(kind == "legacy_save" for kind, _ in api.events)
-    assert [name for name, _ in api.bank_events] == expected
-    assert ("o_proj", "model.layers.77.self_attn.attn") in api.bank_events[-1][1].predecessors
 
     # The MTP proposer creates a fresh forward context. Its layer 78 entry
     # must not inherit target pending saves. MTP has no next layer callback;
@@ -375,9 +226,6 @@ def test_one_token_p_tail_flushes_all_target_layers_before_mtp(api, has_indexer)
     mtp_events = api.events[len(events_before_mtp) :]
     for kind in ("save", "finish", "post_save", "load"):
         assert [name for event, name in mtp_events if event == kind] == mtp_names
-    assert [name for name, _ in api.bank_events] == expected + mtp_names
-    for _, mtp_event in api.bank_events[-len(mtp_names) :]:
-        assert ("o_proj", mtp_names[0]) in mtp_event.predecessors
 
 
 @pytest.mark.parametrize("scheduled,drafts,mtp", [(1, 0, False), (1, 0, True), (2, 1, True)])

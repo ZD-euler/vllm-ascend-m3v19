@@ -301,8 +301,8 @@ class Fixture:
                     # the identical event immediately after the bank handoff.
                     used.synchronize()
                 if layer == args.layers - 1:
-                    # Preserve the original serving schedule as a reference:
-                    # final save before V-up, after the SFA-end event.
+                    # The final layer has no following entry callback. Serving
+                    # submits its save before V-up, after the last-use event.
                     save_and_advance(layer)
                 if mode == "before_vup":
                     # Complete the same SFA event after all bank handoff/save

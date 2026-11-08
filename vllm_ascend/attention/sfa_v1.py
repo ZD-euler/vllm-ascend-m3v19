@@ -3455,7 +3455,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         self,
         save_operations: list[tuple[str, list[torch.Tensor]]],
     ) -> list[str]:
-        """Release N's KV banks, then submit their saves and next bank loads."""
+        """Submit save(N) and load(N+2) for the explicit source layer N."""
         layer_names = [layer_name for layer_name, _ in save_operations]
         if len(layer_names) != len(set(layer_names)):
             raise RuntimeError(
@@ -3463,13 +3463,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                 f"groups: {layer_names}"
             )
 
-        # Release the source layer's latent and optional indexer banks at the
-        # same boundary, including when N+1 has no indexer of its own.
-        # At N+1 entry these events cover N's projection/FFN and work queued
-        # before this attention call. Every TP rank records them before DMA.
-        # Final target/MTP layers call here after their own output projection.
-        for layer_name in layer_names:
-            record_layerwise_prefill_bank_use(layer_name)
+        # Normally called on entry to N+1, before its first KV wait/SFA.
+        # The last target layer has no successor and is submitted after its
+        # own SFA instead.
         self._submit_sfa_transfer_window_save_operations(save_operations)
         for layer_name in layer_names:
             if not maybe_submit_layerwise_prefill_load(layer_name):
@@ -5223,9 +5219,10 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         kv_hash_trace = self._layerwise_prefill_p_node and layerwise_kv_trace_enabled()
 
-        # Keep N's KV banks owned until entry to N+1. Record their release
-        # events and submit their saves/next bank loads here, before N+1's first
-        # connector wait. The saved source name selects N, not this layer.
+        # A layer's KV remains in its bank after its SFA. Submit the prior
+        # layer's save and N+2 load here, before this layer's first connector
+        # wait. The name in save_operations identifies the source layer; no
+        # separate model-layer cursor is needed to choose the transfer.
         transfer_context = (
             get_forward_context().additional_kwargs
             if self._layerwise_prefill_p_node
@@ -5702,8 +5699,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                     actual_seq_lengths_key=actual_seq_lengths_key,
                 )
                 if self._layerwise_prefill_p_node and index_lmcache_enabled:
-                    # Trace here while the indexer bank remains owned. Its
-                    # release event is deferred to the next transfer window.
+                    # The indexer has finished reading its own bank. Record
+                    # before top-k publication and latent SFA are submitted.
                     if kv_hash_trace:
                         trace_layerwise_kv(
                             index_layer_name,
@@ -5718,6 +5715,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                             metadata=attn_metadata,
                             produced=(k_li, k_li_scale) if self.use_sparse_c8_indexer else (k_li,),
                         )
+                    record_layerwise_prefill_bank_use(index_layer_name)
                 if self.index_cache_enabled:
                     # Publish this batch's top-k so downstream skip layers
                     # read it from the stable shared buffer.
@@ -5739,6 +5737,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         metadata=attn_metadata,
                         produced=(k_li, k_li_scale) if self.use_sparse_c8_indexer else (k_li,),
                     )
+                record_layerwise_prefill_bank_use(index_layer_name)
             if content_diagnostics_enabled:
                 queue_selected_topk_fingerprint(
                     req_ids=attn_metadata.req_ids,
@@ -6515,8 +6514,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             _dsa_prof.step()
 
         if self._layerwise_prefill_p_node:
-            # Trace the SFA result here while the latent bank is still owned.
-            # Its release event is recorded by the next transfer window.
+            # All SFA reads of the latent bank are now submitted. The DMA
+            # stream waits on this exact point, excluding v_up/o_proj, FFN,
+            # and the next layer's normalization. Passive TP ranks mark it too.
             if kv_hash_trace:
                 trace_layerwise_kv(
                     layer_name,
@@ -6529,6 +6529,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                               if self.enable_mlapo and num_input_tokens <= MLAPO_MAX_SUPPORTED_TOKENS
                               else (k_nope, k_pe)),
                 )
+            record_layerwise_prefill_bank_use(layer_name)
 
         # Offload to LMCache. Legacy un-bundled connectors save only the
         # latent (k_nope, k_pe). Connectors declaring DSA index LMCache support
@@ -6570,9 +6571,23 @@ class AscendSFAImpl(MLAAttentionImpl):
                 "the SFA context-parallel o_proj path"
             )
 
+        # The final target layer and each one-layer MTP forward have no N+1
+        # callback in their context. Submit their saves here, instead of leaving
+        # the MTP save in a discarded context and relying on storer drain later.
+        final_transfer_names: list[str] = []
+        if is_last_transfer_layer:
+            if pending_transfers is not None:
+                self._finish_sfa_layerwise_transfer_window(
+                    pending_transfers, pending_transfer_names
+                )
+                pending_transfers = None
+            final_transfer_names = self._submit_sfa_layerwise_transfer_window(
+                save_operations
+            )
+
         attn_output = self._v_up_proj(attn_output)
-        # This diagnostic waits after v_up. The KV banks remain owned
-        # until the next layer's entry (or this final layer's projection tail).
+        # Keep the bank-use event at the end of SFA. This optional diagnostic
+        # waits later, after v_up, before weight prefetch and o_proj submission.
         if self._prefill_vup_output_fence:
             synchronize_prefill_vup_output(layer_name)
         weight_prefetch_method = get_weight_prefetch_method()
@@ -6615,11 +6630,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                     pending_transfers, pending_transfer_names
                 )
             if is_last_transfer_layer:
-                # Final target and one-layer MTP contexts have no N+1 callback.
-                # Release and save after o_proj, before this context is dropped.
-                final_transfer_names = self._submit_sfa_layerwise_transfer_window(
-                    save_operations
-                )
                 self._finish_sfa_layerwise_transfer_window(
                     save_operations, final_transfer_names
                 )
@@ -6630,11 +6640,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         else:
             # Keep legacy/non-P connector ordering unchanged.
             output[...] = self.o_proj(attn_output)[0]
-            if self._layerwise_prefill_p_node:
-                # Legacy P connectors save immediately and have no deferred
-                # transfer window. Protect the whole attention computation.
-                for source_name, _ in save_operations:
-                    record_layerwise_prefill_bank_use(source_name)
             if pending_transfers is not None:
                 self._finish_sfa_layerwise_transfer_window(
                     pending_transfers, pending_transfer_names

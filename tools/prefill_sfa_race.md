@@ -1,21 +1,5 @@
 # SFA / bank handoff numerical reproduction
 
-## Current serving handoff
-
-P groups 0 and 1 keep layer N's banks until the entry to layer N+1's
-attention, before N+1's bank wait and QKV preparation. At that entry, each
-source group records N's event and queues its bank DMA wait, save and next
-load. The events cover N's V-up, output projection, FFN and work preceding
-N+1's attention. A layer with no indexer still releases its predecessor's
-indexer bank; it creates no group-1 event for itself.
-Final target and one-layer MTP forwards record and flush after their own
-output projection.
-
-The standalone probe modes below retain the earlier SFA-end event schedule
-as a reference. The serving boundary is exercised on CPU by
-`test_layerwise_prefill_save_policy.py` and `test_layerwise_prefill_bank_event.py`,
-including multiple layers/chunks, single-layer targets and MTP finalization.
-
 ## CPU preflight before handing off an NPU command
 
 Run the complete CPU regression suite before asking for a device run:

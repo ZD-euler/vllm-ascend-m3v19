@@ -565,7 +565,7 @@ def test_used_events_have_only_the_production_bank_owners(production_classes):
     "mode",
     ["event", "p_sfa", "p_use", "p_vup", "after_bank_wait", "before_vup", "p_vup_hold", "hold_sfa"],
 )
-def test_fence_and_final_save_order_matches_reference_schedule(production_classes, mode):
+def test_fence_and_final_save_order_matches_serving(production_classes, mode):
     rt = cpu_runtime(production_classes)
     args = NS(queries=[2, 3, 1], history=2048, topk=8, heads=2, banks=2, layers=5)
     fixture = PROBE.Fixture(rt, args)
