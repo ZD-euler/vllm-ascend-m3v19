@@ -143,6 +143,9 @@ if TYPE_CHECKING:
 
 # Older ACLNN TransposeBatchMatMul binaries require operand dimensions < 65536.
 TRANSPOSE_BMM_MAX_SUPPORTED_DIM = 65536
+# Compatibility export for model_runner's shared-retrieval graph scheduling.
+# Preserve its overlap policy independently of native V-up's supported shapes.
+BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
 # Fence the first sparse load once in each worker process by default.
 _LMCACHE_SPARSE_WAIT_SYNC_ONCE = os.getenv("VLLM_ASCEND_LMCACHE_SPARSE_WAIT_SYNC_ONCE", "1").lower() in (
     "1",

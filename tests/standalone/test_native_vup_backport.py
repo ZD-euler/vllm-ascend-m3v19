@@ -4,7 +4,9 @@
 import ast
 import json
 import sys
+from types import ModuleType
 from types import SimpleNamespace as NS
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -198,3 +200,63 @@ def test_runtime_imports_and_reports_selected_operator(monkeypatch, operator, na
         else ("npu_transpose_batchmatmul" if native_available else "native_torch_bmm")
     )
     assert runtime.projection_branch == expected
+
+
+@pytest.mark.parametrize("tokens", [384, 1536])
+@pytest.mark.parametrize("overlap_enabled", [False, True])
+def test_actual_runner_startup_imports_sfa_constants_before_capture(monkeypatch, tokens, overlap_enabled):
+    # Export the actual module's literal constants, without importing its NPU
+    # dependencies. Do not inject a fake value for a deleted public constant.
+    sfa_tree = ast.parse((ROOT / "vllm_ascend/attention/sfa_v1.py").read_text(encoding="utf-8"))
+    constants = [
+        node for node in sfa_tree.body if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
+    ]
+    sfa_module = ModuleType("vllm_ascend.attention.sfa_v1")
+    exec(compile(ast.Module(body=constants, type_ignores=[]), "<actual-sfa-constants>", "exec"), sfa_module.__dict__)
+    monkeypatch.setitem(sys.modules, sfa_module.__name__, sfa_module)
+
+    source = ROOT / "vllm_ascend/worker/model_runner_v1.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    method = next(
+        node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "_model_forward"
+    )
+    module = ast.parse("from __future__ import annotations")
+    module.body.append(method)
+    key = NS(request_capacity=2, token_capacity=tokens)
+    context = NS(staged_sfa_graph_key=key, staged_sfa_graph_dummy_run=True, cudagraph_runtime_mode="FULL")
+    namespace = {
+        "get_forward_context": lambda: context,
+        "envs_ascend": NS(VLLM_ASCEND_SFA_FULL_GRAPH=True),
+        "CUDAGraphMode": NS(NONE="NONE"),
+    }
+    exec(compile(module, str(source), "exec"), namespace)
+
+    overlap = NS(prepare=Mock()) if overlap_enabled else None
+    graph = NS(
+        sealed=False,
+        retrieval_overlap=overlap,
+        register_transfers=Mock(),
+        bind_sources=Mock(),
+        prepare_run=Mock(return_value="prepared"),
+        run=Mock(return_value="captured"),
+    )
+    impl = NS(prepare_full_graph_layer=Mock(return_value=("metadata",)), _full_graph_transfer=object())
+
+    def coordinate(error, dummy_run):
+        assert dummy_run is True
+        if error is not None:
+            raise RuntimeError("startup preparation failed") from error
+
+    runner = NS(
+        model=object(),
+        _sfa_full_graph=graph,
+        _staged_sfa_impls=(("layer0", impl),),
+        model_config=NS(max_model_len=8192),
+        _coordinate_sfa_full_graph_preparation=Mock(side_effect=coordinate),
+        _run_sfa_full_graph_target=object(),
+    )
+    assert namespace["_model_forward"](runner, tokens) == "captured"
+    runner._coordinate_sfa_full_graph_preparation.assert_called_once_with(None, True)
+    if overlap_enabled:
+        overlap.prepare.assert_called_once_with(key, runner._staged_sfa_impls, (), 1024)
+    graph.run.assert_called_once_with(runner._run_sfa_full_graph_target, prepared="prepared")
