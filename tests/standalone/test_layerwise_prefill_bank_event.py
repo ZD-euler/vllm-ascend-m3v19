@@ -90,7 +90,7 @@ def test_indexer_handoff_precedes_topk_publication_and_latent_attention(p_node, 
 
 @pytest.mark.parametrize("p_node", [True, False])
 @pytest.mark.parametrize("layer_name", ["layer0", "last_target", "mtp"])
-def test_latent_handoff_follows_sfa_before_projection(p_node, layer_name):
+def test_latent_bank_stays_owned_after_sfa(p_node, layer_name):
     namespace, operations, events, _ = marker_runtime()
     tree = ast.parse((ROOT / "sfa_v1.py").read_text(encoding="utf-8"))
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "AscendSFAImpl")
@@ -118,10 +118,7 @@ def test_latent_handoff_follows_sfa_before_projection(p_node, layer_name):
     )
     compile_nodes(forward.body[index : index + 2], namespace)
     operations.extend(["v_up/o_proj", "FFN", "N+1 norm"])
-    assert len(events) == int(p_node)
-    if events:
-        assert events[0][0] == layer_name
-        assert events[0][1].predecessors == ("read latent KV",)
+    assert events == []
 
 
 def test_missing_connector_handoff_api_fails_before_event_recording():
