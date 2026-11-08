@@ -4,6 +4,7 @@
 import ast
 import json
 import sys
+from functools import lru_cache
 from types import ModuleType
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
@@ -40,8 +41,9 @@ def serving_projection(native_available=True, native_error=False):
     # Deliberately expose only the allowed math operations. Accessing the
     # retired custom op or a synchronization call fails the test immediately.
     namespace = {
-        "torch": NS(float16=torch.float16, bfloat16=torch.bfloat16, bmm=bmm),
+        "torch": NS(float16=torch.float16, bfloat16=torch.bfloat16, bmm=bmm, compiler=torch.compiler),
         "torch_npu": NS(npu_transpose_batchmatmul=native) if native_available else NS(),
+        "logger": NS(info_once=Mock()),
     }
     exec(compile(ast.Module(body=[limit, method], type_ignores=[]), "<serving-vup>", "exec"), namespace)
     return namespace["_v_up_proj"], calls
@@ -260,3 +262,51 @@ def test_actual_runner_startup_imports_sfa_constants_before_capture(monkeypatch,
     if overlap_enabled:
         overlap.prepare.assert_called_once_with(key, runner._staged_sfa_impls, (), 1024)
     graph.run.assert_called_once_with(runner._run_sfa_full_graph_target, prepared="prepared")
+
+
+@pytest.mark.parametrize(
+    "available,heads,rank,dtype,expected",
+    [
+        (True, 2, 4, torch.bfloat16, "branch=npu_transpose_batchmatmul input_transpose=internal"),
+        (True, 128, 512, torch.bfloat16, "branch=npu_transpose_batchmatmul input_transpose=explicit"),
+        (False, 2, 4, torch.bfloat16, "branch=torch.bmm reason=missing_native_api"),
+        (True, 2, 4, torch.float32, "branch=torch.bmm reason=unsupported_dtype"),
+    ],
+)
+def test_logs_the_executed_branch_once_across_layers_and_token_counts(available, heads, rank, dtype, expected):
+    projection, _ = serving_projection(native_available=available)
+    messages = []
+
+    # Match vLLM's process-local info_once cache, including its message/args key.
+    @lru_cache
+    def info_once(message, *args, scope):
+        assert scope == "process"
+        messages.append(message % args if args else message)
+
+    projection.__globals__["logger"] = NS(info_once=info_once)
+    for _layer in range(2):
+        weight = torch.eye(rank, 4, dtype=dtype).expand(heads, -1, -1).contiguous()
+        state = NS(local_num_heads=heads, kv_lora_rank=rank, v_head_dim=4, W_UV=weight)
+        for tokens in (1, 3):
+            x = torch.ones((tokens, heads, rank), dtype=dtype)
+            actual = projection(state, x)
+            torch.testing.assert_close(actual, torch.ones((tokens, heads * 4), dtype=dtype))
+    assert messages == ["[SFA_VUP] " + expected]
+
+
+@pytest.mark.parametrize("available,heads,rank", [(True, 2, 4), (True, 128, 512), (False, 2, 4)])
+def test_branch_logging_keeps_torch_compile_fullgraph(available, heads, rank):
+    projection, _ = serving_projection(native_available=available)
+    projection.__globals__["torch"] = torch
+
+    def unexpected_log(*args, **kwargs):
+        raise AssertionError("logging entered the compiled graph")
+
+    projection.__globals__["logger"] = NS(info_once=unexpected_log)
+    weight = torch.eye(rank, 4, dtype=torch.bfloat16).expand(heads, -1, -1).contiguous()
+    state = NS(local_num_heads=heads, kv_lora_rank=rank, v_head_dim=4, W_UV=weight)
+    compiled = torch.compile(lambda x: projection(state, x), backend="eager", fullgraph=True)
+    for value in (1, 2):
+        x = torch.full((3, heads, rank), value, dtype=torch.bfloat16)
+        actual = compiled(x)
+        torch.testing.assert_close(actual, torch.full((3, heads * 4), value, dtype=torch.bfloat16))

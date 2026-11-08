@@ -19,6 +19,19 @@ SFA serving 已绕开旧自定义算子及其首次初始化同步。旧 C++ 实
 历史问题对照，本次改动仅涉及 Python，拉取后重启服务即可生效。
 本地 MLA 已经使用 torch_npu 的同名接口。
 
+服务在首次 eager/图预热执行相应分支时会输出 `[SFA_VUP]`。每个 worker 的
+每种分支只记录一次，token 数和层号变化不会重复打印：
+
+```text
+[SFA_VUP] branch=npu_transpose_batchmatmul input_transpose=internal
+```
+
+`input_transpose=explicit` 同样使用新接口，对应旧 CANN 的大维度兼容分支。
+回退时输出 `branch=torch.bmm`，并标明 `reason=missing_native_api` 或
+`reason=unsupported_dtype`。在启动和请求日志中搜索 `SFA_VUP` 即可。
+标记表示进入该调用分支；数值结果由下面的短测检查。日志跳过 torch.compile
+追踪阶段，通过 eager/图预热调用记录，避免给完整编译图引入日志操作。
+
 ## 运行
 
 在仓库内使用服务的 Python 环境。`0` 是空闲卡编号：

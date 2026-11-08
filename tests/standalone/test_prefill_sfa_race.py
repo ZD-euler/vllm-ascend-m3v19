@@ -635,9 +635,11 @@ def test_real_vup_dispatch_preserves_the_independent_oracle(real_vup_method, que
             bfloat16=torch.bfloat16,
             empty=torch.empty,
             bmm=cpu_bmm,
+            compiler=torch.compiler,
         ),
         "torch_npu": NS(npu_transpose_batchmatmul=cpu_native) if native_available else NS(),
         "TRANSPOSE_BMM_MAX_SUPPORTED_DIM": 65536,
+        "logger": NS(info_once=lambda *args, **kwargs: None),
     }
     exec(compile(real_vup_method, "<serving _v_up_proj>", "exec"), namespace)
     attention = torch.linspace(-0.71, 1.21, query_count * PROBE.WIDTH).reshape(query_count, PROBE.WIDTH)

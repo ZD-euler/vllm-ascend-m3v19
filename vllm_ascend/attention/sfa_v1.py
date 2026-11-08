@@ -2705,12 +2705,25 @@ class AscendSFAImpl(MLAAttentionImpl):
             # Explicitly transpose otherwise, keeping W_UV in (heads, rank, V).
             if self.local_num_heads * self.kv_lora_rank < TRANSPOSE_BMM_MAX_SUPPORTED_DIM:
                 x = x.view(-1, self.local_num_heads, self.kv_lora_rank)
+                if not torch.compiler.is_compiling():
+                    logger.info_once(
+                        "[SFA_VUP] branch=npu_transpose_batchmatmul input_transpose=internal",
+                        scope="process",
+                    )
                 x = torch_npu.npu_transpose_batchmatmul(x, self.W_UV, perm_x1=(1, 0, 2), perm_y=(1, 0, 2))
             else:
                 x = x.view(-1, self.local_num_heads, self.kv_lora_rank).transpose(0, 1).contiguous()
+                if not torch.compiler.is_compiling():
+                    logger.info_once(
+                        "[SFA_VUP] branch=npu_transpose_batchmatmul input_transpose=explicit",
+                        scope="process",
+                    )
                 x = torch_npu.npu_transpose_batchmatmul(x, self.W_UV, perm_x1=(0, 1, 2), perm_y=(1, 0, 2))
             x = x.reshape(-1, self.local_num_heads * self.v_head_dim)
         else:
+            if not torch.compiler.is_compiling():
+                reason = "unsupported_dtype" if x.dtype not in (torch.float16, torch.bfloat16) else "missing_native_api"
+                logger.info_once("[SFA_VUP] branch=torch.bmm reason=%s", reason, scope="process")
             # (B, N, L) -> (N, B, L)
             x = x.view(-1, self.local_num_heads, self.kv_lora_rank).transpose(0, 1)
             # (N, B, L) x (N, L, V) -> (N, B, V)
