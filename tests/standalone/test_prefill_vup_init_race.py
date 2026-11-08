@@ -26,17 +26,26 @@ class CpuRuntime:
     """
 
     def __init__(
-        self, *, overwrite=True, early_read=False, bad_read=False, bad_projection=False, raise_projection=False
+        self,
+        *,
+        overwrite=True,
+        early_read=False,
+        bad_read=False,
+        bad_projection=False,
+        raise_projection=False,
+        fence_first_allocation=False,
     ):
         self.torch, self.device, self.npu = torch, "cpu", self
         self.overwrite, self.early_read = overwrite, early_read
         self.bad_read, self.bad_projection = bad_read, bad_projection
         self.raise_projection = raise_projection
+        self.fence_first_allocation = fence_first_allocation
         self.copies = []
         self.initialized = False
         self.syncs = 0
         self.source_alive_at_project = []
         self.event_syncs = 0
+        self.initialization_fences = 0
 
     def copy_out(self, destination, source):
         assert source.dtype == destination.dtype == torch.uint8
@@ -82,6 +91,9 @@ class CpuRuntime:
         assert out.shape == (tokens, heads, PROBE.V_WIDTH)
         alive = self.source_ref() is not None
         self.source_alive_at_project.append(alive)
+        if not self.initialized and self.fence_first_allocation:
+            self.synchronize()
+            self.initialization_fences += 1
         if not self.initialized and not alive and self.overwrite:
             payload = struct.pack("<18I", heads, tokens, width, PROBE.V_WIDTH, *([0] * 14))
             offset = (tokens - 1) * PROBE.TILING_BYTES
@@ -110,6 +122,39 @@ def test_layout_matches_current_cpp_allocation_and_slot():
     assert int(re.search(r"MAX_CAPTURE_NUM = (\d+)", allocation).group(1)) == PROBE.TILING_SLOTS
     assert "int32_t batchIdx = opShape.m - 1;" in allocation
     assert "{tilingSize * MAX_CAPTURE_NUM}" in allocation
+
+
+def test_cpp_first_allocation_fence_is_checked_and_outside_the_hot_path():
+    source = (ROOT / "csrc/batch_matmul_transpose/op_host/batch_matmul_transpose.h").read_text()
+    # Guard the actual C++ lifetime boundary: task-queue flush and device fence
+    # must be inside the one-time initializer and precede the direct H2D write.
+    initializer, rest = source.split("static auto global_tiling_data = [&] {", 1)[1].split("}();", 1)
+    assert initializer.index("at::empty(") < initializer.index("getCurrentNPUStream().stream()")
+    assert initializer.index("getCurrentNPUStream().stream()") < initializer.index("aclrtSynchronizeStream(stream)")
+    assert initializer.index("aclrtSynchronizeStream(stream)") < initializer.index(
+        "TORCH_CHECK(status == ACL_ERROR_NONE"
+    )
+    assert initializer.index("TORCH_CHECK(status == ACL_ERROR_NONE") < initializer.index("return data;")
+    assert "aclrtMemcpy(" in rest
+    assert "aclrtSynchronizeStream(" not in rest
+
+
+@pytest.mark.parametrize("mode", PROBE.MODES)
+def test_first_allocation_fence_preserves_queued_reads_and_only_waits_once(mode):
+    rt = CpuRuntime(fence_first_allocation=True)
+    args = PROBE.parse_args(["--mode", mode, "--tokens", "384", "--heads", "64", "--backlog-size", "16"])
+    report = PROBE.run_probe(rt, args)
+    assert report["exit_code"] == 0
+    assert report["changed_bytes"] == 0
+    assert report["output_zero"] is True
+    assert report["reader_pending_before_vup"] is True
+    assert report["reader_pending_after_vup"] == (mode == "warm")
+    assert rt.initialization_fences == 1
+    # Another call in the same process uses the existing static allocation.
+    again = PROBE.run_probe(rt, args)
+    assert again["exit_code"] == 0
+    assert again["changed_bytes"] == 0
+    assert rt.initialization_fences == 1
 
 
 @pytest.mark.parametrize("mode", PROBE.MODES)

@@ -1,5 +1,6 @@
 #include <iostream>
 #include <string>
+#include <torch_npu/csrc/core/npu/NPUStream.h>
 #include "acl/acl.h"
 #include "kernel_tiling/kernel_tiling.h"
 #include "tiling/platform/platform_ascendc.h"
@@ -103,8 +104,20 @@ std::tuple<at::Tensor, uint32_t> batch_matmul_transpose_tiling(const at::Tensor 
     // tiling
     int32_t batchIdx = opShape.m - 1;
     uint32_t tilingSize = sizeof(pp_matmul::PpMatmulTilingData);
-    static auto global_tiling_data = at::empty(
-        {tilingSize * MAX_CAPTURE_NUM}, at::TensorOptions().dtype(at::kByte).device(tensor_a.options().device()));
+    static auto global_tiling_data = [&] {
+        auto data = at::empty(
+            {tilingSize * MAX_CAPTURE_NUM}, at::TensorOptions().dtype(at::kByte).device(tensor_a.options().device()));
+        // The caching allocator may reuse a freed tensor whose same-stream
+        // readers are still running. Unlike a queued kernel, aclrtMemcpy below
+        // writes immediately. Drain the host task queue and finish those readers
+        // before the first write. Keep this fence inside the static initializer:
+        // subsequent layers/calls retain the existing asynchronous execution.
+        const auto stream = c10_npu::getCurrentNPUStream().stream();
+        const auto status = aclrtSynchronizeStream(stream);
+        TORCH_CHECK(status == ACL_ERROR_NONE,
+                    "batch_matmul_transpose tiling initialization stream fence failed: ", status);
+        return data;
+    }();
     if (batchIdx >= 0 && batchIdx < MAX_CAPTURE_NUM) {
         aclrtMemcpy(global_tiling_data.data_ptr<uint8_t>() + (tilingSize * batchIdx), tilingSize, &matmulTilingData,
                     tilingSize, ACL_MEMCPY_HOST_TO_DEVICE);

@@ -1,17 +1,32 @@
 # V-up 首次分配与异步临时内存短测
 
 这个测试直接检查 `batch_matmul_transpose` 首次调用时，tiling 的 H2D 写入是否覆盖
-前序异步读取的临时内存。只使用一张空闲 NPU，无需模型、P/D 服务或重新编译。
-运行当前已安装的 vllm-ascend、LMCache-Ascend 扩展。
+前序异步读取的临时内存。只使用一张空闲 NPU，无需模型或 P/D 服务。
+检测时运行当前已安装的 vllm-ascend、LMCache-Ascend 扩展；验证 C++ 修复时先重新编译。
 
 ## 已有对照
 
 - 原事件位置：`p_sfa` 正常；`p_use, group=0` 正常；`p_vup, group=0` 有乱码。
 - 两个 group 的事件后移到下一层、关闭全部 fence：仍有乱码。
 - SFA/V-up 独立测试的小、大 token 分支均通过；该测试先运行串行校验，已预热 V-up。
+- 2026-11-08 NPU 短测：`cold` 在前序读取仍 pending 时读到 72 字节的 tiling
+  覆盖，偏移 27576，四个 shape 字段为 `[64, 384, 512, 128]`；`sync`、`hold`、
+  `warm` 均为零改写。
 
-下一步检查 V-up 首次调用的内存写入。事件后移控制 bank 复用，这里的对象是
-缓存分配器管理的临时内存。当前服务结果支持优先检查这段异步访问时序。
+短测已经复现 V-up 首次调用的内存覆盖。事件后移控制 bank 复用，这里的对象是
+缓存分配器管理的临时内存。先验证这处修复，再沿用原服务负载检查输出。
+
+## 首次分配修复后的验证
+
+修复在 C++ 静态 tiling 缓冲区的初始化中，取得分配后先 drain 当前流的 host
+task queue，再等待该流完成，最后执行直接 H2D 写入。等待仅发生在进程首次
+创建该缓冲区时。当前 serving 的相同 token slot 后续继续写相同的 tiling 参数。
+
+**拉取修复后先重新编译 vllm-ascend 扩展**，再启动新的短测进程。复用上述命令，
+预期四个模式均 `exit=0`、`changed_bytes=0`、`output_zero=true`；`cold` 显示
+`overwrite_not_observed`。`cold` 的 `reader_pending_after_vup=false` 对应初始化
+等待；`warm` 在足够的任务积压下仍为 `true`，用于检查后续调用保持异步。
+先完成短测，再用原高并发服务负载验证输出。
 
 ## 检查的具体操作
 
