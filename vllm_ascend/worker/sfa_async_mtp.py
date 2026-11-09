@@ -222,7 +222,6 @@ class AsyncSFAModelRunner(NPUModelRunner):
             or self.num_prompt_logprobs
             or self.dynamic_eplb
             or None
-            or False
             or not batch.sampling_metadata.no_penalties
             or batch.sampling_metadata.bad_words_token_ids
             or s.metadata[s.target_name].decode_remap_boundary_buffer._values != s.boundary_values

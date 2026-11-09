@@ -630,7 +630,7 @@ def wait_for_kv_layer_from_connector(
         wait_kwargs["selected_token_counts"] = selected_token_counts
     if payload_event is not None:
         wait_kwargs["payload_event"] = payload_event
-    if selected_tokens is not None and request_ids is not None and True:
+    if selected_tokens is not None and request_ids is not None:
         connector.wait_for_layer_load(
             layer_name,
             selected_tokens,
