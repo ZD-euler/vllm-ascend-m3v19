@@ -179,6 +179,104 @@ def test_alignment_requires_communication_data(tool, tmp_path, capsys):
     assert "Rank alignment requires communication.json" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("host_start_ms", [0, 249])
+@pytest.mark.parametrize("first_start", [1_000_000, 1_794_207_232_640_317.75])
+def test_delay_details_match_connection_id_and_reuse_rank_trace(
+    tool, tmp_path, monkeypatch, host_start_ms, first_start
+):
+    output = tmp_path / "dp0_rank2_123_20261109145349727_ascend_pt" / "ASCEND_PROFILER_OUTPUT"
+    output.mkdir(parents=True)
+    communication = output / "communication.json"
+    operation = "hcom_allGather__503_47_1"
+    alignment = {
+        "operation": "step/collective/" + operation + "@group",
+        "first_start_us": first_start,
+        "ranks": [{"rank": 0, "start_offset_ms": 0}, {"rank": 2, "start_offset_ms": 250}],
+    }
+    rows = [
+        dict(name=operation, ph="X", ts=first_start + 250_000, dur=8, args={"connection_id": 77}),
+        dict(name=operation, ph="X", ts=first_start + 500_000, dur=8, args={"connection_id": 99}),
+        dict(
+            name="AscendCL@hcom_allGather_",
+            ph="X",
+            ts=first_start + 249_900,
+            dur=10,
+            args={"connection_id": 88},
+        ),
+        dict(
+            name="AscendCL@hcom_allGather_",
+            ph="B",
+            pid=1,
+            tid=12,
+            ts=first_start + host_start_ms * 1000,
+            args={"connection_id": "77"},
+        ),
+        dict(ph="E", pid=1, tid=12, ts=first_start + host_start_ms * 1000 + 10),
+        dict(name="AscendCL@aclrtMemcpyAsync", ph="X", tid=22, ts=first_start + 20_000, dur=195_000),
+        dict(name="AscendCL@aclrtMemcpyAsync", ph="X", tid=22, ts=first_start + 260_000, dur=300_000),
+        dict(name="MEMCPY_ASYNC", ph="X", ts=first_start + 100_000, dur=100, args={"Physic Stream Id": 24}),
+    ]
+    (output / "trace_view.json").write_text(json.dumps({"traceEvents": rows}))
+    calls = []
+    real_events = tool.complete_events
+
+    def traced_events(path):
+        calls.append(path)
+        return real_events(path)
+
+    monkeypatch.setattr(tool, "complete_events", traced_events)
+    details = tool.collective_delay_details([alignment, alignment], [communication], 3)
+    assert len(calls) == 1
+    assert len(details) == 2
+    detail = details[0]
+    assert detail["status"] == "matched"
+    assert detail["host_launch"]["start_offset_ms"] == host_start_ms
+    assert detail["host_launch"]["connection_id"] == 77
+    assert detail["launch_end_to_device_start_ms"] == pytest.approx(250 - host_start_ms - 0.01)
+    assert [row["duration_ms"] for row in detail["long_host_copies"]] == [195]
+    assert detail["long_device_tasks"][0]["stream"] == 24
+
+
+@pytest.mark.parametrize(
+    ("rows", "expected"),
+    [
+        ([], "device_call_missing"),
+        ([dict(name="hcom_allGather__1", ph="X", ts=102, dur=8)], "device_timestamp_mismatch"),
+        ([dict(name="hcom_allGather__1", ph="X", ts=100, dur=8)], "host_launch_missing"),
+    ],
+)
+def test_delay_details_report_missing_correlations(tool, tmp_path, rows, expected):
+    output = tmp_path / "rank2_123_20261109145349727_ascend_pt"
+    output.mkdir()
+    (output / "trace_view.json").write_text(json.dumps(rows))
+    alignment = {
+        "operation": "step/hcom_allGather__1@group",
+        "first_start_us": 0,
+        "ranks": [{"rank": 2, "start_offset_ms": 0.1}],
+    }
+    detail = tool.collective_delay_details([alignment], [output / "communication.json"], 3)[0]
+    assert detail["status"] == expected
+    assert detail["host_launch"] is None
+
+
+def test_locate_cli_uses_selected_capture(tool, tmp_path, monkeypatch, capsys):
+    profile_root, _, workers = make_capture(tmp_path, "20261109-140000", "abcd")
+    monkeypatch.chdir(tmp_path)
+    output = workers[1] / "ASCEND_PROFILER_OUTPUT"
+    rows = [
+        dict(name="hcom_allGather__1", ph="X", ts=1_001_000, dur=10_000, args={"connection_id": 77}),
+        dict(name="AscendCL@hcom_allGather_", ph="X", ts=1_000_000, dur=100, args={"connection_id": 77}),
+    ]
+    (output / "trace_view.json").write_text(json.dumps(rows))
+    tool.main([str(profile_root), "1", "--locate"])
+    report = json.loads(capsys.readouterr().out)
+    detail = report["collective_delay_details"][0]
+    assert detail["rank"] == 1
+    assert detail["status"] == "matched"
+    assert detail["launch_end_to_device_start_ms"] == 0.9
+    assert "traces" not in report
+
+
 def write_communication(output, rank):
     data = {
         "step": {

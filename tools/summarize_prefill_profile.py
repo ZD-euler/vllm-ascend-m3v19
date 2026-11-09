@@ -8,6 +8,7 @@ List captures: python tools/summarize_prefill_profile.py /path/to/profiles --lis
 Select raw directory: python tools/summarize_prefill_profile.py /path/to/profiles 162830_20261109154305160
 Compare ranks without reading traces: python tools/summarize_prefill_profile.py 5
 Include detailed trace summaries: python tools/summarize_prefill_profile.py 5 --full
+Locate late-rank submission delays: python tools/summarize_prefill_profile.py 5 --locate
 PID_timestamp selects exactly one raw directory. Legacy run-number selection is also supported.
 By default, reads communication.json only. Full mode also streams trace_view.json with bounded memory.
 """
@@ -22,6 +23,7 @@ from datetime import datetime
 from pathlib import Path
 
 DEFAULT_PROFILE_DIRECTORY = Path(__file__).resolve().parents[1] / "vllm_profile" / "P_dp0"
+TRACE_TIMESTAMP_TOLERANCE_US = 1.0
 
 
 def number(value):
@@ -215,14 +217,17 @@ def communication_summary(path, top):
     }
 
 
+def profile_rank(path):
+    worker = next((parent.name for parent in path.parents if parent.name.endswith("_ascend_pt")), path.parent.name)
+    match = re.search(r"(?:^|_)rank(\d+)(?:_|$)", worker)
+    return int(match.group(1)) if match else worker
+
+
 def collective_alignment(summaries, top):
     """Compare every rank before selecting the slowest collective instances."""
     grouped = {}
     for summary in summaries:
-        path = Path(summary["file"])
-        worker = next((parent.name for parent in path.parents if parent.name.endswith("_ascend_pt")), path.parent.name)
-        match = re.search(r"(?:^|_)rank(\d+)(?:_|$)", worker)
-        rank = int(match.group(1)) if match else worker
+        rank = profile_rank(Path(summary["file"]))
         for operation in summary["collective"]:
             timing = operation["time"]
             if "Start Timestamp(us)" not in timing:
@@ -261,6 +266,113 @@ def collective_alignment(summaries, top):
         )
     result.sort(key=lambda row: max(rank["duration_ms"] for rank in row["ranks"]), reverse=True)
     return result[:top]
+
+
+def collective_delay_details(alignments, communication_files, top):
+    """Read each late rank's trace once and correlate device calls to Host launches."""
+    traces_by_rank = {}
+    for path in communication_files:
+        rank = profile_rank(path)
+        traces_by_rank.setdefault(rank, []).append(path.with_name("trace_view.json"))
+    grouped = {}
+    results = []
+    for alignment in alignments:
+        late = max(alignment["ranks"], key=lambda row: row["start_offset_ms"])
+        detail = {
+            "operation": alignment["operation"],
+            "rank": late["rank"],
+            "device_start_offset_ms": late["start_offset_ms"],
+            "host_launch": None,
+            "launch_end_to_device_start_ms": None,
+            "long_host_copies": [],
+            "long_device_tasks": [],
+        }
+        results.append(detail)
+        candidates = traces_by_rank[late["rank"]]
+        if len(candidates) != 1:
+            detail["status"] = "multiple_profiles_for_rank"
+            continue
+        path = candidates[0]
+        if not path.is_file():
+            detail["status"] = "trace_missing"
+            continue
+        grouped.setdefault(path, []).append((alignment, detail))
+    for path, targets in grouped.items():
+        launches = {}
+        device_calls = {}
+        host_copies = [[] for _ in targets]
+        device_tasks = [[] for _ in targets]
+        serial = 0
+        for event in complete_events(path):
+            if event.get("ph") != "X":
+                continue
+            name = str(event.get("name", ""))
+            args = event.get("args") or {}
+            start = number(event.get("ts"))
+            duration = number(event.get("dur"))
+            end = start + duration
+            serial += 1
+            connection = args.get("connection_id")
+            if name.startswith("AscendCL@") and "hcom" in name.lower() and connection is not None:
+                launches.setdefault(str(connection), []).append(event)
+            for index, (alignment, detail) in enumerate(targets):
+                first_start = alignment["first_start_us"]
+                device_start = first_start + detail["device_start_offset_ms"] * 1000
+                trace_name = alignment["operation"].rsplit("/", 1)[-1].split("@", 1)[0]
+                if name == trace_name:
+                    previous = device_calls.get(index)
+                    if previous is None or abs(start - device_start) < abs(number(previous.get("ts")) - device_start):
+                        device_calls[index] = event
+                if start >= device_start or end <= first_start:
+                    continue
+                overlap = min(end, device_start) - max(start, first_start)
+                item = {
+                    "name": name,
+                    "thread": str(event.get("tid", "")),
+                    "stream": args.get("Physic Stream Id"),
+                    "connection_id": connection,
+                    "start_offset_ms": (start - first_start) / 1000,
+                    "end_offset_ms": (end - first_start) / 1000,
+                    "duration_ms": duration / 1000,
+                    "overlap_ms": overlap / 1000,
+                }
+                if name == "AscendCL@aclrtMemcpyAsync":
+                    longest(host_copies[index], item, overlap, serial, top)
+                if "Physic Stream Id" in args:
+                    longest(device_tasks[index], item, overlap, serial, top)
+        for index, (alignment, detail) in enumerate(targets):
+            detail["long_host_copies"] = [row for _, _, row in sorted(host_copies[index], reverse=True)]
+            detail["long_device_tasks"] = [row for _, _, row in sorted(device_tasks[index], reverse=True)]
+            device = device_calls.get(index)
+            if device is None:
+                detail["status"] = "device_call_missing"
+                continue
+            connection = (device.get("args") or {}).get("connection_id")
+            first_start = alignment["first_start_us"]
+            device_start = number(device.get("ts"))
+            detail["device_match_error_us"] = device_start - (first_start + detail["device_start_offset_ms"] * 1000)
+            if abs(detail["device_match_error_us"]) > TRACE_TIMESTAMP_TOLERANCE_US:
+                detail["status"] = "device_timestamp_mismatch"
+                continue
+            candidates = launches.get(str(connection), []) if connection is not None else []
+            if len(candidates) != 1:
+                detail["status"] = "host_launch_missing" if not candidates else "host_launch_ambiguous"
+                continue
+            launch = candidates[0]
+            launch_start = number(launch.get("ts"))
+            launch_duration = number(launch.get("dur"))
+            launch_end = launch_start + launch_duration
+            detail["host_launch"] = {
+                "name": launch["name"],
+                "thread": str(launch.get("tid", "")),
+                "connection_id": connection,
+                "start_offset_ms": (launch_start - first_start) / 1000,
+                "end_offset_ms": (launch_end - first_start) / 1000,
+                "duration_ms": launch_duration / 1000,
+            }
+            detail["launch_end_to_device_start_ms"] = (device_start - launch_end) / 1000
+            detail["status"] = "matched"
+    return results
 
 
 def discover_runs(directory, runs_dir=None):
@@ -419,10 +531,16 @@ def main(argv=None):
     cli.add_argument(
         "--top", type=int, default=3, help="Slowest collective instances, or events of each kind in full mode"
     )
-    cli.add_argument(
+    mode = cli.add_mutually_exclusive_group()
+    mode.add_argument(
         "--full",
         action="store_true",
         help="Include detailed per-file communication and trace summaries",
+    )
+    mode.add_argument(
+        "--locate",
+        action="store_true",
+        help="Correlate late-rank Host launches and preceding work using existing traces",
     )
     args = cli.parse_args(argv)
     if args.top < 1:
@@ -506,6 +624,10 @@ def main(argv=None):
         # Rank-local top-N filtering would discard the late rank's short call.
         summaries = [communication_summary(path, sys.maxsize) for path in communication_files]
         report = {"collective_alignment": collective_alignment(summaries, args.top)}
+        if args.locate:
+            report["collective_delay_details"] = collective_delay_details(
+                report["collective_alignment"], communication_files, args.top
+            )
     else:
         report = {"communication": [], "traces": []}
         for path in sorted(files):
