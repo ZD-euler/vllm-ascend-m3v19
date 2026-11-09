@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import gzip
 import importlib.util
 import json
 import shutil
@@ -181,8 +182,9 @@ def test_alignment_requires_communication_data(tool, tmp_path, capsys):
 
 @pytest.mark.parametrize("host_start_ms", [0, 249])
 @pytest.mark.parametrize("first_start", [1_000_000, 1_794_207_232_640_317.75])
+@pytest.mark.parametrize("host_name", ["AscendCL@hcom_allGather_", "Runtime@rtKernelLaunchWithHandle"])
 def test_delay_details_match_connection_id_and_reuse_rank_trace(
-    tool, tmp_path, monkeypatch, host_start_ms, first_start
+    tool, tmp_path, monkeypatch, host_start_ms, first_start, host_name
 ):
     output = tmp_path / "dp0_rank2_123_20261109145349727_ascend_pt" / "ASCEND_PROFILER_OUTPUT"
     output.mkdir(parents=True)
@@ -204,7 +206,7 @@ def test_delay_details_match_connection_id_and_reuse_rank_trace(
             args={"connection_id": 88},
         ),
         dict(
-            name="AscendCL@hcom_allGather_",
+            name=host_name,
             ph="B",
             pid=1,
             tid=12,
@@ -215,6 +217,20 @@ def test_delay_details_match_connection_id_and_reuse_rank_trace(
         dict(name="AscendCL@aclrtMemcpyAsync", ph="X", tid=22, ts=first_start + 20_000, dur=195_000),
         dict(name="AscendCL@aclrtMemcpyAsync", ph="X", tid=22, ts=first_start + 260_000, dur=300_000),
         dict(name="MEMCPY_ASYNC", ph="X", ts=first_start + 100_000, dur=100, args={"Physic Stream Id": 24}),
+        dict(
+            name="EVENT_WAIT",
+            ph="X",
+            ts=first_start + 14_000,
+            dur=235_000,
+            args={"Physic Stream Id": 47, "connection_id": 12},
+        ),
+        dict(
+            name="Runtime@rtStreamWaitEvent",
+            ph="X",
+            ts=first_start + 10_000,
+            dur=5,
+            args={"level": "runtime", "connection_id": 12, "event_id": 123},
+        ),
     ]
     (output / "trace_view.json").write_text(json.dumps({"traceEvents": rows}))
     calls = []
@@ -226,15 +242,19 @@ def test_delay_details_match_connection_id_and_reuse_rank_trace(
 
     monkeypatch.setattr(tool, "complete_events", traced_events)
     details = tool.collective_delay_details([alignment, alignment], [communication], 3)
-    assert len(calls) == 1
+    assert len(calls) == 2
     assert len(details) == 2
     detail = details[0]
     assert detail["status"] == "matched"
     assert detail["host_launch"]["start_offset_ms"] == host_start_ms
     assert detail["host_launch"]["connection_id"] == 77
+    assert detail["host_launch"]["name"] == host_name
     assert detail["launch_end_to_device_start_ms"] == pytest.approx(250 - host_start_ms - 0.01)
     assert [row["duration_ms"] for row in detail["long_host_copies"]] == [195]
-    assert detail["long_device_tasks"][0]["stream"] == 24
+    wait = detail["long_device_tasks"][0]
+    assert wait["stream"] == 47
+    assert wait["host_api_candidates"][0]["name"] == "Runtime@rtStreamWaitEvent"
+    assert wait["host_api_candidates"][0]["args"]["event_id"] == 123
 
 
 @pytest.mark.parametrize(
@@ -275,6 +295,42 @@ def test_locate_cli_uses_selected_capture(tool, tmp_path, monkeypatch, capsys):
     assert detail["status"] == "matched"
     assert detail["launch_end_to_device_start_ms"] == 0.9
     assert "traces" not in report
+    artifact = detail["trace_slice"]
+    with gzip.open(artifact["file"], "rt", encoding="utf-8") as stream:
+        fragment = json.load(stream)
+    assert len(fragment["traceEvents"]) == artifact["events"] == 2
+    assert artifact["compressed_bytes"] > 0
+
+
+def test_trace_slice_preserves_metadata_spanning_ranges_and_flow_events(tool, tmp_path):
+    path = tmp_path / "trace_view.json"
+    output = tmp_path / "fragment.json.gz"
+    rows = [
+        dict(name="process_name", ph="M", pid=1, args={"name": "CANN"}),
+        dict(name="outside", ph="X", ts=10, dur=20),
+        dict(name="Runtime@record", ph="X", ts=5, dur=2, args={"connection_id": 7}),
+        dict(name="spanning", ph="B", pid=1, tid=2, ts=50, args={"connection_id": 7}),
+        dict(ph="E", pid=1, tid=2, ts=400),
+        dict(name="Runtime@launch", ph="X", ts=200, dur=10, args={"connection_id": 7}),
+        dict(name="ac2g", ph="s", ts=201, id=7),
+        dict(name="kernel", ph="X", ts=240, dur=100, args={"Physic Stream Id": 47, "connection_id": 7}),
+        dict(name="after", ph="X", ts=500, dur=10),
+    ]
+    path.write_text(json.dumps(rows))
+    hosts, artifact = tool.trace_dependencies(path, {"7"}, (output, 100, 300))
+    assert [event["name"] for event in hosts["7"]] == ["Runtime@record", "Runtime@launch"]
+    with gzip.open(output, "rt", encoding="utf-8") as stream:
+        fragment = json.load(stream)["traceEvents"]
+    assert [row["name"] for row in fragment] == [
+        "process_name",
+        "Runtime@record",
+        "spanning",
+        "Runtime@launch",
+        "ac2g",
+        "kernel",
+    ]
+    assert fragment[2]["dur"] == 350
+    assert artifact["events"] == 6
 
 
 def write_communication(output, rank):

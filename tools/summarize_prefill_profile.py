@@ -14,16 +14,19 @@ By default, reads communication.json only. Full mode also streams trace_view.jso
 """
 
 import argparse
+import gzip
 import heapq
 import json
 import math
 import re
 import sys
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 
 DEFAULT_PROFILE_DIRECTORY = Path(__file__).resolve().parents[1] / "vllm_profile" / "P_dp0"
 TRACE_TIMESTAMP_TOLERANCE_US = 1.0
+TRACE_SLICE_MARGIN_US = 100.0
 
 
 def number(value):
@@ -268,8 +271,58 @@ def collective_alignment(summaries, top):
     return result[:top]
 
 
-def collective_delay_details(alignments, communication_files, top):
-    """Read each late rank's trace once and correlate device calls to Host launches."""
+def trace_dependencies(path, connections, trace_slice=None):
+    """Read selected Host APIs and optionally export a compressed trace window."""
+    launches = {}
+    count = 0
+    output, start_us, end_us = trace_slice if trace_slice else (None, 0, 0)
+    with gzip.open(output, "wt", encoding="utf-8") if output else nullcontext() as stream:
+        if stream is not None:
+            stream.write('{"traceEvents":[')
+        for event in complete_events(path):
+            name = str(event.get("name", ""))
+            args = event.get("args") or {}
+            connection = args.get("connection_id")
+            # Device IDs can refer to low-level Runtime APIs. Match all Host
+            # families by ID while retaining only the requested connections.
+            if (
+                event.get("ph") == "X"
+                and connection is not None
+                and str(connection) in connections
+                and ("level" in args or "@" in name)
+                and "Physic Stream Id" not in args
+                and "task type" not in args
+                and "model id" not in args
+            ):
+                launches.setdefault(str(connection), []).append(event)
+            if stream is None:
+                continue
+            start = number(event.get("ts"))
+            end = start + number(event.get("dur"))
+            linked = str(connection) in connections or str(event.get("id")) in connections
+            if event.get("ph") != "M" and not linked and (end < start_us or start > end_us):
+                continue
+            if count:
+                stream.write(",")
+            json.dump(event, stream, ensure_ascii=False, separators=(",", ":"))
+            count += 1
+        if stream is not None:
+            stream.write("]}")
+    artifact = None
+    if output:
+        artifact = {
+            "file": str(output.resolve()),
+            "start_us": start_us,
+            "end_us": end_us,
+            "events": count,
+            "compressed_bytes": output.stat().st_size,
+            "includes_linked_context": True,
+        }
+    return launches, artifact
+
+
+def collective_delay_details(alignments, communication_files, top, trace_slice_dir=None):
+    """Correlate late-rank device calls and Host launches with bounded memory."""
     traces_by_rank = {}
     for path in communication_files:
         rank = profile_rank(path)
@@ -298,10 +351,14 @@ def collective_delay_details(alignments, communication_files, top):
             continue
         grouped.setdefault(path, []).append((alignment, detail))
     for path, targets in grouped.items():
-        launches = {}
         device_calls = {}
+        slice_connections = set()
         host_copies = [[] for _ in targets]
         device_tasks = [[] for _ in targets]
+        slice_start = targets[0][0]["first_start_us"] - TRACE_SLICE_MARGIN_US
+        slice_end = (
+            targets[0][0]["first_start_us"] + targets[0][1]["device_start_offset_ms"] * 1000 + TRACE_SLICE_MARGIN_US
+        )
         serial = 0
         for event in complete_events(path):
             if event.get("ph") != "X":
@@ -313,8 +370,14 @@ def collective_delay_details(alignments, communication_files, top):
             end = start + duration
             serial += 1
             connection = args.get("connection_id")
-            if name.startswith("AscendCL@") and "hcom" in name.lower() and connection is not None:
-                launches.setdefault(str(connection), []).append(event)
+            if (
+                trace_slice_dir is not None
+                and connection is not None
+                and ("Physic Stream Id" in args or "model id" in args)
+                and start <= slice_end
+                and end >= slice_start
+            ):
+                slice_connections.add(str(connection))
             for index, (alignment, detail) in enumerate(targets):
                 first_start = alignment["first_start_us"]
                 device_start = first_start + detail["device_start_offset_ms"] * 1000
@@ -340,14 +403,41 @@ def collective_delay_details(alignments, communication_files, top):
                     longest(host_copies[index], item, overlap, serial, top)
                 if "Physic Stream Id" in args:
                     longest(device_tasks[index], item, overlap, serial, top)
+        connections = {str((event.get("args") or {}).get("connection_id")) for event in device_calls.values()}
+        connections.update(str(item["connection_id"]) for heap in device_tasks for _, _, item in heap)
+        connections.update(slice_connections)
+        trace_slice = None
+        if trace_slice_dir is not None:
+            alignment, detail = targets[0]
+            start = alignment["first_start_us"]
+            end = start + detail["device_start_offset_ms"] * 1000
+            worker = next(
+                (parent.name for parent in path.parents if parent.name.endswith("_ascend_pt")), path.parent.name
+            )
+            output = trace_slice_dir / f"prefill-delay-{worker}.json.gz"
+            trace_slice = (output, start - TRACE_SLICE_MARGIN_US, end + TRACE_SLICE_MARGIN_US)
+        launches, artifact = trace_dependencies(path, connections, trace_slice)
+        if artifact is not None:
+            targets[0][1]["trace_slice"] = artifact
         for index, (alignment, detail) in enumerate(targets):
             detail["long_host_copies"] = [row for _, _, row in sorted(host_copies[index], reverse=True)]
             detail["long_device_tasks"] = [row for _, _, row in sorted(device_tasks[index], reverse=True)]
+            for task in detail["long_device_tasks"]:
+                task["host_api_candidates"] = [
+                    {
+                        "name": candidate["name"],
+                        "start_offset_ms": (number(candidate.get("ts")) - alignment["first_start_us"]) / 1000,
+                        "duration_ms": number(candidate.get("dur")) / 1000,
+                        "args": compact(candidate.get("args") or {}),
+                    }
+                    for candidate in launches.get(str(task["connection_id"]), [])
+                ]
             device = device_calls.get(index)
             if device is None:
                 detail["status"] = "device_call_missing"
                 continue
             connection = (device.get("args") or {}).get("connection_id")
+            detail["device_connection_id"] = connection
             first_start = alignment["first_start_us"]
             device_start = number(device.get("ts"))
             detail["device_match_error_us"] = device_start - (first_start + detail["device_start_offset_ms"] * 1000)
@@ -540,7 +630,7 @@ def main(argv=None):
     mode.add_argument(
         "--locate",
         action="store_true",
-        help="Correlate late-rank Host launches and preceding work using existing traces",
+        help="Correlate late-rank Host launches and export a compressed trace window beside the summary",
     )
     args = cli.parse_args(argv)
     if args.top < 1:
@@ -626,7 +716,10 @@ def main(argv=None):
         report = {"collective_alignment": collective_alignment(summaries, args.top)}
         if args.locate:
             report["collective_delay_details"] = collective_delay_details(
-                report["collective_alignment"], communication_files, args.top
+                report["collective_alignment"],
+                communication_files,
+                args.top,
+                trace_slice_dir=args.output.parent if args.output else Path.cwd(),
             )
     else:
         report = {"communication": [], "traces": []}
