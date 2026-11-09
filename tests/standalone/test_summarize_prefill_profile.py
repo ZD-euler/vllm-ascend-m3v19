@@ -115,6 +115,70 @@ def test_communication_summary_includes_reduce_scatter_and_skips_total(tool, tmp
     assert result["collective"][0]["time"]["Wait Time(ms)"] == 10
 
 
+def test_alignment_keeps_late_rank_outside_its_local_top_events(tool, tmp_path, capsys, monkeypatch):
+    operation = "hcom_allGather__503_47_1@group"
+    starts_and_durations = [(0, 249), (17, 232), (244, 5), (17, 232)]
+    for rank, (start_ms, duration_ms) in enumerate(starts_and_durations):
+        output = tmp_path / f"dp0_rank{rank}_123_20261109145349727_ascend_pt" / "ASCEND_PROFILER_OUTPUT"
+        output.mkdir(parents=True)
+        data = {
+            "step": {
+                "collective": {
+                    operation: {
+                        "Communication Time Info": {
+                            "Start Timestamp(us)": 10_000_000 + start_ms * 1000,
+                            "Elapse Time(ms)": duration_ms,
+                        }
+                    },
+                    f"hcom_allGather__other_{rank}@group": {
+                        "Communication Time Info": {"Start Timestamp(us)": 9_000_000, "Elapse Time(ms)": 100}
+                    },
+                }
+            }
+        }
+        (output / "communication.json").write_text(json.dumps(data))
+        (output / "trace_view.json").write_text("This large trace must stay unread")
+    monkeypatch.setattr(tool, "trace_summary", lambda *args: pytest.fail("Alignment read a trace"))
+    tool.main([str(tmp_path), "--align-only", "--top", "1"])
+    report = json.loads(capsys.readouterr().out)
+    aligned = report["collective_alignment"][0]
+    assert len(report["collective_alignment"]) == 1
+    assert aligned["operation"] == "step/collective/" + operation
+    assert aligned["matched_profiles"] == aligned["available_profiles"] == 4
+    assert aligned["start_skew_ms"] == 244
+    assert aligned["end_skew_ms"] == 0
+    assert aligned["tail_after_last_start_ms"] == 5
+    late_rank = aligned["ranks"][-1]
+    assert late_rank == {"rank": 2, "start_offset_ms": 244, "end_offset_ms": 249, "duration_ms": 5}
+
+
+def test_alignment_preserves_communicator_and_missing_rank(tool):
+    summaries = [
+        {
+            "file": f"/profiles/rank{rank}_123_20261109145349727_ascend_pt/ASCEND_PROFILER_OUTPUT/communication.json",
+            "collective": [
+                {
+                    "operation": f"step/hcom_allGather__1@group{rank}",
+                    "time": {"Start Timestamp(us)": 1000, "Elapse Time(ms)": 10},
+                },
+                {"operation": "step/no_timestamp", "time": {"Elapse Time(ms)": 100}},
+            ],
+        }
+        for rank in range(2)
+    ]
+    aligned = tool.collective_alignment(summaries, 3)
+    assert len(aligned) == 2
+    assert {row["operation"] for row in aligned} == {"step/hcom_allGather__1@group0", "step/hcom_allGather__1@group1"}
+    assert all(row["matched_profiles"] == 1 and row["available_profiles"] == 2 for row in aligned)
+
+
+def test_alignment_requires_communication_data(tool, tmp_path, capsys):
+    (tmp_path / "trace_view.json").write_text("{}")
+    with pytest.raises(SystemExit):
+        tool.main([str(tmp_path), "--align-only"])
+    assert "--align-only requires communication.json" in capsys.readouterr().err
+
+
 def make_capture(root, stamp, run_id, prefix=512000, new=128):
     profile_root = root / "vllm_profile" / "P_dp0"
     workers = []

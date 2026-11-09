@@ -6,6 +6,7 @@ Interactive: python tools/summarize_prefill_profile.py
 Default directory: python tools/summarize_prefill_profile.py 162830_20261109154305160
 List captures: python tools/summarize_prefill_profile.py /path/to/profiles --list
 Select raw directory: python tools/summarize_prefill_profile.py /path/to/profiles 162830_20261109154305160
+Compare ranks without reading traces: python tools/summarize_prefill_profile.py 5 --align-only
 PID_timestamp selects exactly one raw directory. Legacy run-number selection is also supported.
 Reads communication.json and streams trace_view.json with bounded memory.
 """
@@ -213,6 +214,54 @@ def communication_summary(path, top):
     }
 
 
+def collective_alignment(summaries, top):
+    """Compare every rank before selecting the slowest collective instances."""
+    grouped = {}
+    for summary in summaries:
+        path = Path(summary["file"])
+        worker = next((parent.name for parent in path.parents if parent.name.endswith("_ascend_pt")), path.parent.name)
+        match = re.search(r"(?:^|_)rank(\d+)(?:_|$)", worker)
+        rank = int(match.group(1)) if match else worker
+        for operation in summary["collective"]:
+            timing = operation["time"]
+            if "Start Timestamp(us)" not in timing:
+                continue
+            start = number(timing["Start Timestamp(us)"])
+            duration = number(timing.get("Elapse Time(ms)"))
+            grouped.setdefault(operation["operation"], []).append(
+                {"rank": rank, "start_us": start, "end_us": start + duration * 1000, "duration_ms": duration}
+            )
+    result = []
+    for operation, ranks in grouped.items():
+        ranks.sort(key=lambda row: (row["start_us"], str(row["rank"])))
+        first_start = ranks[0]["start_us"]
+        last_start = ranks[-1]["start_us"]
+        first_end = min(row["end_us"] for row in ranks)
+        last_end = max(row["end_us"] for row in ranks)
+        result.append(
+            {
+                "operation": operation,
+                "matched_profiles": len(ranks),
+                "available_profiles": len(summaries),
+                "first_start_us": first_start,
+                "start_skew_ms": (last_start - first_start) / 1000,
+                "end_skew_ms": (last_end - first_end) / 1000,
+                "tail_after_last_start_ms": (last_end - last_start) / 1000,
+                "ranks": [
+                    {
+                        "rank": row["rank"],
+                        "start_offset_ms": (row["start_us"] - first_start) / 1000,
+                        "end_offset_ms": (row["end_us"] - first_start) / 1000,
+                        "duration_ms": row["duration_ms"],
+                    }
+                    for row in ranks
+                ],
+            }
+        )
+    result.sort(key=lambda row: max(rank["duration_ms"] for rank in row["ranks"]), reverse=True)
+    return result[:top]
+
+
 def discover_runs(directory, runs_dir=None):
     """Match client manifests to the exact worker captures under a shared root."""
     captures = {path.resolve() for path in directory.rglob("*_ascend_pt") if path.is_dir()}
@@ -367,6 +416,11 @@ def main(argv=None):
         "--output", type=Path, help="Summary file; interactive/default-directory selection uses ./profile-summary.json"
     )
     cli.add_argument("--top", type=int, default=3, help="Longest events of each kind per file")
+    cli.add_argument(
+        "--align-only",
+        action="store_true",
+        help="Compare ranks of the slowest collectives using communication.json only",
+    )
     args = cli.parse_args(argv)
     if args.top < 1:
         cli.error("--top must be positive")
@@ -442,16 +496,24 @@ def main(argv=None):
             cli.error(f"Path does not exist: {path}")
     if not files:
         cli.error("No communication.json or trace_view.json found")
-    report = {"communication": [], "traces": []}
+    if args.align_only:
+        communication_files = sorted(path for path in files if path.name == "communication.json")
+        if not communication_files:
+            cli.error("--align-only requires communication.json")
+        # Rank-local top-N filtering would discard the late rank's short call.
+        summaries = [communication_summary(path, sys.maxsize) for path in communication_files]
+        report = {"collective_alignment": collective_alignment(summaries, args.top)}
+    else:
+        report = {"communication": [], "traces": []}
+        for path in sorted(files):
+            if path.name == "communication.json":
+                report["communication"].append(communication_summary(path, args.top))
+            elif path.name == "trace_view.json":
+                report["traces"].append(trace_summary(path, args.top))
+            else:
+                cli.error(f"Expected communication.json or trace_view.json: {path}")
     if selection is not None:
         report["selection"] = selection
-    for path in sorted(files):
-        if path.name == "communication.json":
-            report["communication"].append(communication_summary(path, args.top))
-        elif path.name == "trace_view.json":
-            report["traces"].append(trace_summary(path, args.top))
-        else:
-            cli.error(f"Expected communication.json or trace_view.json: {path}")
     summary = json.dumps(report, ensure_ascii=False, indent=2)
     if args.output is None:
         print(summary)
