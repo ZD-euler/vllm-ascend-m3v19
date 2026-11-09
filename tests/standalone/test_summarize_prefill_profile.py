@@ -139,7 +139,7 @@ def test_alignment_keeps_late_rank_outside_its_local_top_events(tool, tmp_path, 
         (output / "communication.json").write_text(json.dumps(data))
         (output / "trace_view.json").write_text("This large trace must stay unread")
     monkeypatch.setattr(tool, "trace_summary", lambda *args: pytest.fail("Alignment read a trace"))
-    tool.main([str(tmp_path), "--align-only", "--top", "1"])
+    tool.main([str(tmp_path), "--top", "1"])
     report = json.loads(capsys.readouterr().out)
     aligned = report["collective_alignment"][0]
     assert len(report["collective_alignment"]) == 1
@@ -175,8 +175,19 @@ def test_alignment_preserves_communicator_and_missing_rank(tool):
 def test_alignment_requires_communication_data(tool, tmp_path, capsys):
     (tmp_path / "trace_view.json").write_text("{}")
     with pytest.raises(SystemExit):
-        tool.main([str(tmp_path), "--align-only"])
-    assert "--align-only requires communication.json" in capsys.readouterr().err
+        tool.main([str(tmp_path / "trace_view.json")])
+    assert "Rank alignment requires communication.json" in capsys.readouterr().err
+
+
+def write_communication(output, rank):
+    data = {
+        "step": {
+            "hcom_allGather__1@group": {
+                "Communication Time Info": {"Start Timestamp(us)": 1_000_000 + rank * 1000, "Elapse Time(ms)": 10}
+            }
+        }
+    }
+    (output / "communication.json").write_text(json.dumps(data))
 
 
 def make_capture(root, stamp, run_id, prefix=512000, new=128):
@@ -187,6 +198,7 @@ def make_capture(root, stamp, run_id, prefix=512000, new=128):
         output = worker / "ASCEND_PROFILER_OUTPUT"
         output.mkdir(parents=True)
         (output / "trace_view.json").write_text(json.dumps({"traceEvents": []}))
+        write_communication(output, rank)
         workers.append(worker)
     result_dir = root / f"prefill-profile-{stamp}-{run_id}"
     result_dir.mkdir()
@@ -223,7 +235,7 @@ def test_selects_exact_workers_for_one_run(tool, tmp_path, monkeypatch, capsys, 
     assert result["selection"]["number"] == 2
     assert result["selection"]["manifest"] == str(result_dir / "result.json")
     assert result["selection"]["new_prompt_tokens"] == 4096
-    assert len(result["traces"]) == 2
+    assert result["collective_alignment"][0]["matched_profiles"] == 2
     assert all(str(path) in result["selection"]["profiles"] for path in new_workers)
     assert all(str(path) not in json.dumps(result) for path in old_workers)
 
@@ -239,6 +251,7 @@ def test_missing_worker_profile_fails_selection(tool, tmp_path, capsys):
     profile_root, _, workers = make_capture(tmp_path, "20261109-140000", "abcd")
     trace = workers[1] / "ASCEND_PROFILER_OUTPUT" / "trace_view.json"
     trace.unlink()
+    (trace.parent / "communication.json").unlink()
     trace.parent.rmdir()
     workers[1].rmdir()
     with pytest.raises(SystemExit) as error:
@@ -309,7 +322,7 @@ def test_legacy_multiple_files_still_work(tool, tmp_path, capsys):
         path = directory / "trace_view.json"
         path.write_text(json.dumps({"traceEvents": []}))
         paths.append(path)
-    tool.main(list(map(str, paths)))
+    tool.main([*map(str, paths), "--full"])
     result = json.loads(capsys.readouterr().out)
     assert len(result["traces"]) == 2
     assert "selection" not in result
@@ -414,7 +427,7 @@ def test_interactive_script_entry_point_on_cpu(tool, tmp_path):
     assert "请输入目录编号" in result.stdout
     report = json.loads((tmp_path / "profile-summary.json").read_text())
     assert report["selection"]["run_id"] == "abcd"
-    assert len(report["traces"]) == 2
+    assert report["collective_alignment"][0]["matched_profiles"] == 2
 
 
 def raw_captures(root):
@@ -423,6 +436,7 @@ def raw_captures(root):
         path = root / f"dp0_pp0_tp1_dcp0_ep1_rank1_{pid}_20261109154305160_ascend_pt"
         path.mkdir(parents=True)
         (path / "trace_view.json").write_text(json.dumps({"traceEvents": []}))
+        write_communication(path, 1)
         paths.append(path)
     return paths
 
@@ -436,7 +450,7 @@ def test_raw_identifier_filters_one_directory_without_client_records(tool, tmp_p
     result = json.loads(capsys.readouterr().out)
     assert result["selection"]["profile_identifier"] == identifier
     assert result["selection"]["profiles"] == [str(target)]
-    assert len(result["traces"]) == 1
+    assert result["collective_alignment"][0]["matched_profiles"] == 1
     assert str(other) not in json.dumps(result)
 
 
@@ -476,7 +490,7 @@ def test_existing_raw_directory_path_preserves_direct_input(tool, tmp_path, caps
     target, _ = raw_captures(tmp_path)
     tool.main([str(target)])
     result = json.loads(capsys.readouterr().out)
-    assert len(result["traces"]) == 1
+    assert result["collective_alignment"][0]["matched_profiles"] == 1
     assert "selection" not in result
 
 

@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Extract a small communication/copy summary from existing Ascend profiles.
+"""Compare collective timings across ranks in existing Ascend profiles.
 
 Interactive: python tools/summarize_prefill_profile.py
 Default directory: python tools/summarize_prefill_profile.py 162830_20261109154305160
 List captures: python tools/summarize_prefill_profile.py /path/to/profiles --list
 Select raw directory: python tools/summarize_prefill_profile.py /path/to/profiles 162830_20261109154305160
-Compare ranks without reading traces: python tools/summarize_prefill_profile.py 5 --align-only
+Compare ranks without reading traces: python tools/summarize_prefill_profile.py 5
+Include detailed trace summaries: python tools/summarize_prefill_profile.py 5 --full
 PID_timestamp selects exactly one raw directory. Legacy run-number selection is also supported.
-Reads communication.json and streams trace_view.json with bounded memory.
+By default, reads communication.json only. Full mode also streams trace_view.json with bounded memory.
 """
 
 import argparse
@@ -415,11 +416,13 @@ def main(argv=None):
     cli.add_argument(
         "--output", type=Path, help="Summary file; interactive/default-directory selection uses ./profile-summary.json"
     )
-    cli.add_argument("--top", type=int, default=3, help="Longest events of each kind per file")
     cli.add_argument(
-        "--align-only",
+        "--top", type=int, default=3, help="Slowest collective instances, or events of each kind in full mode"
+    )
+    cli.add_argument(
+        "--full",
         action="store_true",
-        help="Compare ranks of the slowest collectives using communication.json only",
+        help="Include detailed per-file communication and trace summaries",
     )
     args = cli.parse_args(argv)
     if args.top < 1:
@@ -490,16 +493,16 @@ def main(argv=None):
         if path.is_file():
             files.add(path.resolve())
         elif path.is_dir():
-            for name in ("communication.json", "trace_view.json"):
+            for name in ("communication.json", "trace_view.json") if args.full else ("communication.json",):
                 files.update(item.resolve() for item in path.rglob(name))
         else:
             cli.error(f"Path does not exist: {path}")
     if not files:
-        cli.error("No communication.json or trace_view.json found")
-    if args.align_only:
+        cli.error("No communication.json or trace_view.json found" if args.full else "No communication.json found")
+    if not args.full:
         communication_files = sorted(path for path in files if path.name == "communication.json")
         if not communication_files:
-            cli.error("--align-only requires communication.json")
+            cli.error("Rank alignment requires communication.json")
         # Rank-local top-N filtering would discard the late rank's short call.
         summaries = [communication_summary(path, sys.maxsize) for path in communication_files]
         report = {"collective_alignment": collective_alignment(summaries, args.top)}
