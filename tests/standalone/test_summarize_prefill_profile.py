@@ -73,6 +73,48 @@ def test_hccl_summary_retains_wait_and_transit(tool, tmp_path):
     assert "Size Distribution" not in result["links"]["SDMA"]
 
 
+def test_separates_gloo_and_preserves_other_collectives(tool, tmp_path):
+    path = tmp_path / "trace_view.json"
+    names = ["gloo:all_reduce", "hcom_allGather", "hcom_reduceScatter", "hcom_allToAll", "vllm::maybe_pad_and_reduce"]
+    rows = [dict(name=name, ph="X", pid=1, tid=2, ts=10, dur=1000) for name in names]
+    path.write_text(json.dumps({"traceEvents": rows}))
+    result = tool.trace_summary(path, 10)
+    assert result["counts"]["gloo"] == 1
+    assert result["counts"]["collective"] == 3
+    assert result["counts"]["pad_reduce"] == 1
+    assert all("gloo" not in row["name"] for row in result["collective"])
+
+
+def test_nested_begin_end_ranges_preserve_hcom_duration(tool, tmp_path):
+    path = tmp_path / "trace_view.json"
+    rows = [
+        dict(name="vllm::maybe_pad_and_reduce", ph="B", pid=1, tid=2, ts=0),
+        dict(name="hcom_allReduce", ph="B", pid=1, tid=2, ts=1000),
+        dict(ph="E", pid=1, tid=2, ts=181000),
+        dict(ph="E", pid=1, tid=2, ts=182000),
+    ]
+    path.write_text(json.dumps(rows))
+    result = tool.trace_summary(path, 3)
+    assert result["collective"][0]["duration_ms"] == 180
+    assert result["pad_reduce"][0]["duration_ms"] == 182
+
+
+def test_communication_summary_includes_reduce_scatter_and_skips_total(tool, tmp_path):
+    path = tmp_path / "communication.json"
+    data = {
+        "step0": {
+            "hcom_reduceScatter@group": {"Communication Time Info": {"Elapse Time(ms)": 12, "Wait Time(ms)": 10}},
+            "hcom_allGather@group": {"Communication Time Info": {"Elapse Time(ms)": 8}},
+            "Total Op Info": {"Communication Time Info": {"Elapse Time(ms)": 20}},
+        }
+    }
+    path.write_text(json.dumps(data))
+    result = tool.communication_summary(path, 3)
+    assert result["counts"] == {"allreduce": 0, "collective": 2}
+    assert result["allreduce"] == []
+    assert result["collective"][0]["time"]["Wait Time(ms)"] == 10
+
+
 def make_capture(root, stamp, run_id, prefix=512000, new=128):
     profile_root = root / "vllm_profile" / "P_dp0"
     workers = []

@@ -88,12 +88,31 @@ def longest(heap, item, duration, serial, limit):
         heapq.heapreplace(heap, entry)
 
 
+def complete_events(path):
+    """Normalize paired CPU ranges and complete device events to durations."""
+    stacks = {}
+    for event in events(path):
+        phase = event.get("ph")
+        key = (event.get("pid"), event.get("tid"))
+        if phase == "B":
+            stacks.setdefault(key, []).append(event)
+        elif phase == "E":
+            stack = stacks.get(key)
+            if stack:
+                begin = stack.pop()
+                duration = number(event.get("ts")) - number(begin.get("ts"))
+                if duration >= 0:
+                    yield dict(begin, ph="X", dur=duration)
+        else:
+            yield event
+
+
 def trace_summary(path, top):
     processes, threads = {}, {}
-    counts = {"allreduce": 0, "copy": 0}
+    counts = {"allreduce": 0, "collective": 0, "gloo": 0, "pad_reduce": 0, "copy": 0}
     selected = {}
     serial = 0
-    for event in events(path):
+    for event in complete_events(path):
         name = str(event.get("name", ""))
         pid, tid = str(event.get("pid", "")), str(event.get("tid", ""))
         args = event.get("args") or {}
@@ -104,15 +123,23 @@ def trace_summary(path, top):
                 threads[(pid, tid)] = args.get("name")
             continue
         normalized = name.lower().replace("_", "").replace(" ", "")
-        category = None
+        categories = []
         if "allreduce" in normalized:
-            category = "allreduce"
-        elif "memcpy" in normalized or "hosttodevice" in normalized or "h2d" in normalized:
-            category = "copy"
-        if category is None or event.get("ph") != "X":
+            categories.append("allreduce")
+        if "gloo" in normalized:
+            categories.append("gloo")
+        elif any(
+            marker in normalized
+            for marker in ("hcom", "hccl", "allreduce", "allgather", "reducescatter", "alltoall", "broadcast")
+        ):
+            categories.append("collective")
+        if "maybepadandreduce" in normalized:
+            categories.append("pad_reduce")
+        if "memcpy" in normalized or "hosttodevice" in normalized or "h2d" in normalized:
+            categories.append("copy")
+        if not categories or event.get("ph") != "X":
             continue
         duration = number(event.get("dur"))
-        counts[category] += 1
         serial += 1
         item = {
             "name": name,
@@ -124,8 +151,10 @@ def trace_summary(path, top):
             "args": compact(args),
         }
         # Keep CPU submission ranges and device tasks independently.
-        heap = selected.setdefault((category, pid), [])
-        longest(heap, item, duration, serial, top)
+        for category in categories:
+            counts[category] += 1
+            heap = selected.setdefault((category, pid), [])
+            longest(heap, item, duration, serial, top)
     result = {"file": str(path), "counts": counts}
     for category in counts:
         retained = [entry for (kind, _), heap in selected.items() if kind == category for entry in heap]
@@ -141,7 +170,8 @@ def communication_summary(path, top):
     """Keep HCCL time breakdowns and link totals, excluding packet histograms."""
     with path.open(encoding="utf-8-sig") as stream:
         data = json.load(stream)
-    selected = []
+    selected, all_collectives = [], []
+    counts = {"allreduce": 0, "collective": 0}
     serial = 0
 
     def visit(value, location):
@@ -153,7 +183,7 @@ def communication_summary(path, top):
         if not isinstance(value, dict):
             return
         info = value.get("Communication Time Info")
-        if isinstance(info, dict) and "allreduce" in "/".join(location).lower().replace("_", ""):
+        if isinstance(info, dict) and location and not location[-1].lower().startswith("total"):
             duration = max((number(item) for key, item in info.items() if "elap" in key.lower()), default=0)
             links = {
                 link: {key: item for key, item in details.items() if "distribution" not in key.lower()}
@@ -161,14 +191,26 @@ def communication_summary(path, top):
                 if isinstance(details, dict)
             }
             item = {"operation": "/".join(location), "time": info, "links": links}
+            is_allreduce = "allreduce" in item["operation"].lower().replace("_", "")
             serial += 1
-            longest(selected, compact(item), duration, serial, top)
+            item = compact(item)
+            counts["collective"] += 1
+            longest(all_collectives, item, duration, serial, top)
+            if is_allreduce:
+                counts["allreduce"] += 1
+                longest(selected, item, duration, serial, top)
             return
         for key, item in value.items():
             visit(item, [*location, str(key)])
 
     visit(data, [])
-    return {"file": str(path), "allreduce": [row for _, _, row in sorted(selected, reverse=True)]}
+    return {
+        "file": str(path),
+        "counts": counts,
+        "top_level_keys": list(data)[:20] if isinstance(data, dict) else [],
+        "allreduce": [row for _, _, row in sorted(selected, reverse=True)],
+        "collective": [row for _, _, row in sorted(all_collectives, reverse=True)],
+    }
 
 
 def discover_runs(directory, runs_dir=None):
