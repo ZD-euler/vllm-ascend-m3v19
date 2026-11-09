@@ -3,10 +3,10 @@
 """Extract a small communication/copy summary from existing Ascend profiles.
 
 Interactive: python tools/summarize_prefill_profile.py
-Default directory, capture 2: python tools/summarize_prefill_profile.py 2
+Default directory: python tools/summarize_prefill_profile.py 162830_20261109154305160
 List captures: python tools/summarize_prefill_profile.py /path/to/profiles --list
-Select capture: python tools/summarize_prefill_profile.py /path/to/profiles 2 > summary.json
-Numbers are one-based and sorted from oldest to newest. Run IDs are also accepted.
+Select raw directory: python tools/summarize_prefill_profile.py /path/to/profiles 162830_20261109154305160
+PID_timestamp selects exactly one raw directory. Legacy run-number selection is also supported.
 Reads communication.json and streams trace_view.json with bounded memory.
 """
 
@@ -253,6 +253,8 @@ def discover_runs(directory, runs_dir=None):
 
 
 def select_run(runs, selector):
+    if not selector:
+        raise ValueError("Enter a profile identifier")
     if selector.isdecimal():
         index = int(selector) - 1
         if not 0 <= index < len(runs):
@@ -268,24 +270,56 @@ def select_run(runs, selector):
     return matches[0]
 
 
+def is_profile_identifier(value):
+    return bool(re.fullmatch(r"\d+_\d{14,20}", value)) or (
+        value.endswith("_ascend_pt") and "/" not in value and "\\" not in value
+    )
+
+
+def select_profile_directory(directory, identifier):
+    """Select one raw capture by its exact PID_timestamp suffix."""
+    candidates = list(directory.rglob("*_ascend_pt"))
+    if directory.name.endswith("_ascend_pt"):
+        candidates.append(directory)
+    matches = {
+        path.resolve()
+        for path in candidates
+        if path.is_dir()
+        and (
+            path.name == identifier
+            or path.name == identifier + "_ascend_pt"
+            or path.name.endswith("_" + identifier + "_ascend_pt")
+        )
+    }
+    if len(matches) != 1:
+        raise ValueError(f"Profile identifier {identifier!r} matched {len(matches)} directories under {directory}")
+    return matches.pop()
+
+
 def list_runs(runs):
-    print("编号\t采集时间\t前缀token\t新增token\tprofile数\t状态\t记录/ID")
+    print("序号\t采集时间\t前缀token\t新增token\tprofile数\t状态\t记录/ID\t原始目录编号")
     for index, run in enumerate(runs, 1):
         timestamp = datetime.fromtimestamp(run["timestamp"]).strftime("%Y-%m-%d %H:%M:%S")
         prefix = run["prefix_tokens"] if run["prefix_tokens"] is not None else "?"
         new = run["new_prompt_tokens"] if run["new_prompt_tokens"] is not None else "?"
         count = f"{len(run['paths'])}/{run['expected_profiles']}"
-        print(f"{index}\t{timestamp}\t{prefix}\t{new}\t{count}\t{run['status']}\t{run['label']}")
+        identifiers = []
+        for path in run["paths"]:
+            match = re.search(r"(\d+_\d{14,20})_ascend_pt$", path.name)
+            identifiers.append(match.group(1) if match else path.name)
+        print(
+            f"{index}\t{timestamp}\t{prefix}\t{new}\t{count}\t{run['status']}\t{run['label']}\t{','.join(identifiers)}"
+        )
 
 
 def main(argv=None):
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument(
-        "paths", nargs="*", type=Path, help="Profile directories, files, or a number in the default directory"
+        "paths", nargs="*", type=Path, help="Profile directories, files, or PID_timestamp in the default directory"
     )
     cli.add_argument("--list", action="store_true", help="List captures under one common profile directory")
-    cli.add_argument("--interactive", action="store_true", help="List captures and prompt for a number")
-    cli.add_argument("--run", help="Select a one-based capture number, run ID prefix, or result-directory name")
+    cli.add_argument("--interactive", action="store_true", help="Prompt for a raw directory's PID_timestamp")
+    cli.add_argument("--run", help="Select PID_timestamp, a raw directory name, or a legacy run number/ID")
     cli.add_argument("--runs-dir", type=Path, help="Additional directory containing client result directories")
     cli.add_argument(
         "--output", type=Path, help="Summary file; interactive/default-directory selection uses ./profile-summary.json"
@@ -294,52 +328,65 @@ def main(argv=None):
     args = cli.parse_args(argv)
     if args.top < 1:
         cli.error("--top must be positive")
-    default_directory = not args.paths or (len(args.paths) == 1 and str(args.paths[0]).isdecimal())
+    default_directory = not args.paths or (
+        len(args.paths) == 1
+        and (
+            str(args.paths[0]).isdecimal() or (is_profile_identifier(str(args.paths[0])) and not args.paths[0].exists())
+        )
+    )
     if default_directory:
         if args.paths:
             if args.run is not None:
-                cli.error("Supply the capture number once")
+                cli.error("Supply the capture identifier once")
             args.run = str(args.paths[0])
         args.paths = [DEFAULT_PROFILE_DIRECTORY]
         args.interactive = args.interactive or (args.run is None and not args.list)
     if args.interactive and (args.list or args.run is not None):
         cli.error("Use interactive selection, --list, or a capture number separately")
-    # Accept the short DIRECTORY NUMBER form alongside --run and legacy paths.
+    # Accept DIRECTORY IDENTIFIER alongside --run and legacy paths.
     if len(args.paths) == 2 and args.run is None and (str(args.paths[1]).isdecimal() or not args.paths[1].exists()):
         args.run = str(args.paths.pop())
+    if args.list and args.run is not None:
+        cli.error("Use --list or a capture identifier separately")
     selection = None
     if args.list or args.interactive or args.run is not None:
         if len(args.paths) != 1 or not args.paths[0].is_dir():
             cli.error("Capture selection requires one existing profile directory")
-        if args.runs_dir is not None and not args.runs_dir.is_dir():
-            cli.error("--runs-dir must be an existing client-results directory")
-        try:
-            runs = discover_runs(args.paths[0].resolve(), args.runs_dir)
-        except (OSError, ValueError) as error:
-            cli.error(str(error))
-        if not runs:
-            cli.error("No *_ascend_pt captures found in this directory")
-        if args.list:
-            if args.run is not None:
-                cli.error("Use --list or a capture number separately")
-            list_runs(runs)
-            return
         if args.interactive:
-            list_runs(runs)
+            print(f"Profile 根目录 {args.paths[0].resolve()}")
             try:
-                args.run = input("请输入编号：").strip()
+                args.run = input("请输入目录编号（PID_时间戳）：").strip()
             except EOFError:
-                cli.error("No capture number was entered")
-        try:
-            index, run = select_run(runs, args.run)
-        except ValueError as error:
-            cli.error(str(error))
-        if len(run["paths"]) != run["expected_profiles"]:
-            cli.error(f"Capture {index} has {len(run['paths'])}/{run['expected_profiles']} worker profiles")
-        selection = {key: value for key, value in run.items() if key not in {"paths", "timestamp"}}
-        selection["number"] = index
-        selection["profiles"] = list(map(str, run["paths"]))
-        args.paths = run["paths"]
+                cli.error("No profile identifier was entered")
+        if args.run is not None and is_profile_identifier(args.run):
+            try:
+                path = select_profile_directory(args.paths[0].resolve(), args.run)
+            except ValueError as error:
+                cli.error(str(error))
+            selection = {"profile_identifier": args.run, "profiles": [str(path)]}
+            args.paths = [path]
+        else:
+            if args.runs_dir is not None and not args.runs_dir.is_dir():
+                cli.error("--runs-dir must be an existing client-results directory")
+            try:
+                runs = discover_runs(args.paths[0].resolve(), args.runs_dir)
+            except (OSError, ValueError) as error:
+                cli.error(str(error))
+            if not runs:
+                cli.error("No *_ascend_pt captures found in this directory")
+            if args.list:
+                list_runs(runs)
+                return
+            try:
+                index, run = select_run(runs, args.run)
+            except ValueError as error:
+                cli.error(str(error))
+            if len(run["paths"]) != run["expected_profiles"]:
+                cli.error(f"Capture {index} has {len(run['paths'])}/{run['expected_profiles']} worker profiles")
+            selection = {key: value for key, value in run.items() if key not in {"paths", "timestamp"}}
+            selection["number"] = index
+            selection["profiles"] = list(map(str, run["paths"]))
+            args.paths = run["paths"]
     if args.output is None and (default_directory or args.interactive):
         args.output = Path("profile-summary.json")
     files = set()

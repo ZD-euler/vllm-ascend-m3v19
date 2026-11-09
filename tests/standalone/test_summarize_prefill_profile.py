@@ -232,12 +232,12 @@ def test_no_arguments_prompts_for_number_and_saves_summary(tool, tmp_path, monke
 
     monkeypatch.setattr("builtins.input", choose)
     tool.main([])
-    assert prompts == ["请输入编号："]
+    assert prompts == ["请输入目录编号（PID_时间戳）："]
     report = json.loads((tmp_path / "profile-summary.json").read_text())
     assert report["selection"]["run_id"] == "new"
     assert report["selection"]["new_prompt_tokens"] == 4096
     output = capsys.readouterr().out
-    assert "编号" in output and "摘要已保存到" in output
+    assert "Profile 根目录" in output and "摘要已保存到" in output
 
 
 def test_number_only_uses_default_directory_without_prompt(tool, tmp_path, monkeypatch):
@@ -271,7 +271,7 @@ def test_number_is_supplied_once(tool, tmp_path, capsys):
     with pytest.raises(SystemExit) as error:
         tool.main(["1", "--run", "2"])
     assert error.value.code == 2
-    assert "Supply the capture number once" in capsys.readouterr().err
+    assert "Supply the capture identifier once" in capsys.readouterr().err
 
 
 def test_interactive_eof_does_not_create_summary(tool, tmp_path, monkeypatch, capsys):
@@ -286,7 +286,7 @@ def test_interactive_eof_does_not_create_summary(tool, tmp_path, monkeypatch, ca
     with pytest.raises(SystemExit) as error:
         tool.main([])
     assert error.value.code == 2
-    assert "No capture number was entered" in capsys.readouterr().err
+    assert "No profile identifier was entered" in capsys.readouterr().err
     assert not (tmp_path / "profile-summary.json").exists()
 
 
@@ -305,7 +305,99 @@ def test_interactive_script_entry_point_on_cpu(tool, tmp_path):
         check=True,
         timeout=15,
     )
-    assert "请输入编号" in result.stdout
+    assert "请输入目录编号" in result.stdout
     report = json.loads((tmp_path / "profile-summary.json").read_text())
     assert report["selection"]["run_id"] == "abcd"
     assert len(report["traces"]) == 2
+
+
+def raw_captures(root):
+    paths = []
+    for pid in (162830, 162950):
+        path = root / f"dp0_pp0_tp1_dcp0_ep1_rank1_{pid}_20261109154305160_ascend_pt"
+        path.mkdir(parents=True)
+        (path / "trace_view.json").write_text(json.dumps({"traceEvents": []}))
+        paths.append(path)
+    return paths
+
+
+@pytest.mark.parametrize("arguments", [[], ["--run"]])
+def test_raw_identifier_filters_one_directory_without_client_records(tool, tmp_path, monkeypatch, capsys, arguments):
+    target, other = raw_captures(tmp_path)
+    identifier = "162830_20261109154305160"
+    monkeypatch.setattr(tool, "discover_runs", lambda *args: pytest.fail("Raw selection read other run records"))
+    tool.main([str(tmp_path), *arguments, identifier])
+    result = json.loads(capsys.readouterr().out)
+    assert result["selection"]["profile_identifier"] == identifier
+    assert result["selection"]["profiles"] == [str(target)]
+    assert len(result["traces"]) == 1
+    assert str(other) not in json.dumps(result)
+
+
+def test_identifier_only_uses_default_root(tool, tmp_path, monkeypatch):
+    target, _ = raw_captures(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(tool, "DEFAULT_PROFILE_DIRECTORY", tmp_path)
+    tool.main(["162830_20261109154305160"])
+    result = json.loads((tmp_path / "profile-summary.json").read_text())
+    assert result["selection"]["profiles"] == [str(target)]
+
+
+def test_interactive_raw_identifier(tool, tmp_path, monkeypatch):
+    target, _ = raw_captures(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(tool, "DEFAULT_PROFILE_DIRECTORY", tmp_path)
+    monkeypatch.setattr("builtins.input", lambda prompt: "162830_20261109154305160")
+    tool.main([])
+    result = json.loads((tmp_path / "profile-summary.json").read_text())
+    assert result["selection"]["profiles"] == [str(target)]
+
+
+def test_duplicate_raw_identifier_requires_unique_directory(tool, tmp_path):
+    raw_captures(tmp_path / "copy1")
+    raw_captures(tmp_path / "copy2")
+    with pytest.raises(ValueError, match="matched 2 directories"):
+        tool.select_profile_directory(tmp_path, "162830_20261109154305160")
+
+
+def test_missing_raw_identifier_reports_zero_matches(tool, tmp_path):
+    raw_captures(tmp_path)
+    with pytest.raises(ValueError, match="matched 0 directories"):
+        tool.select_profile_directory(tmp_path, "999999_20261109154305160")
+
+
+def test_existing_raw_directory_path_preserves_direct_input(tool, tmp_path, capsys):
+    target, _ = raw_captures(tmp_path)
+    tool.main([str(target)])
+    result = json.loads(capsys.readouterr().out)
+    assert len(result["traces"]) == 1
+    assert "selection" not in result
+
+
+def test_raw_identifier_match_is_exact(tool, tmp_path):
+    raw_captures(tmp_path)
+    with pytest.raises(ValueError, match="matched 0 directories"):
+        tool.select_profile_directory(tmp_path, "62830_20261109154305160")
+
+
+@pytest.mark.parametrize("interactive", [False, True])
+def test_user_pid_timestamp_through_real_script_entry_point(tool, tmp_path, interactive):
+    target, other = raw_captures(tmp_path / "vllm_profile" / "P_dp0")
+    identifier = "162830_20261109154305160"
+    script = tmp_path / "tools" / "summarize_prefill_profile.py"
+    script.parent.mkdir()
+    shutil.copyfile(tool.__file__, script)
+    result = subprocess.run(
+        [sys.executable, "-X", "utf8", str(script), *([] if interactive else [identifier])],
+        input=identifier + "\n" if interactive else "",
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        cwd=tmp_path,
+        check=True,
+        timeout=15,
+    )
+    report = json.loads((tmp_path / "profile-summary.json").read_text())
+    assert report["selection"]["profiles"] == [str(target)]
+    assert str(other) not in json.dumps(report)
+    assert "摘要已保存到" in result.stdout
