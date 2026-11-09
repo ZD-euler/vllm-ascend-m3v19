@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import base64
 import gzip
+import hashlib
 import importlib.util
 import json
 import shutil
@@ -289,7 +291,9 @@ def test_locate_cli_uses_selected_capture(tool, tmp_path, monkeypatch, capsys):
     ]
     (output / "trace_view.json").write_text(json.dumps(rows))
     tool.main([str(profile_root), "1", "--locate"])
-    report = json.loads(capsys.readouterr().out)
+    printed = capsys.readouterr().out
+    report = json.loads((tmp_path / "profile-summary.json").read_text())
+    assert "PROFILE_BASE64_BEGIN" in printed
     detail = report["collective_delay_details"][0]
     assert detail["rank"] == 1
     assert detail["status"] == "matched"
@@ -300,6 +304,53 @@ def test_locate_cli_uses_selected_capture(tool, tmp_path, monkeypatch, capsys):
         fragment = json.load(stream)
     assert len(fragment["traceEvents"]) == artifact["events"] == 2
     assert artifact["compressed_bytes"] > 0
+
+
+@pytest.mark.parametrize("chunk_chars", [4, 64, 6000])
+def test_base64_parts_round_trip(tool, tmp_path, capsys, chunk_chars):
+    path = tmp_path / "trace.json.gz"
+    original = gzip.compress(bytes(range(256)) * 4)
+    path.write_bytes(original)
+    tool.print_base64_parts(path, chunk_chars)
+    lines = capsys.readouterr().out.splitlines()
+    restored = bytearray()
+    expected_parts = len(lines) // 3
+    for index in range(expected_parts):
+        header_line, payload, end = lines[index * 3 : index * 3 + 3]
+        assert header_line.startswith("PROFILE_BASE64_BEGIN ")
+        header = json.loads(header_line.removeprefix("PROFILE_BASE64_BEGIN "))
+        assert header["part"] == index + 1
+        assert header["parts"] == expected_parts
+        assert header["bytes"] == len(original)
+        assert header["chars"] == len(payload) <= chunk_chars
+        assert header["sha256"] == hashlib.sha256(original).hexdigest()
+        assert end == "PROFILE_BASE64_END"
+        restored.extend(base64.b64decode(payload, validate=True))
+    assert bytes(restored) == original
+    assert gzip.decompress(restored) == bytes(range(256)) * 4
+
+
+def test_base64_existing_file_can_select_one_part_without_reading_profiles(tool, tmp_path, capsys, monkeypatch):
+    path = tmp_path / "trace.json.gz"
+    path.write_bytes(bytes(range(100)))
+    monkeypatch.setattr(tool, "discover_runs", lambda *args: pytest.fail("Encoding read profiles"))
+    tool.main(["--base64", str(path), "--chunk-chars", "16", "--part", "2"])
+    header_line, payload, _ = capsys.readouterr().out.splitlines()
+    assert json.loads(header_line.removeprefix("PROFILE_BASE64_BEGIN "))["part"] == 2
+    assert base64.b64decode(payload, validate=True) == bytes(range(12, 24))
+
+
+@pytest.mark.parametrize("chunk_chars", [0, 3, 6])
+def test_base64_invalid_chunk_length(tool, tmp_path, chunk_chars):
+    with pytest.raises(ValueError, match="multiple of 4"):
+        tool.print_base64_parts(tmp_path / "missing.gz", chunk_chars)
+
+
+def test_base64_invalid_part(tool, tmp_path):
+    path = tmp_path / "trace.gz"
+    path.write_bytes(b"abc")
+    with pytest.raises(ValueError, match="between 1 and 1"):
+        tool.print_base64_parts(path, part=2)
 
 
 def test_trace_slice_preserves_metadata_spanning_ranges_and_flow_events(tool, tmp_path):
