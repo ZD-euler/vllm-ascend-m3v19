@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Extract a small communication/copy summary from existing Ascend profiles.
 
+Interactive: python tools/summarize_prefill_profile.py
+Default directory, capture 2: python tools/summarize_prefill_profile.py 2
 List captures: python tools/summarize_prefill_profile.py /path/to/profiles --list
 Select capture: python tools/summarize_prefill_profile.py /path/to/profiles 2 > summary.json
 Numbers are one-based and sorted from oldest to newest. Run IDs are also accepted.
@@ -16,6 +18,8 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
+
+DEFAULT_PROFILE_DIRECTORY = Path(__file__).resolve().parents[1] / "vllm_profile" / "P_dp0"
 
 
 def number(value):
@@ -276,19 +280,35 @@ def list_runs(runs):
 
 def main(argv=None):
     cli = argparse.ArgumentParser(description=__doc__)
-    cli.add_argument("paths", nargs="+", type=Path, help="Profile directories or individual JSON files")
+    cli.add_argument(
+        "paths", nargs="*", type=Path, help="Profile directories, files, or a number in the default directory"
+    )
     cli.add_argument("--list", action="store_true", help="List captures under one common profile directory")
+    cli.add_argument("--interactive", action="store_true", help="List captures and prompt for a number")
     cli.add_argument("--run", help="Select a one-based capture number, run ID prefix, or result-directory name")
     cli.add_argument("--runs-dir", type=Path, help="Additional directory containing client result directories")
+    cli.add_argument(
+        "--output", type=Path, help="Summary file; interactive/default-directory selection uses ./profile-summary.json"
+    )
     cli.add_argument("--top", type=int, default=3, help="Longest events of each kind per file")
     args = cli.parse_args(argv)
     if args.top < 1:
         cli.error("--top must be positive")
+    default_directory = not args.paths or (len(args.paths) == 1 and str(args.paths[0]).isdecimal())
+    if default_directory:
+        if args.paths:
+            if args.run is not None:
+                cli.error("Supply the capture number once")
+            args.run = str(args.paths[0])
+        args.paths = [DEFAULT_PROFILE_DIRECTORY]
+        args.interactive = args.interactive or (args.run is None and not args.list)
+    if args.interactive and (args.list or args.run is not None):
+        cli.error("Use interactive selection, --list, or a capture number separately")
     # Accept the short DIRECTORY NUMBER form alongside --run and legacy paths.
     if len(args.paths) == 2 and args.run is None and (str(args.paths[1]).isdecimal() or not args.paths[1].exists()):
         args.run = str(args.paths.pop())
     selection = None
-    if args.list or args.run is not None:
+    if args.list or args.interactive or args.run is not None:
         if len(args.paths) != 1 or not args.paths[0].is_dir():
             cli.error("Capture selection requires one existing profile directory")
         if args.runs_dir is not None and not args.runs_dir.is_dir():
@@ -304,6 +324,12 @@ def main(argv=None):
                 cli.error("Use --list or a capture number separately")
             list_runs(runs)
             return
+        if args.interactive:
+            list_runs(runs)
+            try:
+                args.run = input("请输入编号：").strip()
+            except EOFError:
+                cli.error("No capture number was entered")
         try:
             index, run = select_run(runs, args.run)
         except ValueError as error:
@@ -314,6 +340,8 @@ def main(argv=None):
         selection["number"] = index
         selection["profiles"] = list(map(str, run["paths"]))
         args.paths = run["paths"]
+    if args.output is None and (default_directory or args.interactive):
+        args.output = Path("profile-summary.json")
     files = set()
     for path in args.paths:
         if path.is_file():
@@ -335,7 +363,12 @@ def main(argv=None):
             report["traces"].append(trace_summary(path, args.top))
         else:
             cli.error(f"Expected communication.json or trace_view.json: {path}")
-    print(json.dumps(report, ensure_ascii=False, indent=2))
+    summary = json.dumps(report, ensure_ascii=False, indent=2)
+    if args.output is None:
+        print(summary)
+    else:
+        args.output.write_text(summary + "\n", encoding="utf-8")
+        print(f"摘要已保存到 {args.output.resolve()}")
 
 
 if __name__ == "__main__":

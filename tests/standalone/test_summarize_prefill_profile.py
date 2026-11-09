@@ -2,6 +2,9 @@
 
 import importlib.util
 import json
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -214,3 +217,95 @@ def test_incomplete_manifest_leaves_other_captures_available(tool, tmp_path, cap
     ready = next(run for run in runs if run["run_id"] == "ready")
     assert ready["paths"] == workers
     assert "Skipping unreadable capture record" in capsys.readouterr().err
+
+
+def test_no_arguments_prompts_for_number_and_saves_summary(tool, tmp_path, monkeypatch, capsys):
+    profile_root, _, _ = make_capture(tmp_path, "20261109-140000", "old")
+    make_capture(tmp_path, "20261109-150000", "new", new=4096)
+    monkeypatch.setattr(tool, "DEFAULT_PROFILE_DIRECTORY", profile_root)
+    monkeypatch.chdir(tmp_path)
+    prompts = []
+
+    def choose(prompt):
+        prompts.append(prompt)
+        return "2"
+
+    monkeypatch.setattr("builtins.input", choose)
+    tool.main([])
+    assert prompts == ["请输入编号："]
+    report = json.loads((tmp_path / "profile-summary.json").read_text())
+    assert report["selection"]["run_id"] == "new"
+    assert report["selection"]["new_prompt_tokens"] == 4096
+    output = capsys.readouterr().out
+    assert "编号" in output and "摘要已保存到" in output
+
+
+def test_number_only_uses_default_directory_without_prompt(tool, tmp_path, monkeypatch):
+    profile_root, _, _ = make_capture(tmp_path, "20261109-140000", "abcd")
+    monkeypatch.setattr(tool, "DEFAULT_PROFILE_DIRECTORY", profile_root)
+    monkeypatch.setattr("builtins.input", lambda *args: pytest.fail("Unexpected prompt"))
+    monkeypatch.chdir(tmp_path)
+    tool.main(["1"])
+    report = json.loads((tmp_path / "profile-summary.json").read_text())
+    assert report["selection"]["run_id"] == "abcd"
+
+
+def test_explicit_directory_interactive_and_output(tool, tmp_path, monkeypatch):
+    profile_root, _, _ = make_capture(tmp_path, "20261109-140000", "abcd")
+    output = tmp_path / "selected.json"
+    monkeypatch.setattr("builtins.input", lambda prompt: "1")
+    tool.main([str(profile_root), "--interactive", "--output", str(output)])
+    assert json.loads(output.read_text())["selection"]["number"] == 1
+
+
+def test_default_directory_list_does_not_prompt_or_write_summary(tool, tmp_path, monkeypatch):
+    profile_root, _, _ = make_capture(tmp_path, "20261109-140000", "abcd")
+    monkeypatch.setattr(tool, "DEFAULT_PROFILE_DIRECTORY", profile_root)
+    monkeypatch.setattr("builtins.input", lambda *args: pytest.fail("Unexpected prompt"))
+    monkeypatch.chdir(tmp_path)
+    tool.main(["--list"])
+    assert not (tmp_path / "profile-summary.json").exists()
+
+
+def test_number_is_supplied_once(tool, tmp_path, capsys):
+    with pytest.raises(SystemExit) as error:
+        tool.main(["1", "--run", "2"])
+    assert error.value.code == 2
+    assert "Supply the capture number once" in capsys.readouterr().err
+
+
+def test_interactive_eof_does_not_create_summary(tool, tmp_path, monkeypatch, capsys):
+    profile_root, _, _ = make_capture(tmp_path, "20261109-140000", "abcd")
+    monkeypatch.setattr(tool, "DEFAULT_PROFILE_DIRECTORY", profile_root)
+    monkeypatch.chdir(tmp_path)
+
+    def end_input(prompt):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", end_input)
+    with pytest.raises(SystemExit) as error:
+        tool.main([])
+    assert error.value.code == 2
+    assert "No capture number was entered" in capsys.readouterr().err
+    assert not (tmp_path / "profile-summary.json").exists()
+
+
+def test_interactive_script_entry_point_on_cpu(tool, tmp_path):
+    make_capture(tmp_path, "20261109-140000", "abcd")
+    script = tmp_path / "tools" / "summarize_prefill_profile.py"
+    script.parent.mkdir()
+    shutil.copyfile(tool.__file__, script)
+    result = subprocess.run(
+        [sys.executable, "-X", "utf8", str(script)],
+        input="1\n",
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        cwd=tmp_path,
+        check=True,
+        timeout=15,
+    )
+    assert "请输入编号" in result.stdout
+    report = json.loads((tmp_path / "profile-summary.json").read_text())
+    assert report["selection"]["run_id"] == "abcd"
+    assert len(report["traces"]) == 2
