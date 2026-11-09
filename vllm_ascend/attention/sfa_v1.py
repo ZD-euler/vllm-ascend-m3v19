@@ -112,9 +112,8 @@ if TYPE_CHECKING:
 
 # Older ACLNN TransposeBatchMatMul binaries require operand dimensions < 65536.
 TRANSPOSE_BMM_MAX_SUPPORTED_DIM = 65536
-# Compatibility export for model_runner's shared-retrieval graph scheduling.
-# Preserve its overlap policy independently of native V-up's supported shapes.
-BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
+# Bound shared-retrieval overlap independently of native V-up's supported shapes.
+SHARED_RETRIEVAL_MAX_CUBE_TOKENS = 1024
 # Fence the first sparse load once in each worker process by default.
 _LMCACHE_SPARSE_WAIT_SYNC_ONCE = os.getenv("VLLM_ASCEND_LMCACHE_SPARSE_WAIT_SYNC_ONCE", "1").lower() in (
     "1",
@@ -4567,16 +4566,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             AscendAttentionState.SpecDecoding,
         }
 
-        # Join both layer banks before native or fused QKV preparation. Each
-        # connector call waits for every request's load on the compute stream.
-        if self._layerwise_prefill_p_node:
-            wait_for_kv_layer_from_connector(layer_name)
-            if kv_cache is not None and index_lmcache_enabled:
-                with _dsa_prof.section("lmc_index_retrieve"):
-                    wait_for_kv_layer_from_connector(index_layer_name)
-
         # run mlapo ops when dsa-cp is disabled, and ensure that num_tokens satisfies the count limitation
         if self.enable_mlapo and num_input_tokens <= MLAPO_MAX_SUPPORTED_TOKENS:
+            # MLAPO writes latent KV inside the fused projection.
+            if self._layerwise_prefill_p_node:
+                wait_for_kv_layer_from_connector(layer_name)
             hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_with_mlapo(
                 hidden_states=hidden_states,
                 kv_cache=kv_cache,
@@ -4614,9 +4608,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             # would advance the per-request layerwise retriever TWICE per layer
             # (this one with a dense arange) and desync it — skip whenever the
             # batch has decode rows (mixed steps included).
-            if not self._layerwise_prefill_p_node and not (
-                self.dsa_shrink_latent and attn_metadata.num_decode_tokens > 0
-            ):
+            if not (self.dsa_shrink_latent and attn_metadata.num_decode_tokens > 0):
                 wait_for_kv_layer_from_connector(layer_name)
 
             if self.enable_dsa_cp:
@@ -4776,7 +4768,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         if kv_cache is not None and self.has_indexer:
             assert k_li is not None
-            if index_lmcache_enabled and not self._layerwise_prefill_p_node:
+            if index_lmcache_enabled:
                 # A cold shared-cache decode needs prompt index rows before
                 # top-k selection. The group-1 wait is a no-op when resident
                 # and does not advance the group-0 latent-layer cursor.

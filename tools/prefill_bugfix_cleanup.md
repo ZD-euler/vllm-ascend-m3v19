@@ -29,9 +29,9 @@ completion waits previously wrapped in timing code execute at the same point.
 | Default host wait before P bank reuse (`2689771`, LMCache-Ascend) | Already reverted by `4fa23c1` | Keep the normal event-based bank handoff. |
 | Cross-bank source joins | Already removed by `03cf1d6`, LMCache-Ascend | Preserve the current bank-local dependency model. |
 | Runtime diagnostic fences and tracing | Removed in this cleanup | The native V-up fix is retained; diagnostic synchronization and readbacks are retired. |
-| QKV waits for its bank (`12038c21d`) | Kept | QKV writes must follow completion of that bank's preceding transfer. |
+| Early QKV bank wait (`12038c21d`) | Reverted on 2026-11-09 | Ordinary projection uses temporary tensors. Join each bank at its cache-writing operation; MLAPO joins before its fused write. |
 | ACLNN workspace lifetime (`e0bed7b3a`) | Kept | Retain workspace ownership through consumer submission. |
-| Legacy V-up first-allocation fence (`3e64d22a2`) | Kept | Protect the still-callable legacy custom operator from direct tiling writes into reused storage. |
+| Legacy V-up first-allocation fence (`3e64d22a2`) | Removed on 2026-11-09 | Delete the legacy custom operator, tiling storage, bindings, and build entries following upstream v0.28.0.rc1. |
 | Native SFA V-up (`1d712d835`) and startup compatibility (`5c4897c31`) | Kept | This is the final serving path, with operator capability/shape fallback. |
 | `SFA_VUP` branch log (`45cfe2a24`) | Kept | Identify the selected projection branch in actual serving. |
 | Existing first sparse-load synchronization (`67d4c5718`, `90d6c5c73`, July 2026) | Kept | Preserve this earlier default behavior; it is separate from the prefill diagnostic fences. |
@@ -49,7 +49,7 @@ queued reader on the compute stream. The cold-allocation probe observed exactly
 retained-owner, and warm-allocation controls were clean. The native SFA V-up
 backport avoids that legacy tiling initialization path.
 
-## Local validation
+## Validation of the 2026-11-08 cleanup
 
 On Windows with CPU PyTorch, the standalone suites passed:
 
@@ -71,3 +71,34 @@ timed out. NPU serving validation belongs to the target Ascend environment.
 This cleanup changes Python code, tests, and tools. Pull the matching `dev-lmy`
 updates for vllm-ascend, LMCache, and LMCache-Ascend, then restart P/D workers.
 It introduces no C++ build change.
+
+## Follow-up on 2026-11-09
+
+The early P-node wait moves back to each bank's first cache write. Ordinary
+QKV and indexer projection can overlap the pending DMA. Latent writes wait
+before `exec_kv`; indexer writes wait before scatter. MLAPO waits before its
+fused projection/cache write. Bank last-use events keep their original boundary.
+
+The legacy custom V-up operator and its one-time initialization fence are
+removed together, along with obsolete probes. SFA uses native
+`npu_transpose_batchmatmul` or the existing PyTorch fallback. Shared-retrieval
+capability detection checks the native API. Its 1024-token scheduling bound
+is named `SHARED_RETRIEVAL_MAX_CUBE_TOKENS`.
+
+The reload coverage guard compares the requested cached-token count with each
+group's prepared source coverage before H2D submission. For example, a request
+expecting 16384 cached tokens must receive at least 16384 tokens from each
+participating group, except for an explicitly recomputed final token. An
+incomplete source prefix raises an error with the request ID, group and counts.
+
+This follow-up changes C++ registration and build inputs. Rebuild vllm-ascend
+and restart P/D workers to deploy the complete operator removal.
+
+Follow-up CPU validation passed 1350 standalone tests (14 skipped), 199 SFA graph
+tests (3 skipped), and 29 reload-coverage tests. Changed Python files pass parsing
+and undefined-name/unused-variable checks. All 12 explicit CMake source paths
+exist, and the legacy name is absent from implementation and build inputs.
+
+The full repository lint sweep also reports existing formatting/line-length
+issues and a Windows application-control block (4551) for codespell. The changed
+Python sources add no Ruff diagnostics relative to the preceding commit.

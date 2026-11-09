@@ -2967,10 +2967,10 @@ class NPUModelRunner(GPUModelRunner):
                                     group.members[0]: tuple(group.writes) for group in shared_groups
                                 }
                         if graph_inputs is not None and getattr(self._sfa_full_graph, "retrieval_overlap", None) is not None:
-                            from vllm_ascend.attention.sfa_v1 import BMM_TRANS_MAX_SUPPORTED_TOKENS
+                            from vllm_ascend.attention.sfa_v1 import SHARED_RETRIEVAL_MAX_CUBE_TOKENS
 
                             self._sfa_full_graph.retrieval_overlap.prepare(
-                                context.staged_sfa_graph_key, impls, shared_groups, BMM_TRANS_MAX_SUPPORTED_TOKENS,
+                                context.staged_sfa_graph_key, impls, shared_groups, SHARED_RETRIEVAL_MAX_CUBE_TOKENS,
                             )
                         self._sfa_full_graph.bind_sources(source, request_ids)
                         prepared_call = self._sfa_full_graph.prepare_run(graph_inputs=graph_inputs, **graph_kwargs)

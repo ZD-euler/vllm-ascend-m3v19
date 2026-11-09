@@ -9,6 +9,7 @@ from types import SimpleNamespace as NS
 
 import numpy as np
 import pytest
+import torch
 
 ROOT = Path(__file__).resolve().parents[2] / "vllm_ascend"
 
@@ -72,99 +73,101 @@ def test_compact_scratch_policy_excludes_only_banked_p(builder, p_node, unbundle
 @pytest.mark.parametrize("mlapo", [False, True])
 @pytest.mark.parametrize("has_indexer", [False, True])
 @pytest.mark.parametrize("decode_rows", [0, 1, 2, 4])
-def test_bank_waits_precede_p_qkv_and_preserve_d_order(p_node, mlapo, has_indexer, decode_rows):
-    # Single-token prefill tails and P-side MTP can be classified as decode.
-    # Execute the shared wait gate, actual QKV dispatch and both old wait sites.
+def test_bank_waits_follow_native_qkv_and_protect_cache_writes(p_node, mlapo, has_indexer, decode_rows):
     forward = method("attention/sfa_v1.py", "AscendSFAImpl", "forward")
-    dispatch_index = next(
-        i
-        for i, node in enumerate(forward.body)
+    dispatch = deepcopy(next(
+        node for node in forward.body
         if isinstance(node, ast.If) and "self.enable_mlapo" in ast.unparse(node.test)
-    )
-    early_wait = forward.body[dispatch_index - 1]
-    assert ast.unparse(early_wait.test) == "self._layerwise_prefill_p_node"
-    dispatch = deepcopy(forward.body[dispatch_index])
+    ))
     first_cache_write = next(i for i, node in enumerate(dispatch.orelse) if calls(node, "exec_kv"))
-    dispatch.orelse = dispatch.orelse[:first_cache_write]
+    dispatch.orelse = dispatch.orelse[:first_cache_write + 1]
     index_write = next(
-        node
-        for node in forward.body
+        node for node in forward.body
         if isinstance(node, ast.If) and ast.unparse(node.test) == "kv_cache is not None and self.has_indexer"
     )
-    late_index_wait = deepcopy(index_write)
-    late_index_wait.body = [
-        next(
-            node
-            for node in index_write.body
-            if isinstance(node, ast.If) and "wait_for_kv_layer_from_connector" in ast.unparse(node)
-        )
-    ]
-
     obj = initialized_shrink(p_node, 2)
     obj.enable_mlapo = mlapo
     obj.has_indexer = has_indexer
-    obj.q_lora_rank = 1
-    obj.kv_lora_rank = 1
-    obj.qk_rope_head_dim = 1
+    obj.q_lora_rank = obj.kv_lora_rank = obj.qk_rope_head_dim = 1
     obj.q_a_layernorm = lambda tensor: tensor
+    obj.enable_dsa_cp = True
+    obj.use_sparse_c8_indexer = False
+    obj.is_kv_producer = False
     operations = []
+    value = torch.zeros(4, 1)
 
     def wait(layer_name):
         assert layer_name not in operations, "Duplicate wait advances a retriever twice"
         operations.append(layer_name)
 
-    def prepare_qkv(kind):
+    def write_latent(*args, **kwargs):
         if p_node:
-            assert operations == (["latent", "indexer"] if has_indexer else ["latent"])
-        operations.append(kind)
+            assert "latent" in operations
+        operations.append("write_latent")
+        return value, value
 
     def project(tensor):
-        prepare_qkv("native_qkv")
-        return (NS(split=lambda *args, **kwargs: (object(), object())),)
+        assert "latent" not in operations and "indexer" not in operations
+        operations.append("native_qkv")
+        return (NS(split=lambda *args, **kwargs: (value, value)),)
 
     project.weight = object()
     obj.fused_qkv_a_proj = project
+    obj.exec_kv = write_latent
 
     def preprocess(**kwargs):
-        prepare_qkv("mlapo_qkv")
-        return 1, 2, 3, 4
+        if p_node:
+            assert operations == ["latent"]
+        operations.append("mlapo_qkv")
+        write_latent()
+        return value, value, value, value
 
     obj._sfa_preprocess_with_mlapo = preprocess
 
     def indexer_preprocess(**kwargs):
+        assert "indexer" not in operations
         operations.append("indexer_qkv")
-        return object(), None
+        return value, None
+
+    def write_index(*args):
+        assert "indexer" in operations
+        operations.append("write_index")
 
     obj.indexer_select_pre_process = indexer_preprocess
     namespace = dict(
         self=obj,
-        attn_metadata=NS(num_decode_tokens=decode_rows),
+        attn_metadata=NS(num_decode_tokens=decode_rows, num_actual_tokens=4),
         layer_name="latent",
         index_layer_name="indexer",
         index_lmcache_enabled=has_indexer,
-        hidden_states=object(),
-        kv_cache=object(),
-        cos=object(),
-        sin=object(),
-        slot_mapping=object(),
+        hidden_states=value,
+        kv_cache=(value, value, value),
+        cos=value,
+        sin=value,
+        slot_mapping=torch.arange(4),
+        idx_slot_mapping=torch.arange(4),
+        slot_mapping_cp=torch.arange(4),
         num_input_tokens=4,
         MLAPO_MAX_SUPPORTED_TOKENS=16,
-        kv_hash_trace=False,
         _dsa_prof=NS(section=lambda name: nullcontext()),
         get_weight_prefetch_method=lambda: NS(maybe_prefetch_mla_or_sla_weight_in_current_stream=lambda **kwargs: None),
         wait_for_kv_layer_from_connector=wait,
+        torch_npu=NS(npu_scatter_nd_update_=write_index),
     )
-    execute([early_wait, dispatch, late_index_wait], namespace)
-    expected = ["mlapo_qkv" if mlapo else "native_qkv"]
-    if has_indexer:
-        expected.append("indexer_qkv")
-    if p_node:
-        expected = (["latent", "indexer"] if has_indexer else ["latent"]) + expected
-    else:
-        if not mlapo and decode_rows == 0:
-            expected.append("latent")
+    execute([dispatch, index_write], namespace)
+    if mlapo:
+        expected = (["latent"] if p_node else []) + ["mlapo_qkv", "write_latent"]
         if has_indexer:
-            expected.append("indexer")
+            expected.append("indexer_qkv")
+    else:
+        expected = ["native_qkv"]
+        if has_indexer:
+            expected.append("indexer_qkv")
+        if p_node or decode_rows == 0:
+            expected.append("latent")
+        expected.append("write_latent")
+    if has_indexer:
+        expected.extend(["indexer", "write_index"])
     assert operations == expected
 
 
@@ -197,10 +200,10 @@ def test_p_does_not_remap_full_bank_topk_to_decode_scratch(p_node, remaps):
 
 
 @pytest.mark.parametrize("p_node", [False, True])
-def test_mlapo_uses_same_preprocessing_after_shared_wait_gate(p_node):
+def test_mlapo_waits_only_for_its_latent_bank_before_cache_write(p_node):
     forward = method("attention/sfa_v1.py", "AscendSFAImpl", "forward")
     outer = next(n for n in forward.body if isinstance(n, ast.If) and "self.enable_mlapo" in ast.unparse(n.test))
-    dispatch = outer.body[0]
+    dispatch = outer.body[:2]
     seen = []
 
     def preprocess(**kwargs):
@@ -219,10 +222,11 @@ def test_mlapo_uses_same_preprocessing_after_shared_wait_gate(p_node):
         layer_name="layer",
         attn_metadata=object(),
     )
-    execute([dispatch], ns)
-    assert [entry[0] for entry in seen] == ["legacy"]
+    ns["wait_for_kv_layer_from_connector"] = lambda name: seen.append(("wait", name))
+    execute(dispatch, ns)
+    assert [entry[0] for entry in seen] == (["wait"] if p_node else []) + ["legacy"]
     assert ns["ql_nope"] == 2
-    assert "layer_name" not in seen[0][1]
+    assert "layer_name" not in seen[-1][1]
 
 
 @pytest.mark.parametrize("p_node", [False, True])

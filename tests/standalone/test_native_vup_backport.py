@@ -1,17 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Execute serving V-up and its complete short probe with real CPU tensors."""
+"""Exercise native serving V-up with real CPU tensors."""
 
 import ast
-import json
 import sys
 from functools import lru_cache
+from pathlib import Path
 from types import ModuleType
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
 
 import pytest
 import torch
-from test_prefill_vup_init_race import PROBE, ROOT, CpuRuntime
+
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def serving_projection(native_available=True, native_error=False):
@@ -84,124 +85,16 @@ def test_fallback_keeps_bmm_and_propagates_native_errors(native_available, dtype
     assert len(calls) == 1
 
 
-class CpuServingRuntime(CpuRuntime):
-    def __init__(self, *, native_available=True):
-        super().__init__(overwrite=False)
-        self.projection_branch = "npu_transpose_batchmatmul" if native_available else "native_torch_bmm"
-        projection, self.calls = serving_projection(native_available)
-        self.adapter = PROBE.NpuRuntime(NS(npu=self), None, projection, self.projection_branch)
-
-    def project(self, a, b, out):
-        super().project(a, b, out)
-        self.adapter.project(a, b, out)
 
 
-@pytest.mark.parametrize("mode", PROBE.MODES)
-@pytest.mark.parametrize("native_available", [True, False])
-def test_entire_serving_cli_with_deferred_dma_and_nonzero_oracle(monkeypatch, tmp_path, capsys, mode, native_available):
-    runtime = CpuServingRuntime(native_available=native_available)
-    monkeypatch.setattr(PROBE, "load_runtime", lambda args: runtime)
-    output = tmp_path / "nested" / "result.json"
-    result = PROBE.main(
-        [
-            "--mode",
-            mode,
-            "--tokens",
-            "3",
-            "--heads",
-            "2",
-            "--backlog-size",
-            "16",
-            "--backlog-ops",
-            "2",
-            "--output",
-            str(output),
-        ]
-    )
-    report = json.loads(output.read_text())
-    assert result == report["exit_code"] == 0
-    assert report["operator"] == "serving"
-    assert report["projection_branch"] == runtime.projection_branch
-    assert report["changed_bytes"] == 0
-    assert report["numerical"] == {
-        "passed": True,
-        "cases": [{"tokens": n, "passed": True} for n in (1, 3, 1536)],
-    }
-    assert report["reader_pending_after_vup"] == (mode != "sync")
-    assert report["project_call_ms"] >= 0
-    records = [json.loads(line.removeprefix("[VUP_INIT] ")) for line in capsys.readouterr().out.splitlines()]
-    assert records[-1] == {"event": "result", **report}
 
 
-def test_failed_nonzero_oracle_sets_failure_exit(monkeypatch, tmp_path):
-    runtime = CpuRuntime(overwrite=False)
-    monkeypatch.setattr(PROBE, "load_runtime", lambda args: runtime)
-    output = tmp_path / "bad.json"
-    assert (
-        PROBE.main(["--mode", "cold", "--tokens", "2", "--heads", "1", "--backlog-size", "16", "--output", str(output)])
-        == 2
-    )
-    report = json.loads(output.read_text())
-    assert report["output_zero"] is True
-    assert report["numerical"]["passed"] is False
-    assert report["status"] == "projection_failed"
 
 
-def test_large_serving_probe_has_no_legacy_slot():
-    args = PROBE.parse_args(["--mode", "cold", "--tokens", "1536", "--heads", "1", "--backlog-size", "16"])
-    report = PROBE.run_probe(CpuServingRuntime(), args)
-    assert report["exit_code"] == 0
-    assert report["changed_bytes"] == 0
-    assert report["candidate_write_address"] is None
-    assert report["slot_shape_words"] is None
-    with pytest.raises(SystemExit):
-        PROBE.parse_args(["--mode", "cold", "--operator", "legacy", "--tokens", "1536"])
 
 
-def test_default_glm_projection_shapes_and_numerical_inputs_on_cpu():
-    runtime = CpuServingRuntime()
-    args = PROBE.parse_args(["--mode", "cold", "--backlog-size", "16", "--backlog-ops", "1"])
-    assert args.heads == 64 and args.tokens == 384
-    report = PROBE.run_probe(runtime, args)
-    assert report["exit_code"] == 0
-    numerical = PROBE.validate_projection(runtime, args)
-    assert numerical == {
-        "passed": True,
-        "cases": [{"tokens": n, "passed": True} for n in (1, 384, 1536)],
-    }
 
 
-@pytest.mark.parametrize("operator,native_available", [("legacy", False), ("serving", False), ("serving", True)])
-def test_runtime_imports_and_reports_selected_operator(monkeypatch, operator, native_available):
-    loaded = []
-    projection, _ = serving_projection()
-    fake_torch = NS(
-        __version__="cpu-test",
-        npu=NS(set_device=lambda device: loaded.append(device)),
-        ops=NS(_C_ascend=NS(batch_matmul_transpose=object())),
-    )
-    fake_npu = NS(__version__="cpu-test")
-    if native_available:
-        fake_npu.npu_transpose_batchmatmul = object()
-    modules = {
-        "torch": fake_torch,
-        "torch_npu": fake_npu,
-        "vllm_ascend.platform": NS(NPUPlatform=NS(import_kernels=lambda: loaded.append("kernels"))),
-        "vllm_ascend.vllm_ascend_C": NS(),
-        "lmcache_ascend.c_ops": NS(layerwise_prefill_dma_copy=object()),
-        "vllm_ascend.attention.sfa_v1": NS(AscendSFAImpl=NS(_v_up_proj=projection)),
-    }
-    for name, module in modules.items():
-        monkeypatch.setitem(sys.modules, name, module)
-    runtime = PROBE.load_runtime(PROBE.parse_args(["--mode", "cold", "--operator", operator]))
-    assert loaded == ["kernels", 0]
-    assert (runtime.projection is projection) == (operator == "serving")
-    expected = (
-        "legacy_batch_matmul_transpose"
-        if operator == "legacy"
-        else ("npu_transpose_batchmatmul" if native_available else "native_torch_bmm")
-    )
-    assert runtime.projection_branch == expected
 
 
 @pytest.mark.parametrize("tokens", [384, 1536])
