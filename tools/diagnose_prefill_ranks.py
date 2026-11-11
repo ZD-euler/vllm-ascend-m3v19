@@ -12,7 +12,6 @@ Current /proc observations are labelled separately from historical profiles.
 
 import argparse
 import json
-import re
 import subprocess
 import sys
 import time
@@ -20,6 +19,7 @@ from collections import Counter, defaultdict
 from contextlib import suppress
 from pathlib import Path
 
+import regex as re
 import summarize_prefill_profile as summary
 
 
