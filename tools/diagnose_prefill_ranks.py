@@ -47,6 +47,11 @@ def union_duration(intervals):
     return total
 
 
+def profile_pid(path):
+    match = re.search(r"_rank(\d+)_(\d+)_", str(path))
+    return int(match[2]) if match else None
+
+
 def trace_report(path, alignment):
     origin = alignment["first_start_us"]
     end = origin + max(row["start_offset_ms"] for row in alignment["ranks"]) * 1000
@@ -138,10 +143,9 @@ def trace_report(path, alignment):
                     "largest_gaps": sorted(gaps, key=lambda gap: gap["duration_ms"], reverse=True)[:3],
                 }
             )
-    match = re.search(r"_rank(\d+)_(\d+)_", str(path))
     return {
         "rank": summary.profile_rank(path),
-        "profile_pid": int(match[2]) if match else None,
+        "profile_pid": profile_pid(path),
         "trace": str(path.resolve()),
         "window_start_offset_ms": origin_window[0],
         "window_end_offset_ms": origin_window[1],
@@ -166,7 +170,18 @@ def command_output(command):
 
 
 def status_fields(path):
-    allowed = {"Name", "Pid", "Tgid", "Threads", "Cpus_allowed_list", "Mems_allowed_list", "VmRSS", "VmLck"}
+    allowed = {
+        "Name",
+        "Pid",
+        "PPid",
+        "Tgid",
+        "NSpid",
+        "Threads",
+        "Cpus_allowed_list",
+        "Mems_allowed_list",
+        "VmRSS",
+        "VmLck",
+    }
     return {
         key: value.strip()
         for line in path.read_text().splitlines()
@@ -183,6 +198,10 @@ def process_snapshot(pid, proc_root=Path("/proc")):
     except OSError as error:
         return {"pid": pid, "status": "unavailable", "error": str(error)}
     result = {"pid": pid, "status": "current_observation", "process": status}
+    with suppress(OSError):
+        result["command"] = [
+            field.decode(errors="replace") for field in (root / "cmdline").read_bytes().split(b"\0") if field
+        ]
     try:
         wanted = {"RANK", "LOCAL_RANK", "ASCEND_RT_VISIBLE_DEVICES", "ASCEND_VISIBLE_DEVICES", "CPU_AFFINITY_CONF"}
         environment = {}
@@ -283,17 +302,22 @@ def main(argv=None):
     alignments = summary.collective_alignment(communications, 3)
     if not alignments or any(row["matched_profiles"] != len(files) for row in alignments):
         raise ValueError("The selected capture lacks matching collectives on every rank")
+    profile_pids = set()
+    for path in files:
+        pid = profile_pid(path)
+        if pid is not None:
+            profile_pids.add(pid)
+    current_machine = machine_snapshot(profile_pids)
     reports = []
     for path in files:
         trace = path.with_name("trace_view.json")
         print(f"Reading rank {summary.profile_rank(path)} from {trace}", file=sys.stderr, flush=True)
         reports.append(trace_report(trace, alignments[0]))
-    profile_pids = {row["profile_pid"] for row in reports if row["profile_pid"] is not None}
     report = {
         "run_id": selected["run_id"],
         "collective_alignment": alignments,
         "ranks": reports,
-        "current_machine": machine_snapshot(profile_pids),
+        "current_machine": current_machine,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

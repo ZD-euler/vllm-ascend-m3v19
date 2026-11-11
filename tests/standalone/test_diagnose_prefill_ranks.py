@@ -74,14 +74,26 @@ def test_same_stream_event_wait_is_reported(tool, tmp_path):
     assert result["copy_streams"][0]["copy_active_ms"] == pytest.approx(0.04)
 
 
-def test_process_numa_snapshot_and_missing_process(tool, tmp_path):
+@pytest.mark.parametrize("with_command", [False, True])
+def test_process_numa_snapshot_and_missing_process(tool, tmp_path, with_command):
     root = tmp_path / "42"
     (root / "task" / "42").mkdir(parents=True)
-    status = "Name:\tworker\nPid:\t42\nCpus_allowed_list:\t0-3\nMems_allowed_list:\t0,1\n"
+    status = (
+        "Name:\tVLLM::Worker_DP\nPid:\t42\nPPid:\t40\nNSpid:\t1042\t42\n"
+        "Cpus_allowed_list:\t0-3\nMems_allowed_list:\t0,1\n"
+    )
     (root / "status").write_text(status)
     (root / "task" / "42" / "status").write_text(status)
     (root / "numa_maps").write_text("1000 bind:1 anon=512 N1=512 kernelpagesize_kB=4\n")
+    if with_command:
+        (root / "cmdline").write_bytes(b"VLLM::Worker_DP0_TP2_EP2\0")
     result = tool.process_snapshot(42, tmp_path)
+    assert result["process"]["NSpid"] == "1042\t42"
+    assert result["process"]["PPid"] == "40"
+    if with_command:
+        assert result["command"] == ["VLLM::Worker_DP0_TP2_EP2"]
+    else:
+        assert "command" not in result
     assert result["memory_numa_MiB"] == {"1": 2}
     assert result["threads"][0]["Cpus_allowed_list"] == "0-3"
     assert tool.process_snapshot(43, tmp_path)["status"] == "unavailable"
@@ -116,7 +128,20 @@ def test_full_existing_profile_workflow(tool, monkeypatch, tmp_path):
     manifest = tmp_path / "prefill-profile-test"
     manifest.mkdir()
     (manifest / "result.json").write_text(json.dumps({"run_id": "test-run", "raw_profiles": paths}))
-    monkeypatch.setattr(tool, "machine_snapshot", lambda pids: {"profile_pids": sorted(pids)})
+    observations = []
+
+    def machine_snapshot(pids):
+        observations.append("machine")
+        return {"profile_pids": sorted(pids)}
+
+    original_trace_report = tool.trace_report
+
+    def trace_report(path, alignment):
+        assert observations == ["machine"]
+        return original_trace_report(path, alignment)
+
+    monkeypatch.setattr(tool, "machine_snapshot", machine_snapshot)
+    monkeypatch.setattr(tool, "trace_report", trace_report)
     destination = tmp_path / "diagnosis.json"
     tool.main(
         ["--profile-root", str(root), "--runs-dir", str(tmp_path), "--run", "test-run", "--output", str(destination)]
