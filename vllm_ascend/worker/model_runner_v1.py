@@ -5100,6 +5100,15 @@ class NPUModelRunner(GPUModelRunner):
                 "after graph capture has started; restart the worker to rebuild "
                 "captured addresses."
             )
+        for group in kv_cache_config.kv_cache_groups:
+            spec = group.kv_cache_spec
+            layer_specs = spec.kv_cache_specs.values() if isinstance(spec, UniformTypeKVCacheSpecs) else (spec,)
+            for layer_spec in layer_specs:
+                packed_main = getattr(layer_spec, "cache_sparse_sfa_c8", False)
+                if type(packed_main) is not bool:
+                    raise ValueError("Packed main C8 marker must be a boolean")
+                if packed_main:
+                    raise ValueError("Packed main C8 KV cache is not enabled in the production runner.")
         self._validate_dsa_compact_startup_policy(kv_cache_config)
         self._validate_sfa_layerwise_connector_cudagraph_mode()
         kv_cache_config = deepcopy(kv_cache_config)
