@@ -108,6 +108,7 @@ from vllm_ascend.worker.dsa_shared_pool import MixedIndexerMetadata
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
 if TYPE_CHECKING:
+    from vllm.v1.core.dsa_shared_pool import DSASharedBlockLayout
     from vllm.v1.core.sched.output import SchedulerOutput
 
 # Older ACLNN TransposeBatchMatMul binaries require operand dimensions < 65536.
@@ -1061,7 +1062,36 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         device: torch.device,
         metadata_cls: type[AscendSFAMetadata] | None = None,
         supports_dcp_with_varlen: bool = False,
+        *,
+        shared_pool_layout: "DSASharedBlockLayout | None" = None,
     ):
+        layerwise_prefill_p_node = bool(
+            vllm_config.kv_transfer_config is not None
+            and vllm_config.kv_transfer_config.is_kv_producer
+            and envs.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
+        )
+        ascend_config = get_ascend_config()
+        block_map = getattr(ascend_config, "indexer_hbm_block_map", None)
+        mixed_indexer = getattr(ascend_config, "indexer_c8_shared_block_factor", 1) == 2
+        packed_main = getattr(kv_cache_spec, "cache_sparse_sfa_c8", False)
+        if type(packed_main) is not bool:
+            raise ValueError("Packed main C8 marker must be a boolean")
+        if packed_main and shared_pool_layout is None:
+            raise ValueError("Packed main C8 SFA metadata requires a shared-pool layout")
+        if shared_pool_layout is not None:
+            from vllm.v1.core.dsa_shared_pool import DSAPackedMainC8PrefillLayout
+
+            if (
+                not packed_main
+                or not layerwise_prefill_p_node
+                or not mixed_indexer
+                or block_map is not None
+                or not isinstance(shared_pool_layout, DSAPackedMainC8PrefillLayout)
+                or shared_pool_layout.latent_page_size_bytes != kv_cache_spec.page_size_bytes
+                or kv_cache_spec.block_size != vllm_config.cache_config.block_size
+            ):
+                raise ValueError("Packed main C8 SFA metadata requires a matching mixed-indexer prefill shared pool")
+
         super().__init__(
             kv_cache_spec,
             layer_names,
@@ -1073,20 +1103,14 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
 
         self.block_size = vllm_config.cache_config.block_size
         self.max_blocks = (vllm_config.model_config.max_model_len + self.block_size - 1) // self.block_size
-        self._layerwise_prefill_p_node = bool(
-            vllm_config.kv_transfer_config is not None
-            and vllm_config.kv_transfer_config.is_kv_producer
-            and envs.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
-        )
+        self._layerwise_prefill_p_node = layerwise_prefill_p_node
         self._mixed_indexer_metadata = None
-        ascend_config = get_ascend_config()
-        if getattr(ascend_config, "indexer_c8_shared_block_factor", 1) == 2 and (
-            getattr(ascend_config, "indexer_hbm_block_map", None) is None
-            or any(ascend_config.indexer_c8_layer_mask(layer_names))
-        ):
+        if mixed_indexer and (block_map is None or any(ascend_config.indexer_c8_layer_mask(layer_names))):
             # A BF16-only draft/consumer builder never uses physical C8 metadata.
-            block_map = getattr(ascend_config, "indexer_hbm_block_map", None)
-            blocks_per_bundle = 18 if block_map is not None or self._layerwise_prefill_p_node else 9
+            if shared_pool_layout is not None:
+                blocks_per_bundle = shared_pool_layout.indexer_blocks_per_bundle
+            else:
+                blocks_per_bundle = 18 if block_map is not None or self._layerwise_prefill_p_node else 9
             self._mixed_indexer_metadata = MixedIndexerMetadata(
                 vllm_config.scheduler_config.max_num_seqs + 1,
                 (self.max_blocks + blocks_per_bundle - 1) // blocks_per_bundle * blocks_per_bundle,
