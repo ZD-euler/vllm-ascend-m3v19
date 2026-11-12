@@ -2007,11 +2007,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.local_num_heads = self.num_heads
         self.vllm_config = get_current_vllm_config()
         self.block_size = self.vllm_config.cache_config.block_size
-        int(
-            self.vllm_config.model_config.get_num_layers(
-                self.vllm_config.parallel_config
-            )
-        )
         speculative_config = self.vllm_config.speculative_config
         self.decode_threshold = 1 + (
             speculative_config.num_speculative_tokens

@@ -99,8 +99,6 @@ MAX_SPLIT_TRANSFER_ID_LENGTH = 64
 SPLIT_DONE_MAX_ATTEMPTS = 3
 CONTROL_ACK_MAX_ATTEMPTS = 3
 THREAD_SHUTDOWN_TIMEOUT = 30.0
-def _cold_live_log(event: str, **fields: Any) -> None:
-    return
 
 
 class RemotePortInfo(TypedDict):

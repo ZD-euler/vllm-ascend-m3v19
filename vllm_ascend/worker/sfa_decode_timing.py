@@ -259,8 +259,6 @@ def install_decode_timing(worker, connector, *, prompt_tokens: int, event_factor
             ("finalize_kv_connector", "kv.finalize", False),
         ):
             timing.observe(runner, method, stage, device=device)
-        if hasattr(runner, "rejection_sampler"):
-            pass
         if hasattr(runner, "model"):
             timing.observe(runner.model, "compute_logits", "target.compute_logits", device=True)
         for method, stage in (

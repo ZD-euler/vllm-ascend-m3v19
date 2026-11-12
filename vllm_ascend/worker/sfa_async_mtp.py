@@ -221,7 +221,6 @@ class AsyncSFAModelRunner(NPUModelRunner):
             or self.debugger is not None
             or self.num_prompt_logprobs
             or self.dynamic_eplb
-            or None
             or not batch.sampling_metadata.no_penalties
             or batch.sampling_metadata.bad_words_token_ids
             or s.metadata[s.target_name].decode_remap_boundary_buffer._values != s.boundary_values
@@ -421,8 +420,6 @@ class AsyncSFAModelRunner(NPUModelRunner):
                 common.num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu_tensor[: common.num_reqs]
                 common.max_seq_len = int(self.seq_lens.np[: len(s.ids)].max())
                 self.async_mtp_replays += 1
-                if self.async_mtp_replays == 1:
-                    pass
             self._remember(seed=not deferred)
             return output
         except BaseException:

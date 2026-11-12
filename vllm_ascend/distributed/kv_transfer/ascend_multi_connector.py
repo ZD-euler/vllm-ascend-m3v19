@@ -32,10 +32,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _cold_live_log(event: str, **fields: Any) -> None:
-    pass
-
-
 def _is_single_tensor_kv(kv_cache: Any) -> bool:
     return isinstance(kv_cache, (tuple, list)) and len(kv_cache) < 2
 
