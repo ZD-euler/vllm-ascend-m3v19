@@ -9,16 +9,21 @@
 自己的完整回答，就发送自己的下一轮，不等待其他会话。每个会话最多一个在途请求，
 可同时出现会话 0 在第 2 轮、会话 1 在第 5 轮；只有预热阶段有全局屏障。
 
-每个会话自己的输入始终是：
+默认使用 `--prompt-format native`，通过 proxy 的 `/v1/chat/completions` 发送标准
+`messages`。第一条 user 消息包含会话标记和文章，之后只追加上一轮实际返回的
+assistant 消息和本轮预写 user 问题，已有消息不修改、不删减。
 
-```text
-本轮输入 = 上轮完整输入 + 上轮实际输出 + 本轮预写问题及角色分隔符
-```
+模板由 P/D 服务按正常 chat 接口处理，客户端不再调用 `/tokenize`，不自行拼接角色
+标记，不强制关闭思考。`chat_template_kwargs` 只设置 `clear_thinking=false`，保留历史
+思考。流式返回的 `reasoning`（兼容 `reasoning_content`）与 `content` 分开保存，
+下一轮一并发送。只有思考、正常结束的空回复、或达到 `max_tokens` 的回复也可继续下一轮；
+网络错误和不完整响应仍会停止测试，不自动重试。
 
-会话开头加入固定的 `session=编号; timestamp_ns=时间戳; run=运行编号`。
-不同会话、不同运行的前缀不同，防止互相复用整篇文章的缓存；同一会话的标记
-在所有轮次保持不变，不会为隔离会话而破坏它自己的历史 KV 复用。
-使用 `/v1/completions`，保留回答的原始空白，不重新套 chat template、摘要或截断历史。
+会话第一条 user 消息开头加入固定的 `session=编号; timestamp_ns=时间戳; run=运行编号`。
+不同会话、不同运行的前缀不同；同一会话所有轮次使用同一个标记。
+由模型原生模板处理消息边界，缓存命中量以服务端 `cached_tokens` 为准。
+`--prompt-format legacy` 保留原来的 `/v1/completions` 纯文本追加测试。
+切换消息格式需要重新预热。
 
 ## 运行
 
@@ -35,7 +40,9 @@ python3 tools/multi_turn_kv_reuse_concurrent.py \
   2>&1 | tee multi-turn-c4-200k.log
 ```
 
-- `--base-url` 是服务或 PD proxy 地址，末尾带 `/v1` 也可。
+- `--base-url` 是生成服务或 PD proxy 地址，末尾带 `/v1` 也可。
+- native 模式只需要 proxy 地址；不需要直接 P 地址或额外的模板预检查。
+  旧命令中的 `--tokenizer-url` 为兼容保留，已经不使用。
 - `--model-name` 对应服务的 `--served-model-name`；省略时通过 `/v1/models` 发现模型。
 - `--concurrency` 默认 1；4 表示 4 个独立会话。默认每个会话先预热一次，再测 50 轮，
   共发出 `4 × (1 + 50)` 个请求，指标中只有 `4 × 50` 个后续请求。
@@ -45,7 +52,8 @@ python3 tools/multi_turn_kv_reuse_concurrent.py \
 - 截短文章后追加固定阅读问题；会话标记和阅读问题会增加少量 token。
   真实初始长度以预热响应的 `prompt_tokens` 为准。文章不足目标长度时不补长。
 - 该长度只控制初始文章。后续保留全部历史，随着回答和问题逐轮增长，不反复截断到 200k。
-- 不传 `--context-tokens` 时使用完整预写文章，约 500k token，不需要 tokenizer。
+- 不传 `--context-tokens` 时使用完整预写文章，约 500k token，不需要本地 tokenizer 文件；
+  服务端在处理 chat 请求时应用自己的模板。
 - `--rounds` 是预热后的测量轮数，默认 50；`--rounds 0` 只预热。
 - `--max-tokens` 默认 128，需要长回答可改为 4000。HTTP socket timeout 默认 3600 秒，
   可用 `--timeout` 修改。服务上下文上限需容纳文章、所有历史以及当前回答预算。
@@ -73,7 +81,7 @@ python3 tools/multi_turn_kv_reuse_concurrent.py \
 `sessions` 分别记录各会话的 `completed_followup_rounds`；根级同名字段是所有会话
 进度的最小值，只表示大家都已完成到哪一轮，不用于阻止快会话继续发送。
 
-TTFT 从开始发送 HTTP 请求到收到第一个非空文本增量，包含上传、排队、模型计算、
+TTFT 从开始发送 HTTP 请求到收到第一个非空思考或正文增量，包含上传、排队、模型计算、
 PD 交接和网络时间。它不是纯 NPU prefill 时间。平均 token 间隔按首末文本增量间隔
 除以 `completion_tokens - 1` 估计；MTP、流式合并和网络缓冲会影响该估计。
 
@@ -88,14 +96,18 @@ sessions/000/                并发大于 1 时，每会话独立目录
   turns/001/ ... 050/        后续轮次
     added_input.txt          本轮增加的问题
     output.txt               本轮实际输出
-    request.json             请求元数据，不重复保存整篇文章
+    request.json             请求元数据、消息格式和模板参数
+    assistant_message.json  原始 assistant 正文和思考，供下一轮及 replay 使用
     response.json            完整响应及 usage
     events.jsonl             原始流式事件
 ```
 
 并发为 1 时，`session_prefix.txt`、`turns/` 直接放在输出根目录。
-重建任一会话输入：固定会话标记 + 公共初始文章 + 此会话之前的实际回答和追加问题。
-重新分词时拼接边界附近少量 token 可能变化，字符相同不保证 token 前缀完全相同。
+native 模式由初始文章、会话标记、每轮 `assistant_message.json` 和
+`added_input.txt` 重建标准 messages；`prefill_kv_replay.py` 自动识别此格式。
+`output.txt` 和终端打印保留按流式顺序接收的思考及正文；结构化字段以
+`assistant_message.json` 为准。`prompt_chars` / `new_input_chars` 统计这些消息正文的
+字符数，不含模板控制标记。旧 legacy 和 token-list 归档仍可读取。
 
 ## 只画 TTFT，不读服务端日志
 

@@ -22,6 +22,8 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from multi_turn_chat import AssistantStream, NativeDialogue, add_chat_arguments, complete_chat, initial_user_text
+
 QUESTION_PREFIX = "\n\n用户："
 QUESTION_SUFFIX = "\n助手：\n"
 DEFAULT_ROUNDS = 50
@@ -86,8 +88,11 @@ class Client:
         return models[0]["id"]
 
     def complete(self, payload: dict[str, Any], directory: Path) -> tuple[str, dict[str, Any]]:
+        chat = "messages" in payload
+        assistant = AssistantStream(chat)
+        endpoint = "/v1/chat/completions" if chat else "/v1/completions"
         request = urllib.request.Request(
-            self.base_url + "/v1/completions",
+            self.base_url + endpoint,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
         )
@@ -119,9 +124,7 @@ class Client:
                 for choice in event.get("choices", []):
                     if choice.get("index", 0) != 0:
                         raise RuntimeError("Expected exactly one completion choice")
-                    text = choice.get("text", "")
-                    if not isinstance(text, str):
-                        raise RuntimeError("Completion text must be a string")
+                    text = assistant.take(choice)
                     if text:
                         if first_text is None:
                             first_text = received
@@ -136,19 +139,28 @@ class Client:
             directory / "response.json",
             {
                 "id": response_id,
-                "choices": [{"index": 0, "text": text, "finish_reason": finish_reason}],
+                "choices": [
+                    {
+                        "index": 0,
+                        "text": text,
+                        "finish_reason": finish_reason,
+                        **({"message": assistant.message()} if chat else {}),
+                    }
+                ],
                 "usage": usage,
                 "stream_done": done,
             },
         )
+        if chat:
+            save_json(directory / "assistant_message.json", assistant.message())
         if not done or finish_reason not in ("stop", "length"):
             raise RuntimeError(f"Incomplete completion: done={done}, finish_reason={finish_reason!r}")
-        if not text:
+        if not text and not chat:
             raise RuntimeError("Completion returned no text; the next round was not sent")
         details = usage.get("prompt_tokens_details") or {}
         prompt_tokens, completion_tokens = usage.get("prompt_tokens"), usage.get("completion_tokens")
         cached_tokens = details.get("cached_tokens")
-        generation_s = last_text - first_text
+        generation_s = last_text - first_text if first_text is not None else None
         stats = {
             "response_id": response_id,
             "prompt_tokens": prompt_tokens,
@@ -158,11 +170,11 @@ class Client:
                 prompt_tokens - cached_tokens if prompt_tokens is not None and cached_tokens is not None else None
             ),
             "latency_s": elapsed,
-            "ttft_s": first_text - started,
+            "ttft_s": first_text - started if first_text is not None else None,
             "generation_s": generation_s,
             "mean_token_gap_ms": (
                 generation_s * 1000 / (completion_tokens - 1)
-                if completion_tokens is not None and completion_tokens > 1
+                if generation_s is not None and completion_tokens is not None and completion_tokens > 1
                 else None
             ),
             "finish_reason": finish_reason,
@@ -182,7 +194,12 @@ def run(args: argparse.Namespace, root: Path, initial_prompt: str, questions: li
         "total_requests": args.rounds + 1,
         "max_tokens": args.max_tokens,
         "initial_prompt_chars": len(initial_prompt),
-        "composition": "next_prompt = previous_prompt + previous_actual_output + added_input.txt",
+        "prompt_format": args.prompt_format,
+        "composition": (
+            "native template over cumulative user/assistant messages"
+            if args.prompt_format == "native"
+            else "next_prompt = previous_prompt + previous_actual_output + added_input.txt"
+        ),
         "timing_scope": "Client stream timing includes HTTP transfer and queueing; token gaps are estimates.",
         "rounds": [],
     }
@@ -191,18 +208,25 @@ def run(args: argparse.Namespace, root: Path, initial_prompt: str, questions: li
     try:
         model = args.model or client.model_name()
         summary["model"] = model
+        if args.prompt_format == "native":
+            print("[MULTI_TURN] Standard /v1/chat/completions; append-only messages; preserving reasoning.", flush=True)
         print(f"[MULTI_TURN] model={model} requests={args.rounds + 1} artifacts={root.resolve()}", flush=True)
         print("[MULTI_TURN] Fixed text is unchanged; actual token count comes from server usage.", flush=True)
         print("[MULTI_TURN] cached_tokens=null means not reported; it does not mean a cache miss.", flush=True)
         history, previous_output, previous_prompt_chars = initial_prompt, "", 0
+        dialogue = NativeDialogue(initial_prompt) if args.prompt_format == "native" else None
         with root.joinpath("metrics.csv").open("w", newline="", encoding="utf-8") as metrics_file:
             metrics = csv.DictWriter(metrics_file, fieldnames=METRIC_FIELDS)
             metrics.writeheader()
             for current_round in range(args.rounds + 1):
                 question = questions[current_round - 1] if current_round else ""
-                added = QUESTION_PREFIX + question + QUESTION_SUFFIX if current_round else ""
+                added = (
+                    (question if dialogue else QUESTION_PREFIX + question + QUESTION_SUFFIX) if current_round else ""
+                )
                 if current_round:
                     history += previous_output + added
+                    if dialogue:
+                        dialogue.append(question)
                 directory = root / "turns" / f"{current_round:03d}"
                 directory.mkdir(parents=True)
                 directory.joinpath("added_input.txt").write_bytes(added.encode("utf-8"))
@@ -230,7 +254,11 @@ def run(args: argparse.Namespace, root: Path, initial_prompt: str, questions: li
                     f"[MULTI_TURN] round={current_round:02d} begin request_id={request_id} chars={len(history)}",
                     flush=True,
                 )
-                previous_output, stats = client.complete(payload, directory)
+                previous_output, stats = (
+                    complete_chat(client, dialogue, payload, directory)
+                    if dialogue
+                    else client.complete(payload, directory)
+                )
                 row = {
                     "round": current_round,
                     "phase": "followup" if current_round else "initial",
@@ -261,6 +289,7 @@ def run(args: argparse.Namespace, root: Path, initial_prompt: str, questions: li
 def main(argv: list[str] | None = None) -> int:
     assets = Path(__file__).resolve().parent / "multi_turn_kv_assets"
     parser = argparse.ArgumentParser(description=__doc__)
+    add_chat_arguments(parser)
     parser.add_argument("--base-url", default="http://127.0.0.1:8000", help="Service or PD proxy address")
     parser.add_argument("--model-name", "--model", dest="model", help="Served model name; default: /v1/models")
     parser.add_argument("--prefix-file", type=Path, default=assets / "prefix_500k.txt")
@@ -274,6 +303,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("rounds must be nonnegative; max-tokens and timeout must be positive")
     try:
         initial_prompt = read_text(args.prefix_file)
+        if args.prompt_format == "native":
+            initial_prompt = initial_user_text(initial_prompt)
         questions_text = read_text(args.questions_file)
         questions = [line.strip() for line in questions_text.splitlines() if line.strip()]
         if not initial_prompt.strip():
