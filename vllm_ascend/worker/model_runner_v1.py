@@ -5970,14 +5970,24 @@ class NPUModelRunner(GPUModelRunner):
         max_num_blocks = []
         max_model_len = max(self.max_model_len, self.max_encoder_len)
         shared_layout = None
+        def _group_attention_specs(group) -> list[AttentionSpec]:
+            spec = group.kv_cache_spec
+            specs = list(spec.kv_cache_specs.values()) if isinstance(spec, UniformTypeKVCacheSpecs) else [spec]
+            return [item for item in specs if isinstance(item, AttentionSpec)]
+
         if self.dsa_shared_pool:
+            all_attention_specs = [
+                spec
+                for group in kv_cache_config.kv_cache_groups
+                for spec in _group_attention_specs(group)
+            ]
             latent_spec = next(
-                group.kv_cache_spec for group in kv_cache_config.kv_cache_groups
-                if group.kv_cache_spec.head_size > self.sparse_head_dim[-1]
+                spec for spec in all_attention_specs
+                if spec.head_size > self.sparse_head_dim[-1]
             )
             indexer_spec = next(
-                group.kv_cache_spec for group in kv_cache_config.kv_cache_groups
-                if group.kv_cache_spec.head_size == self.sparse_head_dim[-1]
+                spec for spec in all_attention_specs
+                if spec.head_size == self.sparse_head_dim[-1]
             )
             shared_layout = dsa_shared_block_layout(
                 latent_spec, indexer_spec, prefill_child=self.layerwise_prefill_p_node,
@@ -5986,8 +5996,17 @@ class NPUModelRunner(GPUModelRunner):
             if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
                 continue
             max_num_blocks_per_req = cdiv(max_model_len, block_sizes[i] * get_total_cp_world_size())
-            if self.dsa_shared_pool and isinstance(kv_cache_group.kv_cache_spec, AttentionSpec):
-                if kv_cache_group.kv_cache_spec.head_size > self.sparse_head_dim[-1]:
+            group_attention_specs = _group_attention_specs(kv_cache_group)
+            group_attention_spec = (
+                next(
+                    (spec for spec in group_attention_specs if spec.head_size > self.sparse_head_dim[-1]),
+                    group_attention_specs[0],
+                )
+                if group_attention_specs
+                else None
+            )
+            if self.dsa_shared_pool and group_attention_spec is not None:
+                if group_attention_spec.head_size > self.sparse_head_dim[-1]:
                     blocks_per_bundle = shared_layout.latent_blocks_per_bundle
                 else:
                     blocks_per_bundle = shared_layout.indexer_blocks_per_bundle
