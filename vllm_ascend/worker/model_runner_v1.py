@@ -5154,6 +5154,7 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         self.may_reinitialize_input_batch(kv_cache_config)
+        self._validate_selected_prefill_eligibility(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
         self._validate_shared_resident_layout(kv_caches)
         if self._sfa_full_graph.retrieval_overlap is not None:
@@ -6074,6 +6075,53 @@ class NPUModelRunner(GPUModelRunner):
                 ),
                 kernel_block_sizes=self.kernel_block_sizes,
                 max_num_blocks_per_req=max_num_blocks,
+            )
+
+    def _validate_selected_prefill_eligibility(
+        self, kv_cache_config: KVCacheConfig
+    ) -> None:
+        """Fail fast when selected prefill is requested without its runtime."""
+        if not self.ascend_config.enable_selected_prefill:
+            return
+        from vllm_ascend.attention.selected_prefill_policy import (
+            selected_prefill_ineligibility_reason,
+        )
+
+        connector = get_kv_transfer_group() if has_kv_transfer_group() else None
+        connector_name = type(connector).__name__.lower() if connector is not None else ""
+        is_lmcache_connector = connector is not None and (
+            getattr(connector, "supports_dsa_index_lmcache", False)
+            or "lmcache" in connector_name
+        )
+        main_kv_layout_supported = bool(
+            self.enable_sparse_sfa_c8
+            and any(
+                getattr(group.kv_cache_spec, "cache_sparse_sfa_c8", False) is True
+                for group in kv_cache_config.kv_cache_groups
+            )
+        )
+        reason = selected_prefill_ineligibility_reason(
+            requested=True,
+            layerwise_prefill_p_node=self.layerwise_prefill_p_node,
+            enforce_eager=self.model_config.enforce_eager,
+            tensor_parallel_size=self.parallel_config.tensor_parallel_size,
+            kv_group_count=len(kv_cache_config.kv_cache_groups),
+            dsa_shared_pool=self.dsa_shared_pool,
+            is_lmcache_connector=is_lmcache_connector,
+            main_kv_layout_supported=main_kv_layout_supported,
+            registered_source_ready=bool(
+                getattr(connector, "supports_selected_prefill_sources", False)
+            ),
+            bank_writer_ready=bool(
+                getattr(connector, "supports_selected_prefill_bank_writer", False)
+            ),
+            reader_retirement_ready=bool(
+                getattr(connector, "supports_selected_prefill_reader_retirement", False)
+            ),
+        )
+        if reason is not None:
+            raise ValueError(
+                f"Selected prefill is requested but unavailable: {reason}"
             )
 
     def initialize_attn_backend(self, kv_cache_config: KVCacheConfig) -> None:

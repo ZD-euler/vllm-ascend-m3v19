@@ -85,3 +85,60 @@ class TestSelectedPrefillPolicy(unittest.TestCase):
             with self.subTest(marker=marker):
                 with self.assertRaisesRegex(ValueError, "marker must be a boolean"):
                     packed_main_c8_enabled(SimpleNamespace(cache_sparse_sfa_c8=marker))
+
+
+class TestRunnerSelectedPrefillGate(unittest.TestCase):
+    @staticmethod
+    def _gate():
+        import ast
+        from pathlib import Path
+
+        source = Path(__file__).parents[3] / "vllm_ascend/worker/model_runner_v1.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        method = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_validate_selected_prefill_eligibility"
+        )
+        namespace = {
+            "get_kv_transfer_group": lambda: SimpleNamespace(
+                supports_dsa_index_lmcache=True,
+                supports_selected_prefill_sources=False,
+                supports_selected_prefill_bank_writer=False,
+                supports_selected_prefill_reader_retirement=False,
+            ),
+            "has_kv_transfer_group": lambda: True,
+            "KVCacheConfig": object,
+        }
+        exec(
+            compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"),
+            namespace,
+        )
+        return namespace[method.name]
+
+    def _runner(self, requested):
+        return SimpleNamespace(
+            ascend_config=SimpleNamespace(enable_selected_prefill=requested),
+            layerwise_prefill_p_node=True,
+            model_config=SimpleNamespace(enforce_eager=True),
+            parallel_config=SimpleNamespace(tensor_parallel_size=1),
+            enable_sparse_sfa_c8=True,
+            dsa_shared_pool=True,
+        )
+
+    def _config(self):
+        return SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(
+                    kv_cache_spec=SimpleNamespace(cache_sparse_sfa_c8=True)
+                )
+            ]
+        )
+
+    def test_disabled_request_is_a_noop(self):
+        self._gate()(self._runner(False), self._config())
+
+    def test_requested_runtime_fails_fast(self):
+        with self.assertRaisesRegex(ValueError, "unavailable"):
+            self._gate()(self._runner(True), self._config())
