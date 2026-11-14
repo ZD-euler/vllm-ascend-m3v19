@@ -293,10 +293,14 @@ class cmake_build_ext(build_ext):
             raise RuntimeError(f"CMake configuration failed: {e}")
 
         install_path = os.path.join(ROOT_DIR, self.build_lib)
+        package_path = os.path.join(install_path, "vllm_ascend")
+        if self.inplace or getattr(self, "editable_mode", False) or "develop" in (self.distribution.commands or ()):
+            package_path = os.path.join(ROOT_DIR, "vllm_ascend")
         if isinstance(self.distribution.get_command_obj("develop"), develop):
             install_path = os.path.join(ROOT_DIR, "vllm_ascend")
         # add CMAKE_INSTALL_PATH
         cmake_args += [f"-DCMAKE_INSTALL_PREFIX={install_path}"]
+        cmake_args += [f"-DVLLM_ASCEND_PACKAGE_PATH={package_path}"]
 
         cmake_args += [f"-DCMAKE_PREFIX_PATH={pybind11_cmake_path}"]
 
