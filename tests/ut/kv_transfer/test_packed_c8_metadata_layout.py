@@ -204,8 +204,8 @@ def runner_backend(api, vllm_root, metadata, packed_shared_pool, mixed_indexer):
 
     layer_backends = {
         "main.1": backend("sfa", SFAWithInheritedConstructor),
-        "li.0": backend("indexer", SFAWithInheritedConstructor),
-        "li.1": backend("indexer", SFAWithInheritedConstructor),
+        "li.0": backend("indexer", OtherBuilder),
+        "li.1": backend("indexer", OtherBuilder),
     }
     factory = Mock(wraps=packed_shared_pool["dsa_shared_block_layout"])
     namespace = {
@@ -254,12 +254,15 @@ def runner_backend(api, vllm_root, metadata, packed_shared_pool, mixed_indexer):
     )
 
 
-def test_packed_component_dispatches_layout_to_both_sfa_builders(runner_backend, packed, mixed_indexer):
+def test_packed_component_dispatches_layout_only_to_main_sfa_builder(runner_backend, packed, mixed_indexer):
     runner_backend.initialize(runner_backend.runner, runner_backend.make_config(packed))
     runner_backend.factory.assert_called_once_with(packed, mixed_indexer, prefill_child=True)
     main_group, indexer_group = runner_backend.runner.attn_groups
     assert main_group[0]._mixed_indexer_metadata.max_blocks == 4100
-    assert indexer_group[0]._mixed_indexer_metadata.max_blocks == 4100
+    # The indexer group keeps its standard builder; mixed-indexer metadata
+    # belongs to the SFA builder that consumes the packed main group.
+    assert type(indexer_group[0]).__name__ == "OtherBuilder"
+    assert indexer_group[0].args[0] is mixed_indexer
 
 
 def test_packed_indexer_metadata_capacity_covers_padded_block_table(runner_backend, packed):
@@ -269,14 +272,13 @@ def test_packed_indexer_metadata_capacity_covers_padded_block_table(runner_backe
     runner_backend.initialize(runner_backend.runner, runner_backend.make_config(packed))
     padded_blocks = -(-4101 // 82) * 82
     assert padded_blocks == 4182
-    for group in runner_backend.runner.attn_groups:
-        workspace = group[0]._mixed_indexer_metadata
-        assert workspace.max_blocks == padded_blocks
-        canonical_table = torch.full((1, padded_blocks), 82, dtype=torch.int32)
-        canonical_slots = torch.tensor([82 * 128 + 7, -1])
-        physical_table, physical_slots = workspace.update(canonical_table, canonical_slots)
-        assert physical_table.tolist() == [[164] * padded_blocks]
-        assert physical_slots.tolist() == [164 * 128 + 7, -1]
+    workspace = runner_backend.runner.attn_groups[0][0]._mixed_indexer_metadata
+    assert workspace.max_blocks == padded_blocks
+    canonical_table = torch.full((1, padded_blocks), 82, dtype=torch.int32)
+    canonical_slots = torch.tensor([82 * 128 + 7, -1])
+    physical_table, physical_slots = workspace.update(canonical_table, canonical_slots)
+    assert physical_table.tolist() == [[164] * padded_blocks]
+    assert physical_slots.tolist() == [164 * 128 + 7, -1]
 
 
 @pytest.mark.parametrize("prefill", [True, False])
@@ -319,7 +321,7 @@ def test_production_startup_rejects_before_building_metadata_or_allocating(initi
     runner._validate_dsa_compact_startup_policy = Mock()
     runner.initialize_attn_backend = Mock()
     runner.initialize_kv_cache_tensors = Mock()
-    with pytest.raises(ValueError, match="not enabled in the production runner"):
+    with pytest.raises(ValueError, match="requires enable_sparse_sfa_c8"):
         initialize(runner, runner_backend.make_config(packed))
     runner._validate_dsa_compact_startup_policy.assert_not_called()
     runner.initialize_attn_backend.assert_not_called()

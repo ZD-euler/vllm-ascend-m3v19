@@ -233,7 +233,7 @@ def test_production_guard_blocks_the_same_packed_config(initialize, packed_views
     state.runner._validate_dsa_compact_startup_policy = Mock()
     state.runner.initialize_attn_backend = Mock()
     state.runner._allocate_kv_cache_tensors = Mock()
-    with pytest.raises(ValueError, match="not enabled in the production runner"):
+    with pytest.raises(ValueError, match="requires enable_sparse_sfa_c8"):
         initialize(state.runner, state.config)
     state.runner._validate_dsa_compact_startup_policy.assert_not_called()
     state.runner.initialize_attn_backend.assert_not_called()

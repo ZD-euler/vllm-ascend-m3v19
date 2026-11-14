@@ -91,10 +91,13 @@ def test_glm53_mixed_policy_preserves_six_bf16_owners(validate):
         ({"enable_sparse_li_c8": True}, "A2", None, True),
         ({"enable_sparse_c8": True}, "A3", None, True),
         ({"enable_sparse_li_c8": False, "enable_sparse_c8": True}, "A2", ValueError, False),
-        ({"enable_sparse_sfa_c8": True}, "A2", NotImplementedError, False),
+        ({"enable_sparse_sfa_c8": True}, "A2", ValueError, False),
+        ({"enable_sparse_li_c8": True, "enable_sparse_sfa_c8": True}, "A2", None, True),
         ({"enable_sparse_li_c8": True}, "A5", NotImplementedError, False),
         ({"enable_sparse_c8": True}, "A5", None, False),
+        ({"enable_sparse_li_c8": True, "enable_sparse_sfa_c8": True}, "A5", NotImplementedError, False),
         ({"enable_sparse_li_c8": True}, "310P", NotImplementedError, False),
+        ({"enable_sparse_li_c8": True, "enable_sparse_sfa_c8": True}, "310P", NotImplementedError, False),
         ({"enable_sparse_li_c8": True, "c8_enable_reshape_optim": True}, "A2", NotImplementedError, False),
     ],
 )
@@ -110,7 +113,7 @@ def test_startup_c8_flags_and_supported_hardware(settings, device, error, enable
         i
         for i, node in enumerate(init.body)
         if isinstance(node, ast.If)
-        and any(isinstance(n, ast.Constant) and n.value == "enable_sparse_sfa_c8" for n in ast.walk(node.test))
+        and any(isinstance(n, ast.Constant) and n.value == "enable_sparse_li_c8" for n in ast.walk(node.test))
     )
     end = next(
         i
@@ -133,6 +136,7 @@ def test_startup_c8_flags_and_supported_hardware(settings, device, error, enable
     else:
         exec(code, ns)
         assert obj.enable_sparse_c8 is obj.enable_sparse_li_c8 is enabled
+        assert obj.enable_sparse_sfa_c8 is bool(settings.get("enable_sparse_sfa_c8", False))
 
 
 @pytest.mark.parametrize("mask", [(True, True), (False, True), (False, False)])

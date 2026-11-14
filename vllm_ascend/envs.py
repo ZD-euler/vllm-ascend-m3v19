@@ -144,6 +144,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     # and --no-enable-prefix-caching. Prerequisite for freeing latent blocks at
     # end of prefill (DSA latent offload P2). Default 0.
     "VLLM_ASCEND_DSA_TWO_GROUPS": lambda: bool(int(os.getenv("VLLM_ASCEND_DSA_TWO_GROUPS", "0"))),
+    # Run the layerwise-prefill P-node cache layout without an offload
+    # connector. This is a local validation mode for the packed main C8 slab;
+    # transfer callbacks stay disabled and only the native prefill path runs.
+    "VLLM_ASCEND_LAYERWISE_PREFILL_LOCAL_ONLY": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_LAYERWISE_PREFILL_LOCAL_ONLY", "0"))
+    ),
     # DSA shared bundle pool. Requires DSA_UNBUNDLE=1 and DSA_TWO_GROUPS=1.
     # vLLM owns one physical bundle allocator while exposing two logical block
     # tables: latent (k_nope+k_pe) and indexer. vLLM-Ascend backs sibling latent

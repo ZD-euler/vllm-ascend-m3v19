@@ -154,11 +154,6 @@ class AscendConfig:
 
         from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
-        # Disable Sparse C8 for A5
-        # A5 has not been fully validated for this path and may carry hidden risks.
-        # TODO(rjg-lyh): Enable A5 support after sufficient validation.
-        if additional_config.get("enable_sparse_sfa_c8", False):
-            raise NotImplementedError("This deployment supports indexer C8 only; keep enable_sparse_sfa_c8=false")
         if "enable_sparse_li_c8" in additional_config and "enable_sparse_c8" in additional_config:
             if additional_config["enable_sparse_li_c8"] != additional_config["enable_sparse_c8"]:
                 raise ValueError("enable_sparse_li_c8 conflicts with legacy enable_sparse_c8")
@@ -172,6 +167,20 @@ class AscendConfig:
                 raise NotImplementedError("Indexer INT8/FP16-scale caching is supported on A2/A3 only")
             if additional_config.get("c8_enable_reshape_optim", False):
                 raise NotImplementedError("Indexer C8 currently requires the scatter-based write path")
+        # Packed main C8 stores NOPE/INT8, RoPE/BF16 and FP32 scales in one
+        # 656-byte row. It is a P-node prefill cache format and is only valid
+        # together with the two-group shared pool and a C8 indexer group.
+        self.enable_sparse_sfa_c8 = bool(additional_config.get("enable_sparse_sfa_c8", False))
+        if self.enable_sparse_sfa_c8:
+            if not use_sparse:
+                raise ValueError("enable_sparse_sfa_c8 requires a DSA sparse-attention model")
+            if not self.enable_sparse_li_c8:
+                raise ValueError(
+                    "enable_sparse_sfa_c8 requires indexer C8 "
+                    "(enable_sparse_li_c8/enable_sparse_c8)"
+                )
+            if get_ascend_device_type() not in (AscendDeviceType.A2, AscendDeviceType.A3):
+                raise NotImplementedError("Packed main C8 is supported on A2/A3 only")
 
         self.enable_sp_by_pass = (
             vllm_config.model_config is not None

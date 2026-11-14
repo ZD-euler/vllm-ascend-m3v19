@@ -662,10 +662,30 @@ class NPUModelRunner(GPUModelRunner):
             logger.info("DSA shrink-latent stage %d enabled (B2 compact-scratch decode).", self.dsa_shrink_latent)
         # dsa c8
         self.use_sparse_c8_indexer = self.ascend_config.enable_sparse_c8
+        self.enable_sparse_sfa_c8 = bool(
+            self.use_sparse and self.ascend_config.enable_sparse_sfa_c8
+        )
         self._mixed_indexer_c8_names = None
         if self.use_sparse_c8_indexer:
             self.c8_k_cache_dtype = torch.int8
             self.c8_k_scale_cache_dtype = torch.float16
+        if self.enable_sparse_sfa_c8:
+            if not (self.dsa_unbundle and self.dsa_two_groups and self.dsa_shared_pool):
+                raise ValueError(
+                    "Packed main C8 requires VLLM_ASCEND_DSA_UNBUNDLE=1, "
+                    "VLLM_ASCEND_DSA_TWO_GROUPS=1 and "
+                    "VLLM_ASCEND_DSA_SHARED_POOL=1"
+                )
+            if not self.layerwise_prefill_p_node:
+                raise ValueError(
+                    "Packed main C8 currently requires the layerwise-prefill "
+                    "P-node layout (VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE=true)"
+                )
+            if self.block_size != 128 or self.sparse_head_dim[:2] != (512, 64):
+                raise ValueError(
+                    "Packed main C8 requires block_size=128 and "
+                    "kv_lora_rank=512 with qk_rope_head_dim=64"
+                )
 
         self.attn_backend = get_attn_backend(
             0,
@@ -4972,6 +4992,11 @@ class NPUModelRunner(GPUModelRunner):
                 "mla_forward boundary and do not support the staged "
                 "cross-layer SFA graph path."
             )
+        local_only = bool(envs_ascend.VLLM_ASCEND_LAYERWISE_PREFILL_LOCAL_ONLY)
+        if layerwise_prefill_p_node and local_only and not has_kv_transfer_group():
+            # Local validation mode: the P-node slab is allocated and used by
+            # the native prefill path, while every transfer callback is skipped.
+            return
         if layerwise_prefill_p_node:
             if not has_kv_transfer_group():
                 raise ValueError(
@@ -5105,9 +5130,13 @@ class NPUModelRunner(GPUModelRunner):
             spec = group.kv_cache_spec
             layer_specs = spec.kv_cache_specs.values() if isinstance(spec, UniformTypeKVCacheSpecs) else (spec,)
             for layer_spec in layer_specs:
-                packed_main = packed_main_c8_enabled(layer_spec)
-                if packed_main:
-                    raise ValueError("Packed main C8 KV cache is not enabled in the production runner.")
+                if packed_main_c8_enabled(layer_spec) and not getattr(
+                    self, "enable_sparse_sfa_c8", False
+                ):
+                    raise ValueError(
+                        "Packed main C8 KV cache requires "
+                        "enable_sparse_sfa_c8=true"
+                    )
         self._validate_dsa_compact_startup_policy(kv_cache_config)
         self._validate_sfa_layerwise_connector_cudagraph_mode()
         kv_cache_config = deepcopy(kv_cache_config)
@@ -6088,7 +6117,7 @@ class NPUModelRunner(GPUModelRunner):
             attn_groups: list[AttentionGroup] = []
             for (attn_backend, kv_cache_spec), layer_names in attn_backends_map.items():
                 builder_cls = attn_backend.get_builder_cls()
-                if shared_pool_layout is not None and kv_cache_group_id in (packed_group_id, indexer_group_id):
+                if shared_pool_layout is not None and kv_cache_group_id == packed_group_id:
                     # CP and other builders with their own constructor retain
                     # their existing contract until they support packed prefill.
                     if builder_cls.__init__ is not AscendSFAMetadataBuilder.__init__:
@@ -6117,7 +6146,6 @@ class NPUModelRunner(GPUModelRunner):
 
         shared_pool_layout = None
         packed_group_id = None
-        indexer_group_id = None
         packed_group_ids = [
             group_id
             for group_id, backends in enumerate(attention_backend_maps)
@@ -6135,7 +6163,6 @@ class NPUModelRunner(GPUModelRunner):
             packed_group_id = packed_group_ids[0]
             main_spec = groups[packed_group_id].kv_cache_spec
             indexer_group = groups[1 - packed_group_id]
-            indexer_group_id = 1 - packed_group_id
             indexer_spec = indexer_group.kv_cache_spec
             if (
                 not isinstance(main_spec, MLAAttentionSpec)
@@ -6283,15 +6310,29 @@ class NPUModelRunner(GPUModelRunner):
                         # (k_nope + k_pe); the indexer key is a separate KV group
                         # emitted from the DeepseekV32IndexerCache layer below.
                         kv_lora_rank, qk_rope_head_dim = self.sparse_head_dim[:2]
-                        kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
-                            block_size=self.block_size,
-                            num_kv_heads=1,
-                            head_size=kv_lora_rank + qk_rope_head_dim,
-                            sparse_head_dim=(kv_lora_rank, qk_rope_head_dim),
-                            dtype=self.kv_cache_dtype,
-                            cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
-                            cache_sparse_c8=False,
-                        )
+                        if self.enable_sparse_sfa_c8:
+                            # Packed main C8: one 656-byte row per token holds
+                            # INT8 NOPE, BF16 RoPE and inline FP32 scales.
+                            kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
+                                block_size=128,
+                                num_kv_heads=1,
+                                head_size=656,
+                                sparse_head_dim=(kv_lora_rank, qk_rope_head_dim),
+                                dtype=torch.int8,
+                                cache_dtype_str="int8",
+                                cache_sparse_c8=False,
+                                cache_sparse_sfa_c8=True,
+                            )
+                        else:
+                            kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
+                                block_size=self.block_size,
+                                num_kv_heads=1,
+                                head_size=kv_lora_rank + qk_rope_head_dim,
+                                sparse_head_dim=(kv_lora_rank, qk_rope_head_dim),
+                                dtype=self.kv_cache_dtype,
+                                cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
+                                cache_sparse_c8=False,
+                            )
                     elif self.dsa_free_paged:
                         # DSA offload (M-B): paged cache holds ONLY the indexer key;
                         # latent lives in the PagedLatentPool. Per-token page shrinks

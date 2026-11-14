@@ -42,6 +42,10 @@ from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.common_cp import AscendPCPMetadata
 from vllm_ascend.attention.mla_v1 import MAX_O_PROJ_PREFETCH_SIZE, MLAPO_MAX_SUPPORTED_TOKENS
+from vllm_ascend.attention.packed_c8_sfa import (
+    append_packed_c8_main_kv,
+    packed_c8_sparse_flash_attention,
+)
 from vllm_ascend.attention.selected_prefill_policy import packed_main_c8_enabled
 from vllm_ascend.attention.sfa_graph_layout import FullGraphAttentionBuffers, pack_decode_lanes, unpack_decode_lanes
 from vllm_ascend.attention.sfa_remap_boundary import SFARemapBoundaryBuffer
@@ -1066,10 +1070,16 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         *,
         shared_pool_layout: "DSASharedBlockLayout | None" = None,
     ):
+        transfer = vllm_config.kv_transfer_config
+        local_only = bool(
+            transfer is None and envs.VLLM_ASCEND_LAYERWISE_PREFILL_LOCAL_ONLY
+        )
         layerwise_prefill_p_node = bool(
-            vllm_config.kv_transfer_config is not None
-            and vllm_config.kv_transfer_config.is_kv_producer
-            and envs.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
+            envs.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
+            and (
+                (transfer is not None and transfer.is_kv_producer)
+                or local_only
+            )
         )
         ascend_config = get_ascend_config()
         block_map = getattr(ascend_config, "indexer_hbm_block_map", None)
@@ -2039,8 +2049,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
 
         # The MLAPO operator fuses the pre-processing steps on Q/K/V in MLA into a single operator
-        # NOTE: it imposes a limit on the number of input tokens and conflicts with FlashComm
-        self.enable_mlapo = envs.VLLM_ASCEND_ENABLE_MLAPO
+        # NOTE: it imposes a limit on the number of input tokens and conflicts with FlashComm.
+        # Packed main C8 writes through the standalone append adapter, so
+        # MLAPO must stay off before weights are repacked for its fused path.
+        self.enable_mlapo = envs.VLLM_ASCEND_ENABLE_MLAPO and not ascend_config.enable_sparse_sfa_c8
 
         self.local_num_heads = self.num_heads
         self.vllm_config = get_current_vllm_config()
@@ -2058,6 +2070,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             self.is_kv_producer and envs.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
         )
         self.layer_name = kwargs.get("layer_name")
+        self._packed_main_cache: torch.Tensor | None = None
         if self._layerwise_prefill_p_node:
             self._layerwise_prefill_mtp = bool(
                 speculative_config is not None and speculative_config.method in ("mtp", "deepseek_mtp")
@@ -2891,6 +2904,18 @@ class AscendSFAImpl(MLAAttentionImpl):
         else:
             assert attn_metadata is not None
             block_table = attn_metadata.block_table
+
+        if self._packed_main_cache is not None and kv_override is None:
+            return packed_c8_sparse_flash_attention(
+                ql_nope,
+                q_pe,
+                self._packed_main_cache,
+                topk_indices,
+                scale=self.scale,
+                block_table=block_table,
+                actual_seq_lengths_query=actual_seq_lengths_query,
+                actual_seq_lengths_kv=actual_seq_lengths_key,
+            )
 
         if kv_override is not None:
             kv = kv_override
@@ -4525,6 +4550,18 @@ class AscendSFAImpl(MLAAttentionImpl):
         index_lmcache_enabled = (
             self.dsa_offload_unbundle and index_layer_name is not None and _dsa_index_lmcache_enabled()
         )
+        self._packed_main_cache = None
+        if (
+            len(kv_cache) == 1
+            and isinstance(kv_cache[0], torch.Tensor)
+            and kv_cache[0].dtype == torch.int8
+            and kv_cache[0].ndim == 4
+            and kv_cache[0].shape[-1] == 656
+        ):
+            # Layerwise-prefill packed main C8: one 656-byte row per token.
+            self._packed_main_cache = kv_cache[0]
+            if self.enable_dsa_cp:
+                raise RuntimeError("Packed main C8 does not support DSA-CP")
         if self.dsa_offload_unbundle and self.has_indexer and len(kv_cache) < 3:
             # Un-bundled: the indexer key is its own KV group (DeepseekV32IndexerCache).
             # layer_name is the inner MLAAttention name (...self_attn.attn); the indexer
@@ -4547,7 +4584,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                         raise RuntimeError("Unbundled C8 indexer requires key and scale caches")
                     self._dsa_idx_scale_cache_t = _idx_cache[1]
                 self._dsa_idx_cache_t = _idx_t
-            kv_cache = (kv_cache[0], kv_cache[1], _idx_t)
+            if self._packed_main_cache is not None:
+                # Keep positional indexer access (kv_cache[2]/[3]) while the
+                # packed main occupies the first two slots.
+                kv_cache = (self._packed_main_cache, self._packed_main_cache, _idx_t)
+            else:
+                kv_cache = (kv_cache[0], kv_cache[1], _idx_t)
             if self.use_sparse_c8_indexer:
                 kv_cache += (self._dsa_idx_scale_cache_t,)
 
@@ -4644,7 +4686,19 @@ class AscendSFAImpl(MLAAttentionImpl):
             if not (self.dsa_shrink_latent and attn_metadata.num_decode_tokens > 0):
                 wait_for_kv_layer_from_connector(layer_name)
 
-            if self.enable_dsa_cp:
+            if self._packed_main_cache is not None:
+                actual_tokens = attn_metadata.num_actual_tokens
+                append_packed_c8_main_kv(
+                    self._packed_main_cache,
+                    kv_no_split[:actual_tokens].view(-1, 1, 1, self.kv_lora_rank + self.qk_rope_head_dim),
+                    self.kv_a_layernorm.weight,  # type: ignore[union-attr]
+                    cos[:actual_tokens].view(-1, 1, 1, self.qk_rope_head_dim),
+                    sin[:actual_tokens].view(-1, 1, 1, self.qk_rope_head_dim),
+                    slot_mapping[:actual_tokens],
+                    epsilon=self.kv_a_layernorm.variance_epsilon,  # type: ignore[union-attr]
+                )
+                k_pe = k_nope = None
+            elif self.enable_dsa_cp:
                 assert slot_mapping_cp is not None
                 k_pe, k_nope = self.exec_kv(
                     kv_no_split,
@@ -5190,7 +5244,15 @@ class AscendSFAImpl(MLAAttentionImpl):
         # can also carry DecodeOnly/SpecDecoding attention metadata.
         save_operations: list[tuple[str, list[torch.Tensor]]] = []
         if self._layerwise_prefill_p_node:
-            if self.dsa_offload_unbundle and len(kv_cache) >= 2:
+            if self._packed_main_cache is not None:
+                save_operations.append((layer_name, [self._packed_main_cache]))
+                if (
+                    len(kv_cache) >= 3
+                    and index_layer_name is not None
+                    and index_lmcache_enabled
+                ):
+                    save_operations.append((index_layer_name, [kv_cache[2]]))
+            elif self.dsa_offload_unbundle and len(kv_cache) >= 2:
                 save_operations.append((layer_name, [kv_cache[0], kv_cache[1]]))
                 if (
                     len(kv_cache) >= 3
