@@ -25,20 +25,25 @@ void LIPageGather(const at::Tensor& mainPageBases, const at::Tensor& targetK,
                 targetScale.scalar_type() == at::kHalf && targetScale.dim() >= 2 &&
                 targetK.size(0) > 0 && targetK.size(0) <= UINT32_MAX &&
                 targetScale.size(0) == targetK.size(0) &&
-                targetK.numel() / targetK.size(0) == DATA_PAGE_BYTES &&
-                targetScale.numel() / targetScale.size(0) == SCALE_PAGE_BYTES / 2 &&
                 mainPageBases.numel() <= targetK.size(0),
-                "LI destination must retain native 16384-byte K and 256-byte scale pages");
+                "LI destination cache geometry is invalid");
+    const uint32_t dataBytes = static_cast<uint32_t>(targetK.numel() / targetK.size(0));
+    const uint32_t scaleBytes = static_cast<uint32_t>(
+        targetScale.numel() / targetScale.size(0) * static_cast<int64_t>(sizeof(int16_t)));
+    TORCH_CHECK((dataBytes == 16384U && scaleBytes == 256U) ||
+                (dataBytes == 32768U && scaleBytes == 512U),
+                "LI destination must retain native 16384-byte K and 256-byte scale "
+                "pages or packed 32768-byte K and 512-byte scale pages");
     TORCH_CHECK(mainOffset >= 0 && mainOffset <= UINT32_MAX && dataOffset >= 0 &&
-                dataOffset <= UINT32_MAX - DATA_PAGE_BYTES && scaleOffset >= 0 &&
-                scaleOffset <= UINT32_MAX - SCALE_PAGE_BYTES,
+                dataOffset <= UINT32_MAX - dataBytes && scaleOffset >= 0 &&
+                scaleOffset <= UINT32_MAX - scaleBytes,
                 "LI component offsets exceed the registered object geometry");
     c10_npu::NPUGuard guard(mainPageBases.device());
     const auto stream = c10_npu::getCurrentNPUStream().stream(false);
     at_npu::native::OpCommand::RunOpApi("DsaLIPageGather", [=]() -> int {
         return launch_dsa_selected_li_pages(stream, mainPageBases.data_ptr(), targetK.data_ptr(),
             targetScale.data_ptr(), mainPageBases.numel(), targetK.size(0),
-            mainOffset, dataOffset, scaleOffset);
+            mainOffset, dataOffset, scaleOffset, dataBytes, scaleBytes, dataBytes);
     });
 }
 } // namespace

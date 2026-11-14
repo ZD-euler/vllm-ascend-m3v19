@@ -6,9 +6,13 @@
 using namespace AscendC;
 using namespace SparsePrefillLI;
 
+// The K destination may space logical pages by destinationStrideBytes, while
+// the scale sidecar is a separate tightly packed slab: scale page p starts at
+// p * scaleBytes (256 B for M3v19 native, 512 B for the target packed layout).
 extern "C" __global__ __aicore__ void dsa_selected_li_pages(
     GM_ADDR mainPageBases, GM_ADDR targetK, GM_ADDR targetScale,
-    uint32_t domain, uint32_t mainOffset, uint32_t dataOffset, uint32_t scaleOffset)
+    uint32_t domain, uint32_t mainOffset, uint32_t dataOffset, uint32_t scaleOffset,
+    uint32_t dataBytes, uint32_t scaleBytes, uint32_t destinationStrideBytes)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     GlobalTensor<uint64_t> bases;
@@ -18,7 +22,7 @@ extern "C" __global__ __aicore__ void dsa_selected_li_pages(
     destinationScale.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(targetScale));
     TPipe pipe;
     TBuf<TPosition::VECCALC> bytes;
-    pipe.InitBuffer(bytes, DATA_PAGE_BYTES);
+    pipe.InitBuffer(bytes, MAX_DATA_PAGE_BYTES);
     auto local = bytes.Get<uint8_t>();
     DataCopyPadExtParams<uint8_t> pad{false, 0, 0, 0};
     for (uint64_t page = GetBlockIdx(); page < domain; page += GetBlockNum()) {
@@ -28,34 +32,40 @@ extern "C" __global__ __aicore__ void dsa_selected_li_pages(
         ASSERT_MSG(main > mainOffset, "Invalid leased LI object base");
         if (main <= mainOffset) return;
         const uint64_t blob = main - mainOffset;
-        const bool valid = blob <= UINT64_MAX - dataOffset - DATA_PAGE_BYTES &&
-            blob <= UINT64_MAX - scaleOffset - SCALE_PAGE_BYTES;
+        const bool valid = blob <= UINT64_MAX - dataOffset - dataBytes &&
+            blob <= UINT64_MAX - scaleOffset - scaleBytes;
         ASSERT_MSG(valid, "LI component address overflows");
         if (!valid) return;
         source.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(blob + dataOffset));
-        DataCopyPad(local, source, {1, DATA_PAGE_BYTES, 0, 0, 0}, pad);
+        DataCopyPad(local, source, {1, dataBytes, 0, 0, 0}, pad);
         PipeBarrier<PIPE_ALL>();
-        DataCopyPad(destinationK[page * DATA_PAGE_BYTES], local,
-                    {1, DATA_PAGE_BYTES, 0, 0, 0});
+        DataCopyPad(destinationK[page * destinationStrideBytes], local,
+                    {1, dataBytes, 0, 0, 0});
         PipeBarrier<PIPE_ALL>();
         source.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(blob + scaleOffset));
-        DataCopyPad(local, source, {1, SCALE_PAGE_BYTES, 0, 0, 0}, pad);
+        DataCopyPad(local, source, {1, scaleBytes, 0, 0, 0}, pad);
         PipeBarrier<PIPE_ALL>();
-        DataCopyPad(destinationScale[page * SCALE_PAGE_BYTES], local,
-                    {1, SCALE_PAGE_BYTES, 0, 0, 0});
+        DataCopyPad(destinationScale[page * scaleBytes], local,
+                    {1, scaleBytes, 0, 0, 0});
         PipeBarrier<PIPE_ALL>();
     }
 }
 
 extern "C" int32_t launch_dsa_selected_li_pages(void* stream, void* mainPageBases,
     void* targetK, void* targetScale, uint32_t domain, uint32_t destinationPages,
-    uint32_t mainOffset, uint32_t dataOffset, uint32_t scaleOffset)
+    uint32_t mainOffset, uint32_t dataOffset, uint32_t scaleOffset,
+    uint32_t dataBytes, uint32_t scaleBytes, uint32_t destinationStrideBytes)
 {
     if (!stream || !mainPageBases || !targetK || !targetScale || domain == 0U ||
-        domain > destinationPages || dataOffset > UINT32_MAX - DATA_PAGE_BYTES ||
-        scaleOffset > UINT32_MAX - SCALE_PAGE_BYTES) return -1;
+        domain > destinationPages || dataBytes == 0U || dataBytes > MAX_DATA_PAGE_BYTES ||
+        dataBytes % PAGE_ALIGN_BYTES != 0U || scaleBytes == 0U ||
+        scaleBytes > MAX_SCALE_PAGE_BYTES || scaleBytes % PAGE_ALIGN_BYTES != 0U ||
+        destinationStrideBytes < dataBytes ||
+        destinationStrideBytes % PAGE_ALIGN_BYTES != 0U ||
+        dataOffset > UINT32_MAX - dataBytes || scaleOffset > UINT32_MAX - scaleBytes) return -1;
     dsa_selected_li_pages<<<8, nullptr, stream>>>(
         static_cast<uint8_t*>(mainPageBases), static_cast<uint8_t*>(targetK),
-        static_cast<uint8_t*>(targetScale), domain, mainOffset, dataOffset, scaleOffset);
+        static_cast<uint8_t*>(targetScale), domain, mainOffset, dataOffset, scaleOffset,
+        dataBytes, scaleBytes, destinationStrideBytes);
     return 0;
 }

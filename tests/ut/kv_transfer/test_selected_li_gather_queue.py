@@ -18,7 +18,7 @@ class SelectedLIGatherQueueTest(unittest.TestCase):
             self.skipTest("A host C++ compiler is required")
         return compiler
 
-    def test_real_binding_validates_before_enqueue_and_keeps_current_stream_and_tensors(self):
+    def test_real_binding_accepts_both_page_layouts_and_keeps_current_stream_and_tensors(self):
         import torch
         from torch.utils.cpp_extension import include_paths
 
@@ -52,6 +52,7 @@ void* testStream=reinterpret_cast<void*>(0x123);
 std::vector<std::function<int()>> commands;
 int calls=0, frees=0, launchStatus=0;
 void* expected[3]{};
+uint32_t expectedData=16384, expectedScaleBytes=256, expectedStride=16384;
 at::Tensor Make(at::ScalarType dtype, std::vector<int64_t> shape,
     std::vector<int64_t> stride={}, c10::Device device={c10::DeviceType::PrivateUse1,0}) {
     size_t size=8; for(auto value:shape) size*=std::max<int64_t>(1,value);
@@ -63,10 +64,13 @@ at::Tensor Make(at::ScalarType dtype, std::vector<int64_t> shape,
     return builder.make_tensor();
 }
 extern "C" int32_t launch_dsa_selected_li_pages(void* stream,void* bases,void* k,void* scale,
-    uint32_t domain,uint32_t pages,uint32_t mainOffset,uint32_t dataOffset,uint32_t scaleOffset) {
+    uint32_t domain,uint32_t pages,uint32_t mainOffset,uint32_t dataOffset,uint32_t scaleOffset,
+    uint32_t dataBytes,uint32_t scaleBytes,uint32_t destinationStrideBytes) {
     assert(stream==reinterpret_cast<void*>(0x123));
     assert(bases==expected[0] && k==expected[1] && scale==expected[2]);
     assert(domain==7 && pages==9 && mainOffset==8192 && dataOffset==256 && scaleOffset==17408);
+    assert(dataBytes==expectedData && scaleBytes==expectedScaleBytes &&
+           destinationStrideBytes==expectedStride);
     ++calls;return launchStatus;
 }
 template<class F> void Reject(F fn) {
@@ -84,6 +88,17 @@ int main(){
     }
     assert(frees==0);testStream=reinterpret_cast<void*>(0x456);
     assert(commands.front()()==0 && calls==1);commands.clear();assert(frees==3);
+    {
+        // Target packed mixed indexer: 32 KiB K and 512 B scale per logical page.
+        testStream=reinterpret_cast<void*>(0x123);
+        auto bases=Make(at::kUInt64,{7}),k=Make(at::kChar,{9,256,128}),s=Make(at::kHalf,{9,256});
+        expected[0]=bases.data_ptr();expected[1]=k.data_ptr();expected[2]=s.data_ptr();
+        expectedData=32768;expectedScaleBytes=512;expectedStride=32768;
+        LIPageGather(bases,k,s,8192,256,17408);
+        assert(commands.size()==1 && calls==1);
+        assert(commands.front()()==0 && calls==2);commands.clear();
+        expectedData=16384;expectedScaleBytes=256;expectedStride=16384;
+    }
     auto bases=Make(at::kUInt64,{7}),k=Make(at::kChar,{9,128,128}),s=Make(at::kHalf,{9,128});
     auto call=[&](const at::Tensor& b,const at::Tensor& key,const at::Tensor& scale,
                   int64_t m=8192,int64_t d=256,int64_t z=17408){LIPageGather(b,key,scale,m,d,z);};
@@ -96,11 +111,15 @@ int main(){
     Reject([&]{call(bases,Make(at::kHalf,{9,128,128}),s);});
     Reject([&]{call(bases,Make(at::kChar,{147456}),s);});
     Reject([&]{call(bases,Make(at::kChar,{9,128,127}),s);});
+    Reject([&]{call(bases,Make(at::kChar,{9,256,127}),s);});
+    Reject([&]{call(bases,Make(at::kChar,{9,256,128}),s);});  // 32 KiB K needs 512 B scale.
     Reject([&]{call(bases,Make(at::kChar,{9,128,128},{32768,128,1}),s);});
     Reject([&]{call(bases,k,Make(at::kChar,{9,256}));});
     Reject([&]{call(bases,k,Make(at::kHalf,{9,127}));});
+    Reject([&]{call(bases,k,Make(at::kHalf,{9,257}));});
     Reject([&]{call(bases,k,Make(at::kHalf,{8,128}));});
     Reject([&]{call(bases,k,Make(at::kHalf,{9,128},{256,1}));});
+    Reject([&]{call(bases,k,Make(at::kHalf,{9,256}));});  // 512 B scale needs 32 KiB K.
     Reject([&]{call(Make(at::kUInt64,{10}),k,s);});
     Reject([&]{call(bases,k,s,-1);});
     Reject([&]{call(bases,k,s,INT64_MAX);});
