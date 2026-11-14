@@ -113,6 +113,7 @@ import vllm_ascend.envs as envs_ascend
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.selected_prefill_policy import packed_main_c8_enabled
 from vllm_ascend.attention.sfa_remap_boundary import prepare_native_sparse_boundaries
 from vllm_ascend.attention.sfa_v1 import AscendSFAMetadataBuilder, _fixed_staged_decode_mtp, _get_indexer_types
 from vllm_ascend.attention.utils import (
@@ -5104,9 +5105,7 @@ class NPUModelRunner(GPUModelRunner):
             spec = group.kv_cache_spec
             layer_specs = spec.kv_cache_specs.values() if isinstance(spec, UniformTypeKVCacheSpecs) else (spec,)
             for layer_spec in layer_specs:
-                packed_main = getattr(layer_spec, "cache_sparse_sfa_c8", False)
-                if type(packed_main) is not bool:
-                    raise ValueError("Packed main C8 marker must be a boolean")
+                packed_main = packed_main_c8_enabled(layer_spec)
                 if packed_main:
                     raise ValueError("Packed main C8 KV cache is not enabled in the production runner.")
         self._validate_dsa_compact_startup_policy(kv_cache_config)
@@ -6070,7 +6069,7 @@ class NPUModelRunner(GPUModelRunner):
             attn_groups: list[AttentionGroup] = []
             for (attn_backend, kv_cache_spec), layer_names in attn_backends_map.items():
                 builder_cls = attn_backend.get_builder_cls()
-                if shared_pool_layout is not None and kv_cache_group_id == packed_group_id:
+                if shared_pool_layout is not None and kv_cache_group_id in (packed_group_id, indexer_group_id):
                     # CP and other builders with their own constructor retain
                     # their existing contract until they support packed prefill.
                     if builder_cls.__init__ is not AscendSFAMetadataBuilder.__init__:
@@ -6099,6 +6098,7 @@ class NPUModelRunner(GPUModelRunner):
 
         shared_pool_layout = None
         packed_group_id = None
+        indexer_group_id = None
         packed_group_ids = [
             group_id
             for group_id, backends in enumerate(attention_backend_maps)
@@ -6116,6 +6116,7 @@ class NPUModelRunner(GPUModelRunner):
             packed_group_id = packed_group_ids[0]
             main_spec = groups[packed_group_id].kv_cache_spec
             indexer_group = groups[1 - packed_group_id]
+            indexer_group_id = 1 - packed_group_id
             indexer_spec = indexer_group.kv_cache_spec
             if (
                 not isinstance(main_spec, MLAAttentionSpec)

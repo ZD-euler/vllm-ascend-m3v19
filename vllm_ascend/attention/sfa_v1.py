@@ -42,6 +42,7 @@ from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.common_cp import AscendPCPMetadata
 from vllm_ascend.attention.mla_v1 import MAX_O_PROJ_PREFETCH_SIZE, MLAPO_MAX_SUPPORTED_TOKENS
+from vllm_ascend.attention.selected_prefill_policy import packed_main_c8_enabled
 from vllm_ascend.attention.sfa_graph_layout import FullGraphAttentionBuffers, pack_decode_lanes, unpack_decode_lanes
 from vllm_ascend.attention.sfa_remap_boundary import SFARemapBoundaryBuffer
 from vllm_ascend.attention.utils import (
@@ -1073,22 +1074,35 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         ascend_config = get_ascend_config()
         block_map = getattr(ascend_config, "indexer_hbm_block_map", None)
         mixed_indexer = getattr(ascend_config, "indexer_c8_shared_block_factor", 1) == 2
-        packed_main = getattr(kv_cache_spec, "cache_sparse_sfa_c8", False)
-        if type(packed_main) is not bool:
-            raise ValueError("Packed main C8 marker must be a boolean")
+        packed_main = packed_main_c8_enabled(kv_cache_spec)
+        # The mixed indexer group shares the packed main pool geometry even
+        # though its own spec describes logical BF16/INT8 indexer pages.
+        packed_indexer = bool(
+            not packed_main
+            and getattr(kv_cache_spec, "cache_sparse_c8", False) is True
+            and getattr(kv_cache_spec, "indexer_c8_layer_names", None) is not None
+        )
         if packed_main and shared_pool_layout is None:
             raise ValueError("Packed main C8 SFA metadata requires a shared-pool layout")
         if shared_pool_layout is not None:
             from vllm.v1.core.dsa_shared_pool import DSAPackedMainC8PrefillLayout
 
             if (
-                not packed_main
+                not (packed_main or packed_indexer)
                 or not layerwise_prefill_p_node
                 or not mixed_indexer
                 or block_map is not None
                 or not isinstance(shared_pool_layout, DSAPackedMainC8PrefillLayout)
-                or shared_pool_layout.latent_page_size_bytes != kv_cache_spec.page_size_bytes
                 or kv_cache_spec.block_size != vllm_config.cache_config.block_size
+                or (
+                    packed_main
+                    and shared_pool_layout.latent_page_size_bytes != kv_cache_spec.page_size_bytes
+                )
+                or (
+                    packed_indexer
+                    and shared_pool_layout.indexer_page_size_bytes
+                    != kv_cache_spec.page_size_bytes - kv_cache_spec.indexer_scale_page_size_bytes
+                )
             ):
                 raise ValueError("Packed main C8 SFA metadata requires a matching mixed-indexer prefill shared pool")
 

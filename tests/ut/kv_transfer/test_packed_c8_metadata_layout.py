@@ -15,6 +15,7 @@ import pytest
 import torch
 from test_packed_c8_spec import ROOT, _load_definitions
 from test_packed_c8_spec import api, bf16_main, indexer, initialize, packed, packed_shared_pool, vllm_root  # noqa: F401
+from vllm_ascend.attention.selected_prefill_policy import packed_main_c8_enabled
 
 
 def _load_method(source, class_name, method_name, namespace, *, keep_class=False):
@@ -58,6 +59,7 @@ def metadata(monkeypatch, packed_shared_pool):
         SFARemapBoundaryBuffer=Mock(),
         get_ascend_config=lambda: ascend_config,
         enable_dsa_cp=lambda: False,
+        packed_main_c8_enabled=packed_main_c8_enabled,
     )
     builder = _load_method(
         ROOT / "vllm_ascend/attention/sfa_v1.py",
@@ -129,6 +131,10 @@ def test_packed_builder_rejects_missing_or_incompatible_layout(
     packed_layout = factory(packed, mixed_indexer, prefill_child=True)
     with pytest.raises(ValueError, match="matching mixed-indexer prefill"):
         metadata.builder(packed, ["main.1"], metadata.config, metadata.device, shared_pool_layout=native_layout)
+    with pytest.raises(ValueError, match="matching mixed-indexer prefill"):
+        metadata.builder(
+            mixed_indexer, ["li.0", "li.1"], metadata.config, metadata.device, shared_pool_layout=native_layout
+        )
     metadata.config.cache_config.block_size = 64
     with pytest.raises(ValueError, match="matching mixed-indexer prefill"):
         metadata.builder(packed, ["main.1"], metadata.config, metadata.device, shared_pool_layout=packed_layout)
@@ -198,8 +204,8 @@ def runner_backend(api, vllm_root, metadata, packed_shared_pool, mixed_indexer):
 
     layer_backends = {
         "main.1": backend("sfa", SFAWithInheritedConstructor),
-        "li.0": backend("indexer", OtherBuilder),
-        "li.1": backend("indexer", OtherBuilder),
+        "li.0": backend("indexer", SFAWithInheritedConstructor),
+        "li.1": backend("indexer", SFAWithInheritedConstructor),
     }
     factory = Mock(wraps=packed_shared_pool["dsa_shared_block_layout"])
     namespace = {
@@ -248,12 +254,29 @@ def runner_backend(api, vllm_root, metadata, packed_shared_pool, mixed_indexer):
     )
 
 
-def test_packed_component_dispatches_layout_only_to_sfa_builder(runner_backend, packed, mixed_indexer):
+def test_packed_component_dispatches_layout_to_both_sfa_builders(runner_backend, packed, mixed_indexer):
     runner_backend.initialize(runner_backend.runner, runner_backend.make_config(packed))
     runner_backend.factory.assert_called_once_with(packed, mixed_indexer, prefill_child=True)
-    sfa, indexer_group = runner_backend.runner.attn_groups
-    assert sfa[0]._mixed_indexer_metadata.max_blocks == 4100
-    assert indexer_group[0].args[:2] == (mixed_indexer, ["li.0", "li.1"])
+    main_group, indexer_group = runner_backend.runner.attn_groups
+    assert main_group[0]._mixed_indexer_metadata.max_blocks == 4100
+    assert indexer_group[0]._mixed_indexer_metadata.max_blocks == 4100
+
+
+def test_packed_indexer_metadata_capacity_covers_padded_block_table(runner_backend, packed):
+    # At 4101 blocks the 18-rounded indexer workspace is 4104 entries while
+    # may_reinitialize_input_batch pads the indexer table to 82-rounded 4182.
+    runner_backend.runner.vllm_config.model_config.max_model_len = 4101 * 128
+    runner_backend.initialize(runner_backend.runner, runner_backend.make_config(packed))
+    padded_blocks = -(-4101 // 82) * 82
+    assert padded_blocks == 4182
+    for group in runner_backend.runner.attn_groups:
+        workspace = group[0]._mixed_indexer_metadata
+        assert workspace.max_blocks == padded_blocks
+        canonical_table = torch.full((1, padded_blocks), 82, dtype=torch.int32)
+        canonical_slots = torch.tensor([82 * 128 + 7, -1])
+        physical_table, physical_slots = workspace.update(canonical_table, canonical_slots)
+        assert physical_table.tolist() == [[164] * padded_blocks]
+        assert physical_slots.tolist() == [164 * 128 + 7, -1]
 
 
 @pytest.mark.parametrize("prefill", [True, False])

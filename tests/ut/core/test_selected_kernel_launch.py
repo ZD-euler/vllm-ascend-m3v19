@@ -387,6 +387,8 @@ class SelectedKernelLaunchTest(unittest.TestCase):
         self.assertIn("ASCENDC_DUMP=1 ONE_CORE_DUMP_SIZE=1024", build)
         self.assertIn("-DASCENDC_DUMP=1 -DONE_CORE_DUMP_SIZE=1024", build)
         self.assertIn("sparse_prefill_fused_fixed.o", build)
+        self.assertIn('"${SELECTED_KV_SOURCE_DIR}/li_page_gather_queued.cpp"', build)
+        self.assertIn("dsa_selected_li_pages ${TORCH_LIBRARIES}", build)
         self.assertEqual(build.count("ascendc_compile_definitions("), 2)
         self.assertEqual(build.count("ascendc_compile_options("), 2)
 

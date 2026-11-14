@@ -55,3 +55,15 @@ def selected_prefill_ineligibility_reason(
     if reader_retirement_ready is not True:
         return "Selected prefill requires LMCache reader retirement."
     return None
+
+
+def packed_main_c8_enabled(kv_cache_spec: object) -> bool:
+    """Return the packed-main C8 marker, which must be an explicit boolean.
+
+    Ordinary specs omit the marker and default to disabled. Callers that fake
+    a spec must set the marker explicitly instead of relying on mock children.
+    """
+    marker = getattr(kv_cache_spec, "cache_sparse_sfa_c8", False)
+    if type(marker) is not bool:
+        raise ValueError("Packed main C8 marker must be a boolean")
+    return marker

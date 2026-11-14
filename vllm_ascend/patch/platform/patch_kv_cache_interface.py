@@ -9,6 +9,8 @@ from typing_extensions import Self
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
+from vllm_ascend.attention.selected_prefill_policy import packed_main_c8_enabled
+
 
 @dataclass(frozen=True)
 class AscendMLAAttentionSpec(MLAAttentionSpec):
@@ -74,9 +76,7 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
         return 0
 
     def _packed_main_c8_enabled(self) -> bool:
-        if type(self.cache_sparse_sfa_c8) is not bool:
-            raise ValueError("Packed main C8 marker must be a boolean")
-        return self.cache_sparse_sfa_c8
+        return packed_main_c8_enabled(self)
 
     @property
     def page_size_bytes(self) -> int:

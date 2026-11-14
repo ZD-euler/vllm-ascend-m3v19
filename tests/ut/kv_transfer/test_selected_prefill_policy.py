@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
+from types import SimpleNamespace
 
 from vllm_ascend.attention.selected_prefill_policy import (
+    packed_main_c8_enabled,
     selected_prefill_ineligibility_reason,
     selected_prefill_requested,
 )
@@ -72,3 +74,14 @@ class TestSelectedPrefillPolicy(unittest.TestCase):
 
     def test_validated_capabilities_allow_step_preparation(self):
         self.assertIsNone(selected_prefill_ineligibility_reason(**self.supported))
+
+    def test_packed_main_marker_defaults_to_disabled(self):
+        self.assertFalse(packed_main_c8_enabled(SimpleNamespace()))
+        self.assertFalse(packed_main_c8_enabled(SimpleNamespace(cache_sparse_sfa_c8=False)))
+        self.assertTrue(packed_main_c8_enabled(SimpleNamespace(cache_sparse_sfa_c8=True)))
+
+    def test_packed_main_marker_rejects_non_boolean_values(self):
+        for marker in (0, 1, None, "false"):
+            with self.subTest(marker=marker):
+                with self.assertRaisesRegex(ValueError, "marker must be a boolean"):
+                    packed_main_c8_enabled(SimpleNamespace(cache_sparse_sfa_c8=marker))

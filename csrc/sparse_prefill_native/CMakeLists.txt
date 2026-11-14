@@ -40,18 +40,20 @@ add_custom_command(TARGET sparse_prefill_fused_fixed POST_BUILD
 # Host launch/queue wrapper. It loads the fixed kernel object, runs the
 # prefix union entrypoint from sparse_prefill_union_pipeline, then launches
 # sparse_prefill_partition_finish_fixed with the target's 12-argument
-# signature. The remaining LI queue source is owned separately.
+# signature. It also registers the LI page-gather queue so the installed
+# package exports torch.ops.dsa_prefill_queue.li_page_gather.
 add_library(sparse_prefill_fused_fixed_launch SHARED
     "${SELECTED_KV_SOURCE_DIR}/sparse_prefill_fused_fixed_launch.cpp"
     "${SELECTED_KV_SOURCE_DIR}/sparse_prefill_batch_queued.cpp"
+    "${SELECTED_KV_SOURCE_DIR}/li_page_gather_queued.cpp"
     "${SELECTED_KV_SOURCE_DIR}/hybm_address_export.cpp")
 target_include_directories(sparse_prefill_fused_fixed_launch PRIVATE
     "${ASCEND_HOME_PATH}/include" ${TORCH_INCLUDE_DIRS} "${TORCH_NPU_PATH}/include")
 target_link_directories(sparse_prefill_fused_fixed_launch PRIVATE
     "${ASCEND_HOME_PATH}/lib64" "${TORCH_NPU_PATH}/lib")
 target_link_libraries(sparse_prefill_fused_fixed_launch PRIVATE
-    ascendcl sparse_prefill_union_pipeline ${TORCH_LIBRARIES} torch_npu)
-add_dependencies(sparse_prefill_fused_fixed_launch sparse_prefill_fused_fixed)
+    ascendcl sparse_prefill_union_pipeline dsa_selected_li_pages ${TORCH_LIBRARIES} torch_npu)
+add_dependencies(sparse_prefill_fused_fixed_launch sparse_prefill_fused_fixed dsa_selected_li_pages)
 separate_arguments(torch_abi_flags NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
 target_compile_options(sparse_prefill_fused_fixed_launch PRIVATE ${torch_abi_flags})
 
@@ -69,6 +71,7 @@ install(TARGETS ${SELECTED_KV_TARGETS} LIBRARY DESTINATION "${VLLM_ASCEND_PACKAG
 install(FILES "${SELECTED_KV_LIBRARY_DIR}/sparse_prefill_fused_fixed.o"
     DESTINATION "${VLLM_ASCEND_PACKAGE_PATH}/lib")
 
-# Not wired here: the Python selected runtime, LI page-gather queue
-# registration, and any token-count host rounding. The launcher validates only
-# static geometry; device counts stay on device.
+# The host wrapper owns the selected runtime queue registration, including
+# torch.ops.dsa_prefill_queue.li_page_gather. The Python selected runtime and
+# token-count host rounding are still unwired; the launcher validates only
+# static geometry and device counts stay on device.

@@ -126,8 +126,10 @@ set(
 pybind11_add_module(vllm_ascend_C ${VLLM_ASCEND_SRC})
 
 # Selected-KV prefill device kernels are A3-only and remain separate from the
-# ordinary operator library.
-if(SOC_VERSION MATCHES "ascend910_93.*")
+# ordinary operator library. The feature is still disabled at runtime, so do
+# not make these kernels a hard dependency of every A3 plugin build.
+option(VLLM_ASCEND_BUILD_SELECTED_KV "Build selected-KV prefill kernel targets" OFF)
+if(VLLM_ASCEND_BUILD_SELECTED_KV AND SOC_VERSION MATCHES "ascend910_93.*")
   include(${CMAKE_CURRENT_SOURCE_DIR}/csrc/sparse_prefill_native/CMakeLists.txt)
 endif()
 

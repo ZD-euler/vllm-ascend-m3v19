@@ -13,6 +13,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm_ascend.attention.selected_prefill_policy import packed_main_c8_enabled
+
 ROOT = Path(__file__).resolve().parents[3]
 
 
@@ -34,7 +36,12 @@ def vllm_root():
 
 @pytest.fixture(scope="module")
 def api(vllm_root):
-    namespace = {"dataclass": dataclass, "torch": torch, "get_dtype_size": lambda dtype: dtype.itemsize}
+    namespace = {
+        "dataclass": dataclass,
+        "torch": torch,
+        "get_dtype_size": lambda dtype: dtype.itemsize,
+        "packed_main_c8_enabled": packed_main_c8_enabled,
+    }
     _load_definitions(
         vllm_root / "v1/kv_cache_interface.py",
         {"KVCacheSpec", "AttentionSpec", "FullAttentionSpec", "MLAAttentionSpec", "UniformTypeKVCacheSpecs"},
@@ -207,6 +214,7 @@ def initialize(api):
     namespace = {
         "staged_sfa_graph_configured": lambda config: False,
         "UniformTypeKVCacheSpecs": api.UniformTypeKVCacheSpecs,
+        "packed_main_c8_enabled": packed_main_c8_enabled,
     }
     exec(compile(tree, str(source), "exec"), namespace)
     return namespace["initialize_kv_cache"]

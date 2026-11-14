@@ -18,7 +18,7 @@ class SelectedLIGatherQueueTest(unittest.TestCase):
             self.skipTest("A host C++ compiler is required")
         return compiler
 
-    def test_real_binding_accepts_both_page_layouts_and_keeps_current_stream_and_tensors(self):
+    def test_real_binding_requires_layout_marker_and_forwards_destination_ids(self):
         import torch
         from torch.utils.cpp_extension import include_paths
 
@@ -48,10 +48,14 @@ class SelectedLIGatherQueueTest(unittest.TestCase):
 #include <cassert>
 #include <cstdlib>
 #include <iostream>
+#include <optional>
+#include <string>
 void* testStream=reinterpret_cast<void*>(0x123);
 std::vector<std::function<int()>> commands;
 int calls=0, frees=0, launchStatus=0;
 void* expected[3]{};
+const uint32_t* expectedIds=nullptr;
+uint32_t expectedPages=9;
 uint32_t expectedData=16384, expectedScaleBytes=256, expectedStride=16384;
 at::Tensor Make(at::ScalarType dtype, std::vector<int64_t> shape,
     std::vector<int64_t> stride={}, c10::Device device={c10::DeviceType::PrivateUse1,0}) {
@@ -63,12 +67,15 @@ at::Tensor Make(at::ScalarType dtype, std::vector<int64_t> shape,
     if(!stride.empty()) builder.strides(stride);
     return builder.make_tensor();
 }
-extern "C" int32_t launch_dsa_selected_li_pages(void* stream,void* bases,void* k,void* scale,
-    uint32_t domain,uint32_t pages,uint32_t mainOffset,uint32_t dataOffset,uint32_t scaleOffset,
+extern "C" int32_t launch_dsa_selected_li_pages_mapped(void* stream,void* bases,
+    const uint32_t* ids,void* k,void* scale,uint32_t domain,uint32_t pages,
+    uint32_t mainOffset,uint32_t dataOffset,uint32_t scaleOffset,
     uint32_t dataBytes,uint32_t scaleBytes,uint32_t destinationStrideBytes) {
     assert(stream==reinterpret_cast<void*>(0x123));
     assert(bases==expected[0] && k==expected[1] && scale==expected[2]);
-    assert(domain==7 && pages==9 && mainOffset==8192 && dataOffset==256 && scaleOffset==17408);
+    assert(ids==expectedIds);
+    assert(domain==7 && pages==expectedPages && mainOffset==8192 && dataOffset==256 &&
+           scaleOffset==17408);
     assert(dataBytes==expectedData && scaleBytes==expectedScaleBytes &&
            destinationStrideBytes==expectedStride);
     ++calls;return launchStatus;
@@ -82,26 +89,37 @@ int main(){
     {
         auto bases=Make(at::kUInt64,{7}),k=Make(at::kChar,{9,128,1,128}),s=Make(at::kHalf,{9,128,1,1});
         expected[0]=bases.data_ptr();expected[1]=k.data_ptr();expected[2]=s.data_ptr();
-        LIPageGather(bases,k,s,8192,256,17408);
+        expectedIds=nullptr;expectedPages=9;
+        expectedData=16384;expectedScaleBytes=256;expectedStride=16384;
+        LIPageGather(bases,k,s,8192,256,17408,"native",std::nullopt);
         assert(commands.size()==1 && calls==0);
         // The command owns all tensor references even after the caller drops them.
     }
     assert(frees==0);testStream=reinterpret_cast<void*>(0x456);
     assert(commands.front()()==0 && calls==1);commands.clear();assert(frees==3);
     {
-        // Target packed mixed indexer: 32 KiB K and 512 B scale per logical page.
+        // Packed logical LI pages with an explicit source -> LI block map.
         testStream=reinterpret_cast<void*>(0x123);
-        auto bases=Make(at::kUInt64,{7}),k=Make(at::kChar,{9,256,128}),s=Make(at::kHalf,{9,256});
+        auto bases=Make(at::kUInt64,{7}),ids=Make(at::kInt,{7}),
+             k=Make(at::kChar,{9,256,128}),s=Make(at::kHalf,{9,256});
         expected[0]=bases.data_ptr();expected[1]=k.data_ptr();expected[2]=s.data_ptr();
-        expectedData=32768;expectedScaleBytes=512;expectedStride=32768;
-        LIPageGather(bases,k,s,8192,256,17408);
+        expectedIds=reinterpret_cast<const uint32_t*>(ids.data_ptr<int32_t>());
+        expectedPages=9;expectedData=32768;expectedScaleBytes=512;expectedStride=32768;
+        LIPageGather(bases,k,s,8192,256,17408,"packed",ids);
         assert(commands.size()==1 && calls==1);
         assert(commands.front()()==0 && calls==2);commands.clear();
-        expectedData=16384;expectedScaleBytes=256;expectedStride=16384;
+        expectedIds=nullptr;expectedData=16384;expectedScaleBytes=256;expectedStride=16384;
     }
+    assert(frees==7);
     auto bases=Make(at::kUInt64,{7}),k=Make(at::kChar,{9,128,128}),s=Make(at::kHalf,{9,128});
+    auto packedK=Make(at::kChar,{9,256,128}),packedS=Make(at::kHalf,{9,256});
+    auto ids=Make(at::kInt,{7});
     auto call=[&](const at::Tensor& b,const at::Tensor& key,const at::Tensor& scale,
-                  int64_t m=8192,int64_t d=256,int64_t z=17408){LIPageGather(b,key,scale,m,d,z);};
+                  int64_t m=8192,int64_t d=256,int64_t z=17408,
+                  const std::string& layout="native",
+                  const std::optional<at::Tensor>& destinations=std::nullopt){
+        LIPageGather(b,key,scale,m,d,z,layout,destinations);
+    };
     Reject([&]{call(Make(at::kLong,{7}),k,s);});
     Reject([&]{call(Make(at::kUInt64,{0}),k,s);});
     Reject([&]{call(Make(at::kUInt64,{1,7}),k,s);});
@@ -112,14 +130,14 @@ int main(){
     Reject([&]{call(bases,Make(at::kChar,{147456}),s);});
     Reject([&]{call(bases,Make(at::kChar,{9,128,127}),s);});
     Reject([&]{call(bases,Make(at::kChar,{9,256,127}),s);});
-    Reject([&]{call(bases,Make(at::kChar,{9,256,128}),s);});  // 32 KiB K needs 512 B scale.
+    Reject([&]{call(bases,Make(at::kChar,{9,256,128}),s);});  // 32 KiB K needs the packed marker.
     Reject([&]{call(bases,Make(at::kChar,{9,128,128},{32768,128,1}),s);});
     Reject([&]{call(bases,k,Make(at::kChar,{9,256}));});
     Reject([&]{call(bases,k,Make(at::kHalf,{9,127}));});
     Reject([&]{call(bases,k,Make(at::kHalf,{9,257}));});
     Reject([&]{call(bases,k,Make(at::kHalf,{8,128}));});
     Reject([&]{call(bases,k,Make(at::kHalf,{9,128},{256,1}));});
-    Reject([&]{call(bases,k,Make(at::kHalf,{9,256}));});  // 512 B scale needs 32 KiB K.
+    Reject([&]{call(bases,k,Make(at::kHalf,{9,256}));});  // 512 B scale needs the packed marker.
     Reject([&]{call(Make(at::kUInt64,{10}),k,s);});
     Reject([&]{call(bases,k,s,-1);});
     Reject([&]{call(bases,k,s,INT64_MAX);});
@@ -127,12 +145,32 @@ int main(){
     Reject([&]{call(bases,k,s,8192,UINT32_MAX-16384+1ULL);});
     Reject([&]{call(bases,k,s,8192,256,-1);});
     Reject([&]{call(bases,k,s,8192,256,UINT32_MAX-256+1ULL);});
+    // The packed marker cannot silently reinterpret a per-extent view.
+    Reject([&]{call(bases,Make(at::kChar,{9,128,1,128}),Make(at::kHalf,{9,128,1,1}),
+                    8192,256,17408,"packed",ids);});
+    Reject([&]{call(bases,packedK,packedS,8192,256,17408,"packed");});
+    Reject([&]{call(bases,packedK,Make(at::kHalf,{9,128}),8192,256,17408,"packed",ids);});
+    Reject([&]{call(bases,k,packedS,8192,256,17408,"packed",ids);});
+    Reject([&]{call(bases,packedK,packedS,8192,256,17408,"extent",ids);});
+    Reject([&]{call(bases,k,s,8192,256,17408,"native",Make(at::kLong,{7}));});
+    Reject([&]{call(bases,k,s,8192,256,17408,"native",Make(at::kInt,{6}));});
+    Reject([&]{call(bases,k,s,8192,256,17408,"native",Make(at::kInt,{1,7}));});
+    Reject([&]{call(bases,k,s,8192,256,17408,"native",Make(at::kInt,{7},{2}));});
+    Reject([&]{call(bases,k,s,8192,256,17408,"native",
+                    Make(at::kInt,{7},{},{c10::DeviceType::CPU}));});
+    Reject([&]{call(bases,k,s,8192,256,17408,"native",
+                    Make(at::kInt,{7},{},{c10::DeviceType::PrivateUse1,1}));});
     testStream=reinterpret_cast<void*>(0x123);launchStatus=37;
     expected[0]=bases.data_ptr();expected[1]=k.data_ptr();expected[2]=s.data_ptr();
+    expectedIds=nullptr;expectedPages=9;
+    expectedData=16384;expectedScaleBytes=256;expectedStride=16384;
     call(bases,k,s);
     assert(commands.size()==1 && commands.front()()==37);commands.clear();
     const auto op=c10::Dispatcher::singleton().findSchemaOrThrow("dsa_prefill_queue::li_page_gather","");
     assert(op.hasKernelForDispatchKey(c10::DispatchKey::PrivateUse1));
+    const auto& args=op.schema().arguments();
+    assert(args.size()==8 && !args[6].default_value().has_value() &&
+           args[7].default_value().has_value());
     std::cout<<"LI host contracts passed\n";
 }
 """
@@ -159,7 +197,8 @@ int main(){
                 text=True,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            result = subprocess.run([str(executable)], check=True, capture_output=True, text=True)
+            result = subprocess.run([str(executable)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "LI host contracts passed\n")
 
 
