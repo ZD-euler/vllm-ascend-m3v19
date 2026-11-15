@@ -264,6 +264,7 @@ env_variables: dict[str, Callable[[], Any]] = {
         0,
     ),
     "VLLM_ASCEND_DSA_LMCACHE_CPU_GB": lambda: float(os.getenv("VLLM_ASCEND_DSA_LMCACHE_CPU_GB", "0")),
+    "VLLM_ASCEND_ENABLE_SELECTED_KV_PREFILL": lambda: _strict_bool_env("VLLM_ASCEND_ENABLE_SELECTED_KV_PREFILL"),
 }
 
 # end-env-vars-definition
