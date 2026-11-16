@@ -1374,7 +1374,8 @@ def test_target_names_follow_collection_reset_and_recollection(failed_reset):
 @pytest.mark.parametrize(
     "change", ["none", "replacement", "wrapper", "order", "missing", "fallback", "cascade", "width"]
 )
-def test_async_route_reuses_only_current_validated_metadata(routing, request, monkeypatch, change):
+@pytest.mark.parametrize("residency", ["sparse", "resident", "mixed"])
+def test_async_route_reuses_only_current_validated_metadata(routing, request, monkeypatch, change, residency):
     base, ns, _, _, states = routing
     runner, scheduled, _, _, async_ns = request.getfixturevalue("setup")
     root = Path(__file__).resolve().parents[3] / "vllm_ascend"
@@ -1397,16 +1398,26 @@ def test_async_route_reuses_only_current_validated_metadata(routing, request, mo
     runner.attn_state = states.SpecDecoding
     runner._staged_sfa_graph_capture_sizes = (8, 16)
     runner.decode_threshold = 2
+    frontiers = tuple(
+        4096 if residency == "sparse" or (residency == "mixed" and i == 0) else 0
+        for i in range(runner.input_batch.num_reqs)
+    )
+    runner._async_snapshot.frontiers = runner._async_snapshot.boundary = frontiers
+    boundary = tuple(value for value in frontiers for _ in range(2)) + (0, 0)
+    runner.item.decode_remap_boundary_buffer._values = runner._async_snapshot.boundary_values = boundary
     scheduled.kv_connector_metadata = SimpleNamespace(
         requests=[
             SimpleNamespace(
                 req_id=rid,
-                is_sparse_decode=True,
-                dsa_current_released_frontier=4096,
-                dsa_nonresident_frontier=4096,
-                load_spec=SimpleNamespace(can_load=True, lmcache_cached_tokens=4096, dsa_committed_end=4096),
+                is_sparse_decode=frontier > 0,
+                dsa_current_released_frontier=frontier,
+                dsa_nonresident_frontier=frontier,
+                load_spec=(
+                    SimpleNamespace(can_load=True, lmcache_cached_tokens=frontier, dsa_committed_end=frontier)
+                    if frontier else None
+                ),
             )
-            for rid in runner.input_batch.req_ids
+            for rid, frontier in zip(runner.input_batch.req_ids, frontiers)
         ]
     )
     runner._update_states(scheduled)
@@ -1442,6 +1453,9 @@ def test_async_route_reuses_only_current_validated_metadata(routing, request, mo
     assert len(calls) == (1 if reused else 2)
     expected = ns["_staged_sfa_local_route"](runner, **kwargs)
     assert actual == expected
+    if change == "none":
+        assert actual.action == ns["StagedSFARouteAction"].STAGED
+        assert actual.frontiers == frontiers
     if change in ("cascade", "width"):
         assert actual.action == ns["StagedSFARouteAction"].SAFE_NATIVE
     # A new step must validate fresh metadata; no route result lives across steps.

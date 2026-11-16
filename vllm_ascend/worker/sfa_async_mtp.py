@@ -73,9 +73,11 @@ class AsyncSFAModelRunner(NPUModelRunner):
             raise ValueError("SFA async MTP preparation requires full SFA graphs, async MTP=1, PP=PCP=1 and a supported KV layout")
         self._async_bases = torch.empty(self.max_num_reqs, dtype=torch.int32, device=self.device)
         self._async_snapshot = self._async_pending = self._async_built = None
+        self._async_validated_route = None
         self._async_counts = None
         self._async_epoch, self._async_counts_epoch = 0, -1
         self.async_mtp_replays = 0
+        logger.info("[SFA async MTP] enabled: source=%s", __file__)
 
     @torch.inference_mode()
     def capture_model(self, *args, **kwargs):
@@ -350,9 +352,16 @@ class AsyncSFAModelRunner(NPUModelRunner):
                 or np.any(last_column >= group.num_blocks_per_row[:len(ids)])
             ):
                 return False
-        reason, frontiers, cold = staged_sfa_metadata_sparse_route(scheduled.kv_connector_metadata, ids)
+        route = staged_sfa_metadata_sparse_route(scheduled.kv_connector_metadata, ids)
+        reason, frontiers, cold = route
         if (
-            reason != StagedSFARouteReason.ELIGIBLE
+            # Full graphs also support resident rows (zero remap frontier),
+            # including batches mixing resident and retrieved prefixes.
+            reason not in (
+                StagedSFARouteReason.ELIGIBLE,
+                StagedSFARouteReason.DENSE_PREFIX_HIT,
+                StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
+            )
             or cold
             or frontiers != s.frontiers
             or any(getattr(r, "is_decode_window_save", False) for r in scheduled.kv_connector_metadata.requests)
@@ -360,12 +369,16 @@ class AsyncSFAModelRunner(NPUModelRunner):
             return False
         # Without window saving the remap boundary is independent of acceptance.
         if s.window == 0:
-            return frontiers == s.boundary
-        # Both possible acceptance counts must leave the existing boundary exact.
-        return (
-            _boundary(s.bases + 1, frontiers, s.window) == s.boundary
-            and _boundary(high, frontiers, s.window) == s.boundary
-        )
+            unchanged = frontiers == s.boundary
+        else:
+            # Both possible acceptance counts must leave the existing boundary exact.
+            unchanged = (
+                _boundary(s.bases + 1, frontiers, s.window) == s.boundary
+                and _boundary(high, frontiers, s.window) == s.boundary
+            )
+        if unchanged:
+            self._async_validated_route = route
+        return unchanged
 
     def _update_states(self, scheduler_output):
         self._async_pending = scheduler_output if self._eligible(scheduler_output) else None
@@ -380,7 +393,7 @@ class AsyncSFAModelRunner(NPUModelRunner):
             # _eligible validated this step; no CPU request mutation has run.
             kwargs["_validated_sparse_route"] = (
                 pending.kv_connector_metadata,
-                (StagedSFARouteReason.ELIGIBLE, snapshot.frontiers, ()),
+                self._async_validated_route,
             )
         return super()._staged_sfa_local_route(**kwargs)
 
@@ -530,7 +543,10 @@ class AsyncSFAModelRunner(NPUModelRunner):
                 common.max_seq_len = int(self.seq_lens.np[: len(s.ids)].max())
                 self.async_mtp_replays += 1
                 if self.async_mtp_replays == 1:
-                    logger.info("[SFA async MTP] first launch-before-reconcile batch: requests=%d", len(s.ids))
+                    logger.info(
+                        "[SFA async MTP] first launch-before-reconcile batch: requests=%d connector_route=%s",
+                        len(s.ids), self._async_validated_route[0],
+                    )
             self._remember(seed=not deferred)
             return output
         except BaseException:

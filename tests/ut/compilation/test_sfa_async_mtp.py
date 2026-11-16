@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -125,6 +126,7 @@ def setup():
         return positions.clone(), -positions.clone()
 
     ns = dict(
+        __file__=str(RUNNER),
         np=np,
         logger=SimpleNamespace(info=lambda *args: None),
         torch=torch,
@@ -143,7 +145,9 @@ def setup():
         npu_content_diagnostics_enabled=lambda: False,
         _decode_window_save_window_size=lambda: 0,
         staged_sfa_metadata_sparse_route=lambda m, ids: (m.reason, m.frontiers, m.cold),
-        StagedSFARouteReason=SimpleNamespace(ELIGIBLE="eligible"),
+        StagedSFARouteReason=SimpleNamespace(
+            ELIGIBLE="eligible", DENSE_PREFIX_HIT="dense_prefix_hit", MIXED_CONNECTOR_LOAD="mixed_connector_load",
+        ),
         AscendAttentionState=SimpleNamespace(SpecDecoding="decode"),
         prepare_async_mtp_kernel=Kernel(events),
         prepare_async_mtp_tokens_kernel=AsyncMTPTokenKernel(events),
@@ -239,6 +243,7 @@ def setup():
     runner._staged_sfa_impls = (("l0", object()), ("l1", object()))
     runner._staged_sfa_layer_names = ("l0", "l1")
     runner._async_pending = runner._async_built = None
+    runner._async_validated_route = None
     runner._async_epoch = runner._async_counts_epoch = 1
     runner._async_counts = torch.tensor([1, 2, 1], dtype=torch.int64)
     runner._async_bases = torch.from_numpy(bases.copy())
@@ -589,6 +594,7 @@ def test_cpu_sampling_constraints_keep_original_preparation(setup, field):
 @pytest.mark.parametrize("unsupported", ["none", "triton", "async", "mtp", "pp", "cp"])
 def test_startup_contract_rejects_unsupported_modes(setup, unsupported):
     r, _, _, _, ns = setup
+    ns["logger"].info = Mock()
     r.vllm_config, r.device = object(), torch.device("cpu")
     r.max_num_reqs, r.use_async_scheduling, r._fixed_mtp_metadata = 3, True, ()
     r.parallel_config = SimpleNamespace(pipeline_parallel_size=1)
@@ -605,9 +611,11 @@ def test_startup_contract_rejects_unsupported_modes(setup, unsupported):
     if unsupported == "none":
         r.__init__()
         assert r._async_bases.shape == (3,)
+        ns["logger"].info.assert_called_once_with("[SFA async MTP] enabled: source=%s", str(RUNNER))
     else:
         with pytest.raises(ValueError, match="requires"):
             r.__init__()
+        ns["logger"].info.assert_not_called()
 
 
 def test_non_target_indexer_metadata_does_not_disable_async_entry(setup):
@@ -657,7 +665,17 @@ def test_unpadded_draft_lengths_and_padded_target_lengths(setup):
     assert events.index("replay") < events.index("sync")
 
 
-def _dcp_snapshot(r, scheduled, bases, origins):
+def _set_residency(r, scheduled, ns, residency):
+    frontiers = (0, 0, 0) if residency == "resident" else (4096, 0, 4096)
+    r._async_snapshot.frontiers = r._async_snapshot.boundary = frontiers
+    boundary = tuple(value for value in frontiers for _ in range(2)) + (0, 0)
+    r.item.decode_remap_boundary_buffer._values = r._async_snapshot.boundary_values = boundary
+    scheduled.kv_connector_metadata.frontiers = frontiers
+    scheduled.kv_connector_metadata.reason = "dense_prefix_hit" if residency == "resident" else "mixed_connector_load"
+    ns["get_forward_context"]().staged_sfa_route.frontiers = frontiers
+
+
+def _dcp_snapshot(r, scheduled, bases, origins, world=4, rank=1):
     n = r.input_batch.num_reqs
     r._async_snapshot.bases[:] = bases
     r.input_batch.num_computed_tokens_cpu[:] = bases
@@ -666,24 +684,28 @@ def _dcp_snapshot(r, scheduled, bases, origins):
     r._dsa_dcp_live_origins = np.array(origins, dtype=np.int32)
     scheduled.dsa_dcp_compact_req_ids = {req for req, origin in zip(r.input_batch.req_ids, origins) if origin}
     r.item.sfa_dcp = r._async_snapshot.common.sfa_dcp = SimpleNamespace(
-        layout=SimpleNamespace(world_size=4, rank=1, live_origins=torch.tensor(origins, dtype=torch.int32)),
+        layout=SimpleNamespace(world_size=world, rank=rank, live_origins=torch.tensor(origins, dtype=torch.int32)),
         local_seq_lens=torch.full((n + 2,), -77, dtype=torch.int32),
     )
 
 
 @pytest.mark.parametrize("change", ["none", "origin", "capacity"])
-def test_async_dcp_reconciles_rank_local_slots_before_replay(setup, change):
-    r, s, shape, events, _ = setup
+@pytest.mark.parametrize("residency", ["resident", "mixed"])
+@pytest.mark.parametrize("world,rank", [(4, 1), (8, 0), (8, 7)])
+def test_async_dcp_reconciles_rank_local_slots_before_replay(setup, change, residency, world, rank):
+    r, s, shape, events, ns = setup
     bases = np.array([8190, 8318, 8446], dtype=np.int32)
-    _dcp_snapshot(r, s, bases, [4096, 0, 4096])
+    _set_residency(r, s, ns, residency)
+    origins = [0, 0, 0] if residency == "resident" else [4096, 0, 4096]
+    _dcp_snapshot(r, s, bases, origins, world, rank)
     group0, group1 = r.input_batch.block_table.block_tables
-    group0.num_blocks_per_row[:3] = [49, 17, 49]
+    group0.num_blocks_per_row[:3] = (bases + 3) // 128 // world + np.asarray(origins) // 128 + 1
     group1.block_size, group1.kernel_sizes = 128, [128]
     if change == "origin":
         s.dsa_dcp_compact_req_ids.add("r1")
     elif change == "capacity":
-        # The last potential row is at column 48 after the scratch prefix.
-        group0.num_blocks_per_row[0] = 48
+        # Remove the last column needed by the two-token acceptance case.
+        group0.num_blocks_per_row[0] -= 1
     r._update_states(s)
     if change != "none":
         assert r._async_pending is None and events == ["sync", "state_update"]
@@ -700,11 +722,14 @@ def test_async_dcp_reconciles_rank_local_slots_before_replay(setup, change):
     assert r.positions.gpu.tolist() == [*positions, 0, 0]
     for i, (position, origin) in enumerate(zip(positions, np.repeat(r._dsa_dcp_live_origins, 2))):
         stripe, offset = divmod(position, 128)
-        expected = int(group0.table[i // 2, origin // 128 + stripe // 4]) * 128 + offset if stripe % 4 == 1 else -1
+        expected = (
+            int(group0.table[i // 2, origin // 128 + stripe // world]) * 128 + offset
+            if stripe % world == rank else -1
+        )
         assert r.item.slot_mapping[i] == expected
         assert r.item.indexer_slot_mapping[i] == int(group1.table[i // 2, stripe]) * 128 + offset
     expected_lengths = [
-        int(origin) + (end // 512) * 128 + min(128, max(0, end % 512 - 128))
+        int(origin) + (end // (128 * world)) * 128 + min(128, max(0, end % (128 * world) - 128 * rank))
         for origin, end in zip(r._dsa_dcp_live_origins, current + 2)
     ]
     assert dcp.local_seq_lens.tolist() == [*expected_lengths, 0, 0]
@@ -800,8 +825,12 @@ def test_deferred_update_matches_actual_vllm_request_bookkeeping(setup, monkeypa
         assert vars(r.requests[rid]) == vars(baseline.requests[rid])
 
 
-def test_many_rejections_never_accumulate_position_drift(setup):
-    r, s, shape, events, _ = setup
+@pytest.mark.parametrize("residency", ["sparse", "resident", "mixed"])
+def test_many_rejections_never_accumulate_position_drift(setup, residency):
+    r, s, shape, events, ns = setup
+    if residency != "sparse":
+        _set_residency(r, s, ns, residency)
+    ns["logger"].info = Mock()
     expected = r._async_snapshot.bases.copy()
     for step in range(60):
         counts = torch.tensor([1 + step % 2, 1, 2], dtype=torch.int64)
@@ -818,6 +847,10 @@ def test_many_rejections_never_accumulate_position_drift(setup):
         assert r._async_bases.tolist() == expected.tolist()
         assert events.index("replay") < events.index("sync")
     assert r.async_mtp_replays == 60
+    ns["logger"].info.assert_called_once_with(
+        "[SFA async MTP] first launch-before-reconcile batch: requests=%d connector_route=%s",
+        3, s.kv_connector_metadata.reason,
+    )
 
 
 @pytest.mark.parametrize("enabled", [False, True])
