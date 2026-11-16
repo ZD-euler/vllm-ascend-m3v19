@@ -44,12 +44,12 @@ class Client:
         self.timeout = timeout
         self.api_key = api_key
 
-    def request(self, path, payload=None):
-        headers = {"Content-Type": "application/json"}
+    def request(self, path, payload=None, *, headers=None):
+        request_headers = {"Content-Type": "application/json", **(headers or {})}
         if self.api_key:
-            headers["Authorization"] = "Bearer " + self.api_key
+            request_headers["Authorization"] = "Bearer " + self.api_key
         data = None if payload is None else json.dumps(payload).encode("utf-8")
-        request = Request(self.base_url + path, data=data, headers=headers)
+        request = Request(self.base_url + path, data=data, headers=request_headers)
         try:
             with urlopen(request, timeout=self.timeout) as response:
                 body = response.read()
@@ -184,11 +184,11 @@ def profile_runs(directory):
     return {path.resolve() for path in directory.rglob("*_ascend_pt") if path.is_dir()}
 
 
-def analyse_runs(runs, root):
+def analyse_runs(runs, root, prefix=PREFIX):
     runs = sorted(runs)
     if not runs:
         raise RuntimeError("No new *_ascend_pt captures found in --profile-dir")
-    print(f"{PREFIX} exporting {len(runs)} capture(s) after profiling stopped", flush=True)
+    print(f"{prefix} exporting {len(runs)} capture(s) after profiling stopped", flush=True)
     code = (
         "import sys; from torch_npu.profiler.profiler import analyse; "
         "[analyse(path, max_process_number=2) for path in sys.argv[1:]]"
@@ -202,7 +202,7 @@ def analyse_runs(runs, root):
         traces.extend(worker_traces)
     write_json(root / "traces.json", traces)
     for trace in traces:
-        print(f"{PREFIX} MindStudio trace: {trace}", flush=True)
+        print(f"{prefix} MindStudio trace: {trace}", flush=True)
     return traces
 
 

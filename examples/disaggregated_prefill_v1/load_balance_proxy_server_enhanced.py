@@ -56,11 +56,13 @@ logger = logging.getLogger(__name__)
 
 
 if __package__:
-    from .remote_fill_placement import validate_remote_fill_placement
     from .pd_serving_perf import serving_perf_enabled as _serving_perf_enabled
+    from .profile_routes import profile_response, profile_route
+    from .remote_fill_placement import validate_remote_fill_placement
 else:
-    from remote_fill_placement import validate_remote_fill_placement
     from pd_serving_perf import serving_perf_enabled as _serving_perf_enabled
+    from profile_routes import profile_response, profile_route
+    from remote_fill_placement import validate_remote_fill_placement
 
 MAX_RECOMPUTE_RETRIES = 3
 _DECODER_PLACEMENT_DISCOVERY_TIMEOUT_SECONDS = 2.0
@@ -2664,6 +2666,11 @@ async def _handle_completions(api: str, request: Request):
         
         original_request_id = instance_info.request_id
         stream_flag = bool(req_data.get("stream", False))
+        profile_routes = (
+            [profile_route(instance_info)]
+            if not stream_flag and getattr(request, "headers", {}).get("x-vllm-profile-routes") == "1"
+            else None
+        )
 
         if not stream_flag:
             retry_count = 0
@@ -2703,8 +2710,11 @@ async def _handle_completions(api: str, request: Request):
                 stop_reason = choice.get("stop_reason") or choice.get("finish_reason")
                 if stop_reason not in {"recomputed", "force_free_recomputed"}:
                     content_type = response.headers.get("content-type", "application/json")
+                    content = response.content
+                    if profile_routes is not None:
+                        content = profile_response(content, profile_routes)
                     return Response(
-                        content=response.content,
+                        content=content,
                         status_code=response.status_code,
                         headers={"content-type": content_type},
                     )
@@ -2724,6 +2734,8 @@ async def _handle_completions(api: str, request: Request):
                     original_request_id=original_request_id,
                     prefix_anchors=prefix_anchors,
                 )
+                if profile_routes is not None:
+                    profile_routes.append(profile_route(instance_info))
                 released_kv = False
         
         async def generate_stream():

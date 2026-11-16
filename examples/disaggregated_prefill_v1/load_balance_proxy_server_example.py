@@ -178,11 +178,13 @@ def _encode_json_payload(payload: Any) -> bytes:
 
 
 if __package__:
-    from .remote_fill_placement import validate_remote_fill_placement
     from .pd_serving_perf import serving_perf_enabled as _proxy_cold_perf_enabled
+    from .profile_routes import profile_response_chunks, profile_route
+    from .remote_fill_placement import validate_remote_fill_placement
 else:
-    from remote_fill_placement import validate_remote_fill_placement
     from pd_serving_perf import serving_perf_enabled as _proxy_cold_perf_enabled
+    from profile_routes import profile_response_chunks, profile_route
+    from remote_fill_placement import validate_remote_fill_placement
 
 
 def _log_proxy_cold_perf_event(
@@ -1611,6 +1613,11 @@ async def _handle_completions(
             log_request_received=False,
         )
         stream_flag = bool(req_data.get("stream", False))
+        profile_routes = (
+            [profile_route(instance_info)]
+            if not stream_flag and headers.get("x-vllm-profile-routes") == "1"
+            else None
+        )
         chat_flag = "messages" in req_data
 
         if "prompt" in req_data:
@@ -1725,6 +1732,8 @@ async def _handle_completions(
                             tmp_request_length = len(json.dumps(req_data).encode("utf-8"))
                             _release_decoder_reservation(instance_info)
                             instance_info = await _handle_select_instance(api, req_data, tmp_request_length)
+                            if profile_routes is not None:
+                                profile_routes.append(profile_route(instance_info))
                             released_kv = False
                             break
                         if retry_count > 0 and not stream_flag:
@@ -1745,8 +1754,11 @@ async def _handle_completions(
 
         # Determine the correct media type based on stream flag
         media_type = "text/event-stream; charset=utf-8" if stream_flag else "application/json"
+        response_chunks = generate_stream()
+        if profile_routes is not None:
+            response_chunks = profile_response_chunks(response_chunks, profile_routes)
         response = _CleanupStreamingResponse(
-            generate_stream(),
+            response_chunks,
             media_type=media_type,
             headers={"X-Request-Id": instance_info.request_id},
             cleanup=cleanup_current_request,
