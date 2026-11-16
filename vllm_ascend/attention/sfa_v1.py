@@ -3934,13 +3934,22 @@ class AscendSFAImpl(MLAAttentionImpl):
         if dcp is not None:
             from vllm_ascend.ops.triton.sfa_dcp import prepare_sfa_dcp_topk
 
-            # The graph's planner rows, including idle rows, are device
-            # metadata. Capture only the capacity, never the live row count.
-            prepare_sfa_dcp_topk(
-                topk_indices, dcp.positions, dcp.topk, dcp.counts, dcp.topk.shape[0],
-                dcp.layout.world_size, dcp.layout.rank, self.block_size, local=False,
+            # Local target indexers emit only -1 or IDs <= L-Q+j, exactly
+            # the target position. Keep draft, alternate CP and unqualified
+            # shared/backend paths on the existing mask contract.
+            causal_topk = (
+                self.has_indexer and not self.skip_topk and not self.dsa_cp_decoder
+                and (self.use_sparse_c8_indexer or not self.use_torch_npu_lightning_indexer)
+                and not dcp.mask_indexer_writes
             )
-            topk_indices = dcp.topk
+            # Packing and the shared producer both own a copy before remapping.
+            if not (causal_topk and (bounded_decode or (group is not None and group.active))):
+                prepare_sfa_dcp_topk(
+                    topk_indices, dcp.positions, dcp.topk, dcp.counts, dcp.topk.shape[0],
+                    dcp.layout.world_size, dcp.layout.rank, self.block_size, local=False,
+                    _causal_global_ids=causal_topk,
+                )
+                topk_indices = dcp.topk
         if bounded_decode:
             original_requests = row_req_indices
             request_block_table = request_block_table[: graph_key.request_capacity]

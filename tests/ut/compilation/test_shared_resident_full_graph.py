@@ -17,7 +17,8 @@ from tests.ut.distributed.kv_transfer.test_shared_resident_plan import grouped, 
 @pytest.mark.parametrize("explicit", [False, True])
 @pytest.mark.parametrize("c8", [False, True])
 @pytest.mark.parametrize("dcp_enabled", [False, True])
-def test_bounded_group_packs_and_restores_once_per_invocation(explicit, c8, dcp_enabled, monkeypatch):
+@pytest.mark.parametrize("qualified", [False, True])
+def test_bounded_group_packs_and_restores_once_per_invocation(explicit, c8, dcp_enabled, qualified, monkeypatch):
     api = resident_api.__wrapped__()
     _, (producer, consumer), group, _ = grouped(api, mtp=2, bounded=True)
     layout = load_source("vllm_ascend/attention/sfa_graph_layout.py", "shared_bounded_layout")
@@ -33,9 +34,13 @@ def test_bounded_group_packs_and_restores_once_per_invocation(explicit, c8, dcp_
     )
     methods("vllm_ascend/attention/sfa_v1.py", {"_cross_layer_pre_compute"}, ns)
     ops = ModuleType("vllm_ascend.ops.triton.sfa_dcp")
-    ops.prepare_sfa_dcp_topk = Mock(side_effect=(
-        host_prepare_topk.__wrapped__() if dcp_enabled else AssertionError("non-DCP must not add Top-K preparation")
-    ))
+    original_prepare = host_prepare_topk.__wrapped__()
+
+    def prepare(*args, **kwargs):
+        assert dcp_enabled and not kwargs.pop("_causal_global_ids", False)
+        return original_prepare(*args, **kwargs)
+
+    ops.prepare_sfa_dcp_topk = Mock(side_effect=prepare)
     monkeypatch.setitem(sys.modules, ops.__name__, ops)
     if dcp_enabled:
         resident_plan = api[1]["prepare_sorted_resident_cache_fused_"]
@@ -53,6 +58,7 @@ def test_bounded_group_packs_and_restores_once_per_invocation(explicit, c8, dcp_
     producer.use_sparse_c8_indexer = c8
     for layer, obj in enumerate((producer, consumer)):
         obj.dsa_cp_decoder = False
+        obj.use_torch_npu_lightning_indexer = False
         obj._cross_layer_pre_compute = MethodType(ns["_cross_layer_pre_compute"], obj)
         obj.fused_qkv_a_proj = Mock(
             side_effect=lambda hidden, layer=layer: (torch.full((hidden.shape[0], 4), float(layer)),)
@@ -93,7 +99,12 @@ def test_bounded_group_packs_and_restores_once_per_invocation(explicit, c8, dcp_
                 counts=counts,
                 row_requests=rows,
                 split_boundary=torch.where(rows >= 0, 10000, 0),
+                mask_indexer_writes=not qualified,
             )
+            if qualified:
+                # A real target producer already emits causal IDs. Keep
+                # adversarial future IDs on the unqualified fallback cases.
+                frame["raw"].masked_fill_(frame["raw"] > dcp.positions[:, None, None], -1)
         kwargs = dict(
             hidden_states=torch.empty(tokens, 4),
             kv_cache_nope=torch.empty(1),
@@ -131,7 +142,7 @@ def test_bounded_group_packs_and_restores_once_per_invocation(explicit, c8, dcp_
             valid = valid & (frame["raw"] <= dcp.positions[:, None, None]) & (frame["raw"] // 128 % 4 == 1)
             assert torch.equal(dcp.counts[:, 0], valid.flatten(1).sum(1).int())
             assert (dcp.counts[:, 1:] == -77).all()
-            assert ops.prepare_sfa_dcp_topk.call_count == step
+            assert ops.prepare_sfa_dcp_topk.call_count == (0 if qualified else step)
         else:
             ops.prepare_sfa_dcp_topk.assert_not_called()
         expected = torch.where(valid, frame["raw"] + 100, -1)

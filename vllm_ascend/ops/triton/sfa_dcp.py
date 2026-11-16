@@ -53,11 +53,19 @@ def prepare_sfa_dcp_topk(
     topk: torch.Tensor, positions: torch.Tensor, output: torch.Tensor,
     counts: torch.Tensor, actual_rows: int, world: int, rank: int, block: int,
     *, local: bool, row_requests: torch.Tensor | None = None,
+    _causal_global_ids: bool = False,
 ) -> None:
-    """Keep causal global IDs for the planner and compact dense rows locally."""
+    """Keep causal global IDs for the planner and compact dense rows locally.
+
+    Only audited target indexer callers may assert ``_causal_global_ids``.
+    Draft rejection can invalidate rows beyond the indexer's causal mask.
+    """
     rows, width = topk.shape[0], topk.shape[-1]
-    init_device_properties_triton()
     if not local and row_requests is None:
+        if _causal_global_ids:
+            output.copy_(topk)  # The resident planner mutates this private copy.
+            return
+        init_device_properties_triton()
         # Graph planners need causal global IDs, not row-wise compaction.
         tile = 256
         if rows:
@@ -65,6 +73,7 @@ def prepare_sfa_dcp_topk(
                 topk, positions, output, rows, width, actual_rows, tile,
             )
         return
+    init_device_properties_triton()
     _prepare_topk[(min(rows, get_vectorcore_num()),)](
         topk, positions, output, counts, row_requests, rows, width, actual_rows, world, rank, block, local
     )
