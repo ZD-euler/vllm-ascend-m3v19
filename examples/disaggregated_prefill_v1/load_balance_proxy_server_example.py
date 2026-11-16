@@ -179,11 +179,11 @@ def _encode_json_payload(payload: Any) -> bytes:
 
 if __package__:
     from .pd_serving_perf import serving_perf_enabled as _proxy_cold_perf_enabled
-    from .profile_routes import profile_response_chunks, profile_route
+    from .profile_routes import ProfileRequest, profile_capabilities, profile_response_chunks, profile_route
     from .remote_fill_placement import validate_remote_fill_placement
 else:
     from pd_serving_perf import serving_perf_enabled as _proxy_cold_perf_enabled
-    from profile_routes import profile_response_chunks, profile_route
+    from profile_routes import ProfileRequest, profile_capabilities, profile_response_chunks, profile_route
     from remote_fill_placement import validate_remote_fill_placement
 
 
@@ -433,12 +433,17 @@ class ProxyState:
         # Update priority queue after releasing
         self._update_prefiller_priority(idx)
 
-    def select_decoder(self, token_count):  # Changed to synchronous
+    def select_decoder(self, token_count, preferred_idx=None):  # Changed to synchronous
         # No lock needed - entire function is atomic
         if not self.decoder_heap:
             raise RuntimeError("No decoder servers available")
 
-        priority, chosen, server = heapq.heappop(self.decoder_heap)
+        if preferred_idx is None:
+            priority, chosen, server = heapq.heappop(self.decoder_heap)
+        else:
+            if not any(index == preferred_idx for _, index, _ in self.decoder_heap):
+                raise ValueError("Profile target D instance is unavailable")
+            chosen = preferred_idx
 
         # Update the chosen server atomically
         self.decoders[chosen].active_tokens += token_count
@@ -1321,6 +1326,7 @@ async def _handle_select_instance(
     *,
     request_id: str | None = None,
     log_request_received: bool = True,
+    target_decoder_idx: int | None = None,
 ) -> "InstanceInfo":
     prefiller_score = proxy_state.calculate_prefill_scores(request_length)
     logger.debug(f"Request length: {request_length}, Prefiller score: {prefiller_score}")
@@ -1340,7 +1346,11 @@ async def _handle_select_instance(
     decoder = None
     reservation = None
     try:
-        decoder_idx = proxy_state.select_decoder(decoder_score)
+        decoder_idx = (
+            proxy_state.select_decoder(decoder_score)
+            if target_decoder_idx is None
+            else proxy_state.select_decoder(decoder_score, target_decoder_idx)
+        )
         decoder = proxy_state.decoders[decoder_idx]
         reservation = DecoderReservation(
             decoder, decoder_idx, decoder_score
@@ -1578,6 +1588,7 @@ async def _handle_completions(
     instance_info = None
     response_owns_cleanup = False
     request_count_released = False
+    profiling_request = None
 
     def release_request_count() -> None:
         nonlocal request_count_released
@@ -1605,13 +1616,16 @@ async def _handle_completions(
         req_data = await request.json()
         req_body = await request.body()
         request_length = len(req_body)
+        profiling_request = ProfileRequest(request, proxy_state)
         instance_info = await _handle_select_instance(
             api,
             req_data,
             request_length,
             request_id=request_id,
             log_request_received=False,
+            target_decoder_idx=profiling_request.target_decoder_idx,
         )
+        await profiling_request.prefill_ready()
         stream_flag = bool(req_data.get("stream", False))
         profile_routes = (
             [profile_route(instance_info)]
@@ -1731,7 +1745,10 @@ async def _handle_completions(
                             req_data["max_tokens"] = origin_max_tokens - completion_tokens + retry_count
                             tmp_request_length = len(json.dumps(req_data).encode("utf-8"))
                             _release_decoder_reservation(instance_info)
-                            instance_info = await _handle_select_instance(api, req_data, tmp_request_length)
+                            instance_info = await _handle_select_instance(
+                                api, req_data, tmp_request_length,
+                                target_decoder_idx=profiling_request.target_decoder_idx,
+                            )
                             if profile_routes is not None:
                                 profile_routes.append(profile_route(instance_info))
                             released_kv = False
@@ -1774,6 +1791,8 @@ async def _handle_completions(
         print("".join(traceback.format_exception(*exc_info)))
         raise
     finally:
+        if profiling_request is not None:
+            profiling_request.close()
         if not response_owns_cleanup:
             try:
                 if instance_info is not None:
@@ -1849,6 +1868,11 @@ async def handle_completions(request: Request):
 @with_cancellation
 async def handle_chat_completions(request: Request):
     return await _handle_completions("/chat/completions", request)
+
+
+@app.get("/profile_routes")
+async def get_profile_routes():
+    return profile_capabilities(proxy_state)
 
 
 @app.get("/healthcheck")

@@ -57,11 +57,11 @@ logger = logging.getLogger(__name__)
 
 if __package__:
     from .pd_serving_perf import serving_perf_enabled as _serving_perf_enabled
-    from .profile_routes import profile_response, profile_route
+    from .profile_routes import ProfileRequest, profile_capabilities, profile_response, profile_route
     from .remote_fill_placement import validate_remote_fill_placement
 else:
     from pd_serving_perf import serving_perf_enabled as _serving_perf_enabled
-    from profile_routes import profile_response, profile_route
+    from profile_routes import ProfileRequest, profile_capabilities, profile_response, profile_route
     from remote_fill_placement import validate_remote_fill_placement
 
 MAX_RECOMPUTE_RETRIES = 3
@@ -2034,6 +2034,7 @@ async def _handle_select_instance(
     analysis=None,
     original_request_id=None,
     prefix_anchors: tuple[PrefixAffinityAnchor, ...] = (),
+    target_decoder_idx: int | None = None,
 ):
     prefiller_score = proxy_state.calculate_prefill_scores(request_length)
     decoder_score = proxy_state.calculate_decode_scores(request_length)
@@ -2050,16 +2051,19 @@ async def _handle_select_instance(
                 with proxy_state._state_lock:
                     if not proxy_state.decoder_placements_ready():
                         continue
-                    known_anchor, known_affinity, affinity_selected = proxy_state.resolve_prefix_affinity(
-                        prefix_anchors, request_length, prefiller_score, decoder_score,
-                    )
+                    if target_decoder_idx is None:
+                        known_anchor, known_affinity, affinity_selected = proxy_state.resolve_prefix_affinity(
+                            prefix_anchors, request_length, prefiller_score, decoder_score,
+                        )
                     if not proxy_state.prefiller_heap:
                         raise RuntimeError("No prefiller servers available")
                     prefill_choice = (known_affinity.prefiller_idx if affinity_selected
                                       else proxy_state.prefiller_heap[0][2])
+                    preferred_decoder = target_decoder_idx
+                    if preferred_decoder is None and affinity_selected:
+                        preferred_decoder = known_affinity.decoder_idx
                     decoder_idx = proxy_state.select_decoder(
-                        decoder_score, known_affinity.decoder_idx if affinity_selected else None,
-                        prefiller_idx=prefill_choice,
+                        decoder_score, preferred_decoder, prefiller_idx=prefill_choice,
                     )
                     decoder = proxy_state.decoders[decoder_idx]
                     reservation = DecoderReservation(decoder, decoder_idx, decoder_score)
@@ -2198,7 +2202,11 @@ async def _handle_select_instance(
                            f"P-node: {prefiller}")
 
         if reservation is None:
-            decoder_idx = proxy_state.select_decoder(decoder_score)
+            decoder_idx = (
+                proxy_state.select_decoder(decoder_score)
+                if target_decoder_idx is None
+                else proxy_state.select_decoder(decoder_score, target_decoder_idx)
+            )
             decoder = proxy_state.decoders[decoder_idx]
             reservation = DecoderReservation(decoder, decoder_idx, decoder_score)
 
@@ -2297,6 +2305,7 @@ async def _handle_completions(api: str, request: Request):
     instance_info = None
     response_owns_cleanup = False
     request_count_released = False
+    profiling_request = None
     released_kv = True
 
     def release_request_count() -> None:
@@ -2329,6 +2338,7 @@ async def _handle_completions(api: str, request: Request):
     try:
         proxy_state.request_num += 1
         req_data = await request.json()
+        profiling_request = ProfileRequest(request, proxy_state)
         prefix_anchors = _parse_prefix_affinity_header(
             getattr(request, "headers", {}).get(_PREFIX_AFFINITY_HEADER)
         )
@@ -2661,8 +2671,10 @@ async def _handle_completions(api: str, request: Request):
             request_length,
             analysis,
             prefix_anchors=prefix_anchors,
+            target_decoder_idx=profiling_request.target_decoder_idx,
         )
         released_kv = False
+        await profiling_request.prefill_ready()
         
         original_request_id = instance_info.request_id
         stream_flag = bool(req_data.get("stream", False))
@@ -2733,6 +2745,7 @@ async def _handle_completions(api: str, request: Request):
                     analysis,
                     original_request_id=original_request_id,
                     prefix_anchors=prefix_anchors,
+                    target_decoder_idx=profiling_request.target_decoder_idx,
                 )
                 if profile_routes is not None:
                     profile_routes.append(profile_route(instance_info))
@@ -2897,6 +2910,7 @@ async def _handle_completions(api: str, request: Request):
                                 analysis,
                                 original_request_id=original_request_id,
                                 prefix_anchors=prefix_anchors,
+                                target_decoder_idx=profiling_request.target_decoder_idx,
                             )
                             released_kv = False
                             logger.info(
@@ -3153,6 +3167,8 @@ async def _handle_completions(api: str, request: Request):
             media_type="application/json"
         )
     finally:
+        if profiling_request is not None:
+            profiling_request.close()
         if not response_owns_cleanup:
             cleanup_current_request()
 
@@ -3474,6 +3490,11 @@ async def handle_completions(request: Request):
 @with_cancellation
 async def handle_chat_completions(request: Request):
     return await _handle_completions("/chat/completions", request)
+
+
+@app.get("/profile_routes")
+async def get_profile_routes():
+    return profile_capabilities(proxy_state)
 
 
 @app.get("/healthcheck")

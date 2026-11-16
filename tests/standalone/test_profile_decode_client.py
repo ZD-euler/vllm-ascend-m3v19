@@ -4,6 +4,7 @@
 import importlib.util
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,7 +38,13 @@ def service():
         profiler={"profiler": "torch", "torch_profiler_dir": "/profiles/D0"},
         routes=[],
         received_headers=None,
+        request_headers=[],
         maximum=100000,
+        max_num_seqs=16,
+        local_dp_size=1,
+        concurrency_gate=None,
+        require_profile=True,
+        dynamic_route=False,
     )
 
     class Handler(BaseHTTPRequestHandler):
@@ -58,9 +65,28 @@ def service():
                 self.reply({"paths": dict.fromkeys(["/tokenize", "/start_profile", "/stop_profile", "/server_info"])})
             elif self.path == "/v1/models":
                 self.reply({"data": [{"id": "glm-test", "max_model_len": state.maximum}]})
+            elif self.path == "/profile_routes":
+                self.reply(
+                    {
+                        "version": 2,
+                        "target_decoder": True,
+                        "prefill_batch_barrier": True,
+                        "decoder_urls": [state.url],
+                    }
+                )
             elif self.path.startswith("/server_info"):
                 self.reply(
-                    {"vllm_config": {"profiler_config": state.profiler, "kv_transfer_config": {"kv_role": state.role}}}
+                    {
+                        "vllm_config": {
+                            "profiler_config": state.profiler,
+                            "kv_transfer_config": {"kv_role": state.role},
+                            "parallel_config": {
+                                "data_parallel_size_local": state.local_dp_size,
+                                "data_parallel_size": state.local_dp_size,
+                            },
+                            "scheduler_config": {"max_num_seqs": state.max_num_seqs},
+                        }
+                    }
                 )
             else:
                 self.reply({"error": "unexpected GET"}, 404)
@@ -69,7 +95,11 @@ def service():
             state.calls.append(self.path)
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             if self.path == "/tokenize":
-                self.reply({"tokens": [11, 12, 13, 14, 15, 16, 17]})
+                tokens = [11, 12, 13, 14, 15, 16, 17]
+                if body["prompt"].startswith("Decode profiling session "):
+                    index = int(body["prompt"].split()[-1].strip("."))
+                    tokens = [100 + index]
+                self.reply({"tokens": tokens})
             elif self.path == "/start_profile":
                 state.profiling = True
                 self.reply({"error": "start failed"} if state.fail_start else None, 500 if state.fail_start else 200)
@@ -82,7 +112,11 @@ def service():
             elif self.path == "/v1/completions":
                 state.completions.append(body)
                 state.received_headers = dict(self.headers)
-                assert state.profiling
+                state.request_headers.append(dict(self.headers))
+                if state.require_profile:
+                    assert state.profiling
+                if state.concurrency_gate:
+                    state.concurrency_gate.wait(timeout=10)
                 if state.fail_request:
                     self.reply({"error": "decode failed"}, 500)
                     return
@@ -95,13 +129,20 @@ def service():
                             "prompt_tokens": len(body["prompt"]),
                             "completion_tokens": state.output_count or body["max_tokens"],
                         },
-                        "vllm_profile_routes": state.routes,
+                        "vllm_profile_routes": (
+                            [{"decoder_url": state.url + "/v1", "request_id": "request", "decoder_dp_rank": 0}]
+                            if state.dynamic_route
+                            else state.routes
+                        ),
                     }
                 )
             else:
                 self.reply({"error": "unexpected POST"}, 404)
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    class Server(ThreadingHTTPServer):
+        request_queue_size = 64
+
+    server = Server(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     state.url = f"http://127.0.0.1:{server.server_port}"
@@ -248,8 +289,8 @@ def test_all_four_decoders_start_before_request_and_all_stop(client_tool, monkey
             events.append((self.base_url, path))
 
     decoders = [Decoder(f"D{index}") for index in range(4)]
-    monkeypatch.setattr(client_tool, "measured_request", lambda *args: events.append(("proxy", "decode completed")))
-    client_tool.profile_request(decoders, None, "model", [1], 128, None, {})
+    monkeypatch.setattr(client_tool, "run_requests", lambda *args: events.append(("proxy", "decode completed")))
+    client_tool.profile_request(decoders, None, "model", [[1]], 128, None, {})
     assert events == [
         ("D0", "/start_profile"),
         ("D1", "/start_profile"),
@@ -291,3 +332,105 @@ def test_invalid_length_fails_before_network(client_tool, tmp_path):
             ["--d-url", "http://127.0.0.1:1", "--prefix-tokens", "0", "--output", str(tmp_path / "capture")]
         )
     assert not (tmp_path / "capture").exists()
+
+
+def test_sixteen_http_requests_run_concurrently_on_target(client_tool, service, tmp_path):
+    service.dynamic_route = True
+    service.concurrency_gate = threading.Barrier(16)
+    invoke(
+        client_tool,
+        service,
+        tmp_path / "capture",
+        "--concurrency",
+        "16",
+        "--target-d-url",
+        service.url,
+    )
+    assert len(service.completions) == 16
+    assert len({tuple(item["prompt"]) for item in service.completions}) == 16
+    assert all(len(item["prompt"]) == 50000 for item in service.completions)
+    assert service.calls.count("/start_profile") == service.calls.count("/stop_profile") == 1
+    assert service.events[-1] == "stopped"
+    result = json.loads((tmp_path / "capture/result.json").read_text())
+    assert result["concurrency"] == 16
+    assert len(result["measurements"]) == 16
+    assert all(route["decoder_url"] == service.url + "/v1" for route in result["executed_routes"])
+    assert len(list((tmp_path / "capture").glob("session-*/response.json"))) == 16
+    headers = [{key.lower(): value for key, value in item.items()} for item in service.request_headers]
+    assert len({item["x-vllm-profile-batch"] for item in headers}) == 1
+    assert {int(item["x-vllm-profile-member"]) for item in headers} == set(range(16))
+    assert all(item["x-vllm-profile-target"] == service.url for item in headers)
+    assert all(item["x-vllm-profile-batch-size"] == "16" for item in headers)
+
+
+def test_warmup_completes_before_capture(client_tool, service, tmp_path):
+    service.dynamic_route = True
+    service.require_profile = False
+    service.concurrency_gate = threading.Barrier(4)
+    invoke(
+        client_tool,
+        service,
+        tmp_path / "capture",
+        "--concurrency",
+        "4",
+        "--target-d-url",
+        service.url,
+        "--warmup",
+    )
+    start = service.calls.index("/start_profile")
+    assert service.calls[:start].count("/v1/completions") == 4
+    assert service.calls[start:].count("/v1/completions") == 4
+    assert len(service.completions) == 8
+    result = json.loads((tmp_path / "capture/result.json").read_text())
+    assert len(result["warmup"]) == len(result["measurements"]) == 4
+    assert sorted(item["prompt"] for item in service.completions[:4]) == sorted(
+        item["prompt"] for item in service.completions[4:]
+    )
+
+
+def test_concurrent_failure_drains_other_requests_before_stop(client_tool, monkeypatch, tmp_path):
+    done = threading.Event()
+    events = []
+
+    class Decoder:
+        base_url = "http://D:7920"
+
+        def request(self, path, payload):
+            if path == "/stop_profile":
+                assert done.is_set()
+            events.append(path)
+
+    def complete(client, model, prompt, output_tokens, root, headers):
+        if prompt == [0]:
+            raise RuntimeError("session failed")
+        time.sleep(0.02)
+        done.set()
+        return {"routes": []}
+
+    monkeypatch.setattr(client_tool, "measured_request", complete)
+    with pytest.raises(RuntimeError, match="1 of 2"):
+        client_tool.profile_request([Decoder()], None, "model", [[0], [1]], 128, tmp_path, {})
+    assert events == ["/start_profile", "/stop_profile"]
+    assert (tmp_path / "session-000/error.json").exists()
+    assert (tmp_path / "session-001/measurement.json").exists()
+
+
+def test_target_capacity_rejected_before_profile(client_tool, service, tmp_path):
+    service.max_num_seqs = 4
+    with pytest.raises(ValueError, match="max_num_seqs=4"):
+        invoke(client_tool, service, tmp_path / "capture", "--target-d-url", service.url, "--concurrency", "16")
+    assert "/start_profile" not in service.calls
+
+
+def test_wrong_target_rejected_before_profile(client_tool, service, tmp_path):
+    with pytest.raises(ValueError, match="absent from the proxy"):
+        invoke(
+            client_tool,
+            service,
+            tmp_path / "capture",
+            "--target-d-url",
+            "http://wrong:7920",
+            "--d-url",
+            "http://wrong:7920",
+        )
+    assert "/start_profile" not in service.calls

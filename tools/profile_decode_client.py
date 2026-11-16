@@ -16,9 +16,16 @@ The updated P/D proxy returns actual per-request routes for this client. Each
 selected decoder's address and configured server-side profile directory are
 printed and saved in result.json, including any recompute route changes.
 
+For 16 concurrent sessions on one D instance, pass --concurrency 16 and
+--target-d-url. The original proxy chooses P and performs the existing KV
+handoff, then releases the batch to D after all P requests are ready. The proxy
+must use one API process for this optional in-memory batch barrier. --warmup
+runs the same batch once before profiling. Sessions have distinct fixed prompts.
+
 Example command
   python tools/profile_decode_client.py --base-url http://proxy:9000 \
-      --d-url http://127.0.0.1:7920 --profile-dir /path/to/D_profiles
+      --target-d-url http://decoder:7920 --concurrency 16 --warmup \
+      --profile-dir /path/to/D_profiles
 
 The HTTP client and trace exporter use the neighboring profile_prefill_client
 module. Trace export runs after all profilers have stopped.
@@ -27,10 +34,12 @@ module. Trace export runs after all profilers have stopped.
 import argparse
 import hashlib
 import json
+import math
 import os
 import sys
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -80,7 +89,11 @@ def preflight(decoders, tokenizer, model, required_tokens):
             if role == "kv_producer":
                 raise ValueError(f"{client.base_url} is a P instance; --d-url needs a decoder")
             instance["profile_dir"] = profiler.get("torch_profiler_dir")
-            instance["dp_rank"] = (config.get("parallel_config") or {}).get("data_parallel_rank")
+            parallel = config.get("parallel_config") or {}
+            instance["dp_rank"] = parallel.get("data_parallel_rank")
+            instance["dp_size"] = parallel.get("data_parallel_size", 1)
+            instance["external_lb"] = parallel.get("data_parallel_external_lb", False)
+            instance["max_num_seqs"] = (config.get("scheduler_config") or {}).get("max_num_seqs")
         instances.append(instance)
     return model, instances
 
@@ -101,7 +114,7 @@ def make_prompt(client, model, count):
     return repeat_tokens(result["tokens"], count)
 
 
-def measured_request(client, model, prompt, output_tokens, root):
+def measured_request(client, model, prompt, output_tokens, root, headers=None):
     payload = {
         "model": model,
         "prompt": prompt,
@@ -115,7 +128,7 @@ def measured_request(client, model, prompt, output_tokens, root):
     }
     write_json(root / "request.json", payload)
     started = time.perf_counter()
-    response = client.request("/v1/completions", payload, headers={"X-VLLM-Profile-Routes": "1"})
+    response = client.request("/v1/completions", payload, headers={"X-VLLM-Profile-Routes": "1", **(headers or {})})
     elapsed = time.perf_counter() - started
     write_json(root / "response.json", response)
     choices = response.get("choices", [])
@@ -149,6 +162,7 @@ def report_routes(measurement, instances, report):
         return
     instance_by_url = {instance["url"]: instance for instance in instances}
     resolved = []
+    printed_destinations = set()
     for route in routes:
         decoder_url = str(route["decoder_url"]).rstrip("/").removesuffix("/v1")
         instance = instance_by_url.get(decoder_url)
@@ -168,18 +182,103 @@ def report_routes(measurement, instances, report):
                 "listed_for_profiling": instance is not None,
             }
         )
-        print(
-            f"{PREFIX} executed decoder={decoder_url}, dp_rank={dp_rank}, "
-            f"request={route.get('request_id')}, server_profile_dir={profile_dir or 'unavailable'}",
-            flush=True,
-        )
-        if trace_pattern:
-            print(f"{PREFIX} MindStudio path on {urlsplit(decoder_url).netloc}: {trace_pattern}", flush=True)
+        destination = decoder_url, dp_rank
+        if destination not in printed_destinations:
+            printed_destinations.add(destination)
+            print(
+                f"{PREFIX} executed decoder={decoder_url}, dp_rank={dp_rank}, "
+                f"server_profile_dir={profile_dir or 'unavailable'}",
+                flush=True,
+            )
+            if trace_pattern:
+                print(f"{PREFIX} MindStudio path on {urlsplit(decoder_url).netloc}: {trace_pattern}", flush=True)
     report["routing_status"] = "reported_by_proxy"
     report["executed_routes"] = resolved
 
 
-def profile_request(decoders, client, model, prompt, output_tokens, root, report):
+def check_proxy(client, target, concurrency):
+    if target is None and concurrency == 1:
+        return
+    capabilities = client.request("/profile_routes")
+    if capabilities.get("version", 0) < 2 or not capabilities.get("target_decoder"):
+        raise ValueError("Update and restart the P/D proxy to enable targeted concurrent profiling")
+    if concurrency > 1 and not capabilities.get("prefill_batch_barrier"):
+        raise ValueError("The P/D proxy must support the profiling prefill barrier")
+    if target is not None and target not in capabilities.get("decoder_urls", []):
+        raise ValueError(f"Target {target!r} is absent from the proxy decoder list")
+
+
+def make_prompts(client, model, count, concurrency):
+    base = make_prompt(client, model, count)
+    if concurrency == 1:
+        return [base]
+    prompts = []
+    for index in range(concurrency):
+        marker = client.request(
+            "/tokenize",
+            {"model": model, "prompt": f"Decode profiling session {index}.\n", "add_special_tokens": False},
+        )["tokens"]
+        repeat_tokens(marker, 1)
+        if len(marker) >= count:
+            raise ValueError("Concurrent prompts must be longer than their session markers")
+        prompts.append(marker + base[len(marker) :])
+    if len({tuple(prompt) for prompt in prompts}) != concurrency:
+        raise ValueError("Tokenizer produced identical prompts for distinct session markers")
+    return prompts
+
+
+def run_requests(client, model, prompts, output_tokens, root, target, gate_timeout):
+    concurrency = len(prompts)
+    batch_id = uuid.uuid4().hex
+    directories = []
+    for index in range(concurrency):
+        directory = root if concurrency == 1 else root / f"session-{index:03d}"
+        directory.mkdir(parents=True, exist_ok=True)
+        directories.append(directory)
+
+    def request(index):
+        headers = {}
+        if target:
+            headers["X-VLLM-Profile-Target"] = target
+        if concurrency > 1:
+            headers.update(
+                {
+                    "X-VLLM-Profile-Batch": batch_id,
+                    "X-VLLM-Profile-Batch-Size": str(concurrency),
+                    "X-VLLM-Profile-Member": str(index),
+                    "X-VLLM-Profile-Batch-Timeout": str(gate_timeout),
+                }
+            )
+        result = measured_request(client, model, prompts[index], output_tokens, directories[index], headers)
+        result["session"] = index
+        if target and (
+            not result["routes"]
+            or any(str(route["decoder_url"]).rstrip("/").removesuffix("/v1") != target for route in result["routes"])
+        ):
+            raise RuntimeError(f"Session {index} did not report the required target {target}")
+        write_json(directories[index] / "measurement.json", result)
+        return result
+
+    if concurrency == 1:
+        return [request(0)]
+    results = []
+    errors = []
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = {executor.submit(request, index): index for index in range(concurrency)}
+        for future in as_completed(futures):
+            try:
+                results.append(future.result())
+            except Exception as error:
+                index = futures[future]
+                errors.append({"session": index, "error": str(error)})
+                write_json(directories[index] / "error.json", errors[-1])
+    if errors:
+        write_json(root / "failures.json", errors)
+        raise RuntimeError(f"{len(errors)} of {concurrency} requests failed; see failures.json")
+    return sorted(results, key=lambda item: item["session"])
+
+
+def profile_request(decoders, client, model, prompts, output_tokens, root, report, target=None, gate_timeout=600):
     attempted = []
     request_error = None
     try:
@@ -189,7 +288,7 @@ def profile_request(decoders, client, model, prompt, output_tokens, root, report
             decoder.request("/start_profile", {})
             print(f"{PREFIX} started {decoder.base_url}", flush=True)
         report["profile_started_at_ns"] = time.time_ns()
-        return measured_request(client, model, prompt, output_tokens, root)
+        return run_requests(client, model, prompts, output_tokens, root, target, gate_timeout)
     except BaseException as error:
         request_error = error
         raise
@@ -210,13 +309,19 @@ def profile_request(decoders, client, model, prompt, output_tokens, root, report
 
 
 def capture(args):
-    if args.prefix_tokens <= 0 or args.output_tokens <= 0 or args.timeout <= 0:
-        raise ValueError("Token counts and --timeout must be positive")
+    if min(args.prefix_tokens, args.output_tokens, args.concurrency, args.timeout, args.batch_timeout) <= 0:
+        raise ValueError("Token counts, concurrency and timeouts must be positive")
+    if not math.isfinite(args.timeout) or not math.isfinite(args.batch_timeout):
+        raise ValueError("Timeouts must be finite")
     key = os.environ.get("OPENAI_API_KEY")
     client = Client(args.base_url, args.timeout, key)
-    decoders = [Client(url, args.timeout, key) for url in args.d_url]
+    target = Client(args.target_d_url, args.timeout, key).base_url if args.target_d_url else None
+    decoder_urls = args.d_url or ([target] if target else [])
+    decoders = [Client(url, args.timeout, key) for url in decoder_urls]
     if len({decoder.base_url for decoder in decoders}) != len(decoders):
         raise ValueError("Pass each --d-url once")
+    if target is not None and target not in {decoder.base_url for decoder in decoders}:
+        raise ValueError("Include --target-d-url in --d-url so the target is profiled")
     tokenizer = Client(args.tokenizer_url or decoders[0].base_url, args.timeout, key)
     run_id = uuid.uuid4().hex
     root = (args.output or Path(f"decode-profile-{time.strftime('%Y%m%d-%H%M%S')}-{run_id[:6]}")).resolve()
@@ -226,29 +331,70 @@ def capture(args):
         "run_id": run_id,
         "base_url": client.base_url,
         "d_urls": [decoder.base_url for decoder in decoders],
+        "target_d_url": target,
+        "concurrency": args.concurrency,
         "tokenizer_url": tokenizer.base_url,
         "prefix_tokens": args.prefix_tokens,
         "output_tokens": args.output_tokens,
         "profile_dir": str(args.profile_dir) if args.profile_dir else None,
-        "capture_scope": "D-side request including initial KV loading and all generation steps",
+        "capture_scope": "D-side batch including initial KV loading and all generation steps",
+        "prefill_batch_barrier": args.concurrency > 1,
     }
     try:
+        check_proxy(client, target, args.concurrency)
         model, instances = preflight(decoders, tokenizer, args.model, args.prefix_tokens + args.output_tokens)
         report["model"] = model
         report["decoder_instances"] = instances
         for instance in instances:
+            if instance["url"] == target:
+                if instance.get("dp_size", 1) > 1 and not instance.get("external_lb"):
+                    raise ValueError("Use a single-DP D API endpoint for targeted instance profiling")
+                capacity = instance.get("max_num_seqs")
+                if capacity is not None and args.concurrency > capacity:
+                    raise ValueError(f"D max_num_seqs={capacity}, requested concurrency={args.concurrency}")
             print(
                 f"{PREFIX} decoder={instance['url']}, server_profile_dir={instance['profile_dir'] or 'unavailable'}",
                 flush=True,
             )
-        prompt = make_prompt(tokenizer, model, args.prefix_tokens)
-        report["prompt_sha256"] = hashlib.sha256(json.dumps(prompt).encode()).hexdigest()
+        prompts = make_prompts(tokenizer, model, args.prefix_tokens, args.concurrency)
+        prompt_hashes = [hashlib.sha256(json.dumps(prompt).encode()).hexdigest() for prompt in prompts]
+        report["prompt_sha256"] = prompt_hashes[0] if args.concurrency == 1 else prompt_hashes
+        if args.warmup:
+            print(f"{PREFIX} warming {args.concurrency} session(s) through the P/D proxy", flush=True)
+            warmup_dir = root / "warmup"
+            warmup_dir.mkdir()
+            report["warmup"] = run_requests(
+                client,
+                model,
+                prompts,
+                args.output_tokens,
+                warmup_dir,
+                target,
+                args.batch_timeout,
+            )
         before = profile_runs(args.profile_dir) if args.profile_dir else set()
         report["status"] = "capturing"
         write_json(root / "result.json", report)
-        print(f"{PREFIX} input={len(prompt):,}, output={args.output_tokens:,}, request={client.base_url}", flush=True)
-        report["measurement"] = profile_request(decoders, client, model, prompt, args.output_tokens, root, report)
-        report_routes(report["measurement"], instances, report)
+        print(
+            f"{PREFIX} concurrency={args.concurrency}, input={args.prefix_tokens:,}, "
+            f"output={args.output_tokens:,}, target={target or 'proxy load balancing'}",
+            flush=True,
+        )
+        measurements = profile_request(
+            decoders,
+            client,
+            model,
+            prompts,
+            args.output_tokens,
+            root,
+            report,
+            target,
+            args.batch_timeout,
+        )
+        report["measurements"] = measurements
+        if args.concurrency == 1:
+            report["measurement"] = measurements[0]
+        report_routes({"routes": [route for item in measurements for route in item["routes"]]}, instances, report)
         report["status"] = "captured"
         if args.profile_dir:
             runs = profile_runs(args.profile_dir) - before
@@ -272,6 +418,16 @@ def parser():
     cli = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     cli.add_argument("--base-url", default="http://127.0.0.1:9000", help="Request URL, normally the existing P/D proxy")
     cli.add_argument("--d-url", action="append", help="Direct D API URL; repeat for every decoder the proxy may select")
+    cli.add_argument(
+        "--target-d-url", help="Pin all requests to this configured D instance; also profiles it by default"
+    )
+    cli.add_argument(
+        "--concurrency", type=int, default=1, help="Sessions released together after all P requests are ready"
+    )
+    cli.add_argument("--warmup", action="store_true", help="Run the same batch once before profiling")
+    cli.add_argument(
+        "--batch-timeout", type=float, default=600, help="Maximum seconds for all P requests to become ready"
+    )
     cli.add_argument("--tokenizer-url", help="vLLM tokenization URL; defaults to the first --d-url")
     cli.add_argument("--model", help="Served model ID; auto-selected when exactly one is listed")
     cli.add_argument("--prefix-tokens", type=int, default=50000, help="Exact input token count")
@@ -291,8 +447,8 @@ def main(argv=None):
         runs = {directory} if directory.name.endswith("_ascend_pt") else profile_runs(directory)
         analyse_runs(runs, directory, prefix=PREFIX)
         return
-    if not args.d_url:
-        cli.error("--d-url is required for capture")
+    if not args.d_url and not args.target_d_url:
+        cli.error("--d-url or --target-d-url is required for capture")
     if args.profile_dir:
         args.profile_dir = args.profile_dir.resolve(strict=True)
     capture(args)
