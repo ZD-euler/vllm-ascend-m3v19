@@ -36,7 +36,13 @@ from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
 from vllm_ascend import envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-from vllm_ascend.utils import enable_dsa_cp_decoder, is_vl_model, parse_layer_idx, vllm_version_is
+from vllm_ascend.utils import (
+    enable_dsa_cp_decoder,
+    is_vl_model,
+    parse_layer_idx,
+    sfa_full_graph_enabled,
+    vllm_version_is,
+)
 
 
 class IndexerWrapper(nn.Module):
@@ -168,6 +174,9 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
             self.use_cross_layer_sfa
             and envs_ascend.VLLM_ASCEND_MTP_DRAFT_DEBUG
         )
+        self.use_full_graph_sfa = bool(
+            self.use_cross_layer_sfa and sfa_full_graph_enabled(vllm_config) and not self.target_sfa_debug
+        )
 
         compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -191,7 +200,15 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
             need_gather_q_kv = _EXTRA_CTX.flash_comm_v1_enabled
             output = torch.empty(hidden_states.shape, dtype=hidden_states.dtype, device=hidden_states.device)
 
-        if self.use_cross_layer_sfa:
+        if self.use_full_graph_sfa:
+            impl = self.mla_attn.impl
+            group = impl.shared_resident_plan
+            torch.ops.vllm.sfa_forward_full(
+                hidden_states, need_gather_q_kv, output, self.prefix, self.next_layer_name,
+                group.reads if group is not None and impl.skip_topk else [],
+                group.writes if group is not None and not impl.skip_topk else [],
+            )
+        elif self.use_cross_layer_sfa:
             impl = self.mla_attn.impl
             if self.target_sfa_debug:
                 torch.ops.vllm.sfa_target_layer_diag(
@@ -453,6 +470,59 @@ def sfa_forward_pre_shared_fake(
     )
 
 
+def sfa_forward_full(
+    hidden_states: torch.Tensor,
+    need_gather_q_kv: bool,
+    output: torch.Tensor,
+    layer_name: str,
+    next_layer_name: str,
+    resident_reads: list[torch.Tensor],
+    resident_writes: list[torch.Tensor],
+) -> None:
+    """Keep planner aliases internal while declaring shared state mutations.
+
+    The same pre/retrieve/post routines retain fallback, capture and overlap
+    ordering. Only a full graph with an active shared plan bypasses the bridge.
+    """
+    context = get_forward_context()
+    impl, attn_layer_name, kv_cache, metadata = _mla_runtime_state(layer_name)
+    group = impl.shared_resident_plan
+    direct = (
+        getattr(context, "sfa_full_graph_active", False)
+        and group is not None and group.active
+        and not impl._staged_graph_content_diagnostic_enabled(attn_layer_name)
+    )
+    query, rope, topk, selected, counts, slots = impl.cross_layer_graph_pre(
+        attn_layer_name, hidden_states, kv_cache, metadata, need_gather_q_kv, output,
+        resident_reads=resident_reads or None, resident_writes=resident_writes or None,
+        copy_bridge=not direct,
+    )
+    impl.cross_layer_lmcache_retrieve(
+        attn_layer_name, next_layer_name, selected, counts, slots, metadata, context,
+    )
+    _, outgoing = impl._shared_retrieval_edges()
+    edge = outgoing.get(attn_layer_name)
+    prefetch = None
+    if edge is not None:
+        capacity = edge.transfer.request_capacity
+        prefetch = (edge, selected[:capacity], counts[:capacity], slots[:capacity], edge.destinations)
+    impl.cross_layer_graph_post(
+        attn_layer_name, query, rope, topk, kv_cache, metadata, output, prefetch=prefetch,
+    )
+
+
+def sfa_forward_full_fake(
+    hidden_states: torch.Tensor,
+    need_gather_q_kv: bool,
+    output: torch.Tensor,
+    layer_name: str,
+    next_layer_name: str,
+    resident_reads: list[torch.Tensor],
+    resident_writes: list[torch.Tensor],
+) -> None:
+    return
+
+
 def sfa_lmcache_retrieve(
     selected_packed: torch.Tensor,
     selected_counts: torch.Tensor,
@@ -579,6 +649,13 @@ def sfa_target_layer_diag_fake(
     return
 
 
+direct_register_custom_op(
+    op_name="sfa_forward_full",
+    op_func=sfa_forward_full,
+    mutates_args=["output", "resident_writes"],
+    fake_impl=sfa_forward_full_fake,
+    dispatch_key="PrivateUse1",
+)
 direct_register_custom_op(
     op_name="sfa_forward_pre",
     op_func=sfa_forward_pre,

@@ -48,7 +48,8 @@ def compile_fx(graph: GraphModule, example_inputs: list, inner_compile: Callable
 
 def _shared_resident_clone_policy(node, op):
     """Share one copy policy between the ordinary and npugraph_ex compilers."""
-    if not node.args or node.args[0] != op.default:
+    full = getattr(torch.ops.vllm, "sfa_forward_full", None)
+    if not node.args or node.args[0] not in (op.default, full.default if full is not None else None):
         return None
     if node.target == torch.ops.higher_order.auto_functionalized and node.kwargs.get("resident_writes"):
         names = node.kwargs.get("_only_clone_these_tensors")

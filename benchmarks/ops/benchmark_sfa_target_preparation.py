@@ -213,7 +213,7 @@ class Pipeline:
         for cache in self.caches:
             cache.fill_(-7)
 
-    def step(self, frame):
+    def prepare(self, frame):
         from vllm_ascend.attention.sfa_graph_layout import pack_decode_lanes, unpack_decode_lanes
         from vllm_ascend.ops.triton.sfa_dcp import prepare_sfa_dcp_topk
 
@@ -272,11 +272,15 @@ class Pipeline:
                 storage = self.impl.shared_resident_plan.attention_topk
                 storage.copy_(planned)
                 planned = storage
-        outputs = self.copy_bridge(self.impl, self.query, (self.query, self.rope, planned, selected, counts, slots))
+        return self.query, self.rope, planned, selected, counts, slots
+
+    def step(self, frame):
+        outputs = self.copy_bridge(self.impl, self.query, self.prepare(frame))
         self.transfer.load(*outputs[3:])  # Real sfa_copy_i32_s64, K and PE.
 
     def snapshot(self, *, include_cache=True):
         # Read only defined prefixes of resident state and variable-size payloads.
+        bridge = getattr(self, "current_outputs", self.bridge)
         counts = self.state.counts.cpu()[..., 0]
         state_tokens, state_slots = self.state.tokens.cpu(), self.state.slots.cpu()
         result = [counts, self.state.generations.cpu(), self.counts[:, 0].cpu()]
@@ -285,17 +289,18 @@ class Pipeline:
                 n = int(counts[row, shard])
                 assert 0 <= n <= SCRATCH
                 result += [state_tokens[row, shard, :n], state_slots[row, shard, :n]]
-        result += [value.cpu() for value in (*self.bridge[:3], self.bridge[4])]
+        result += [value.cpu() for value in (*bridge[:3], bridge[4])]
         if include_cache:
             result += [cache.cpu() for cache in self.caches]
-        selected, misses, slots = (value.cpu() for value in self.bridge[3:])
+        selected, misses, slots = (value.cpu() for value in bridge[3:])
         for lane, count in enumerate(misses.tolist()):
             result += [selected[lane, :count], slots[lane, :count]]
         return result
 
-    def check_transfer(self):
-        selected, counts, slots = (value.cpu() for value in self.bridge[3:])
-        caches = [cache.view(-1, cache.shape[-1]) for cache in self.caches]
+    def check_transfer(self, *, caches=None):
+        bridge = getattr(self, "current_outputs", self.bridge)
+        selected, counts, slots = (value.cpu() for value in bridge[3:])
+        caches = [cache.view(-1, cache.shape[-1]) for cache in (self.caches if caches is None else caches)]
         for lane, count in enumerate(counts.tolist()):
             tokens, destinations = selected[lane, :count].long(), slots[lane, :count].long()
             assert 0 <= count <= SCRATCH
@@ -306,7 +311,7 @@ class Pipeline:
             assert bool(((destinations >= 0) & (destinations < caches[0].shape[0])).all())
             for plane, cache in enumerate(caches):
                 expected = (source_values(tokens, lane) + plane * 32).to(cache.dtype)
-                actual = cache.index_select(0, self.bridge[-1][lane, :count]).cpu()
+                actual = cache.index_select(0, bridge[-1][lane, :count]).cpu()
                 torch.testing.assert_close(actual, expected[:, None].expand(-1, cache.shape[-1]), rtol=0, atol=0)
         return counts.tolist()
 

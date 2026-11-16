@@ -98,7 +98,13 @@ def _gather_sfa_dcp_queries(query: torch.Tensor, rope: torch.Tensor, group) -> t
     """Unpack rank-major collective storage into contiguous TND query planes."""
     rows, heads, query_dim = query.shape
     rope_dim, world = rope.shape[-1], group.world_size
-    packed = group.all_gather(torch.cat((query, rope), dim=-1), dim=0)
+    if query.is_contiguous() and rope.is_contiguous():
+        packet = torch.cat((query, rope), dim=-1)
+    else:
+        from vllm_ascend.ops.triton.sfa_query import pack_sfa_dcp_queries
+
+        packet = pack_sfa_dcp_queries(query, rope)
+    packed = group.all_gather(packet, dim=0)
     query = packed.new_empty((rows, heads * world, query_dim))
     rope = packed.new_empty((rows, heads * world, rope_dim))
     init_device_properties_triton()

@@ -34,7 +34,6 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_ascend import envs
-from vllm_ascend.worker.dsa_shared_pool import MixedIndexerMetadata
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
     _EXTRA_CTX,
@@ -143,6 +142,7 @@ from vllm_ascend.utils import (
     staged_sfa_graph_capture_sizes,
     staged_sfa_graph_configured,
 )
+from vllm_ascend.worker.dsa_shared_pool import MixedIndexerMetadata
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
 if TYPE_CHECKING:
@@ -4377,6 +4377,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         self,
         hidden_states: torch.Tensor,
         outputs: tuple[torch.Tensor, ...],
+        *,
+        copy_payload: bool = True,
     ) -> tuple[torch.Tensor, ...]:
         buffers = self._ensure_staged_sfa_bridge_buffers(hidden_states)
         if len(outputs) != len(buffers):
@@ -4394,6 +4396,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             and all(t.is_contiguous() for t in buffers[:2])
         )
         for index, (source, destination) in enumerate(zip(outputs, buffers, strict=True)):
+            if not copy_payload and index >= 2:
+                continue
             rows = int(source.shape[0])
             if (
                 rows > int(destination.shape[0])
@@ -4412,7 +4416,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     copy_sfa_query_bridge(*outputs[:2], *buffers[:2])
             else:
                 destination[:rows].copy_(source)
-        return buffers
+        return buffers if copy_payload else (*buffers[:2], *outputs[2:])
 
     def cross_layer_graph_pre(
         self,
@@ -4425,6 +4429,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         *,
         resident_reads: list[torch.Tensor] | None = None,
         resident_writes: list[torch.Tensor] | None = None,
+        copy_bridge: bool = True,
     ) -> tuple[torch.Tensor, ...]:
         """Run graph A, or the complete native path outside staged replay."""
         context = get_forward_context()
@@ -4600,10 +4605,14 @@ class AscendSFAImpl(MLAAttentionImpl):
             cp_key_lens=(attn_metadata.dsa_cp_context.actual_seq_lengths_key if self.dsa_cp_decoder else None),
             dcp=getattr(attn_metadata, "sfa_dcp", None),
         )
-        outputs = self._copy_to_staged_sfa_bridge(
-            hidden_states,
-            outputs,
-        )
+        if copy_bridge or getattr(attn_metadata, "sfa_dcp", None) is None:
+            # Ordinary SFA still needs contiguous query planes. A DCP full
+            # graph packs projections directly into its all-gather input.
+            outputs = self._copy_to_staged_sfa_bridge(hidden_states, outputs, copy_payload=copy_bridge)
+        else:
+            # Preserve startup shape/dtype validation and legacy capture
+            # bindings; these buffers are not payloads of the full operator.
+            self._ensure_staged_sfa_bridge_buffers(hidden_states)
         state.runtime = (
             layer_name,
             kv_cache,
@@ -4613,7 +4622,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         if is_dummy and context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
             state.register(
                 graph_key,
-                outputs,
+                self._staged_sfa_bridge_buffers if not copy_bridge else outputs,
                 kv_cache,
                 # Seal the shared top-k buffer address/layout whenever a graph
                 # reads or writes it, so rebinding after capture fails closed.

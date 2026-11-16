@@ -109,6 +109,54 @@ def test_query_bridge_preserves_bits_strides_and_unused_capacity(ops, rows, dtyp
     assert len(calls) == (rows > 0)
 
 
+@pytest.mark.parametrize("rows", [0, 1, 2, 16])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_direct_query_packet_is_bit_exact_and_has_one_copy(ops, rows, dtype):
+    _, copy_queries, calls = ops
+    pack = extract(QUERY_OPS, "pack_sfa_dcp_queries", {"copy_sfa_query_bridge": copy_queries})
+    bits = (torch.arange(8 * rows * 1152) * 97 % 65536 - 32768).to(torch.int16)
+    storage = bits.view(dtype).reshape(8, rows, 1152).transpose(0, 1)
+    query, rope = storage[..., :1024:2], storage[..., 1024::2]
+    packet = pack(query, rope)
+    assert packet.is_contiguous()
+    assert torch.equal(packet.view(torch.int16), torch.cat((query, rope), -1).view(torch.int16))
+    assert len(calls) == (rows > 0)
+    assert torch.equal(storage.transpose(0, 1).reshape(-1).view(torch.int16), bits)
+
+
+@pytest.mark.parametrize("dcp", [False, True])
+@pytest.mark.parametrize("capture", [False, True])
+def test_direct_full_graph_pre_keeps_planner_storage(ops, request, monkeypatch, dcp, capture):
+    _, copy_queries, calls = ops
+    module = ModuleType("vllm_ascend.ops.triton.sfa_query")
+    module.copy_sfa_query_bridge = copy_queries
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    h = request.getfixturevalue("handoff")
+    h.metadata.sfa_dcp = SimpleNamespace() if dcp else None
+    query = torch.arange(2 * 8 * 512).to(torch.bfloat16).reshape(8, 2, 512).transpose(0, 1)
+    outputs = (query, torch.ones(2, 8, 64, dtype=query.dtype), *h.bridge[2:])
+    buffers = tuple(torch.full_like(t, -9, memory_format=torch.contiguous_format) for t in outputs)
+    h.impl._staged_sfa_bridge_buffers = buffers
+    h.impl._ensure_staged_sfa_bridge_buffers = lambda _: buffers
+    h.impl._cross_layer_pre_compute.return_value = outputs
+    h.impl._copy_to_staged_sfa_bridge = MethodType(extract(
+        ROOT / "vllm_ascend/attention/sfa_v1.py", "_copy_to_staged_sfa_bridge", {"torch": torch, "HAS_TRITON": True},
+    ), h.impl)
+    if capture:
+        h.context.staged_sfa_graph_dummy_run = True
+        h.context.cudagraph_runtime_mode = 1
+        h.state.remap_boundary = h.metadata.decode_remap_boundary
+    result = h.namespace["cross_layer_graph_pre"](
+        h.impl, "layer", query, (), h.metadata, False, query, copy_bridge=False,
+    )
+    assert all(a is b for a, b in zip(result[2:], outputs[2:]))
+    assert all(t.eq(-9).all() for t in buffers[2:])
+    assert len(calls) == (0 if dcp else 1)
+    assert result[0] is (query if dcp else buffers[0])
+    if capture:
+        assert h.state.register.call_args.args[1] is buffers
+
+
 @pytest.mark.parametrize("enabled,dtype", [(True, torch.bfloat16), (False, torch.bfloat16), (True, torch.float32)])
 def test_actual_bridge_keeps_buffers_and_other_outputs(ops, monkeypatch, enabled, dtype):
     _, copy_queries, calls = ops

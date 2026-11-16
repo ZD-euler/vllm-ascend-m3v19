@@ -356,8 +356,11 @@ def test_real_aot_pipeline_preserves_sources_and_unrelated_mutation(compiler, mo
 @pytest.mark.parametrize("mtp", [1, 2])
 @pytest.mark.parametrize("bounded", [False, True])
 @pytest.mark.parametrize("decoder_cp", [False, True])
+@pytest.mark.parametrize("full_operator", [False, True])
 @torch.inference_mode()
-def test_existing_sfa_planner_contract_through_new_backend(compiler, monkeypatch, v2, mtp, bounded, decoder_cp):
+def test_existing_sfa_planner_contract_through_new_backend(
+    compiler, monkeypatch, v2, mtp, bounded, decoder_cp, full_operator,
+):
     from tests.ut.compilation import test_shared_resident_buffers as existing
 
     module, state = compiler
@@ -371,6 +374,9 @@ def test_existing_sfa_planner_contract_through_new_backend(compiler, monkeypatch
             monkeypatch.setattr(
                 torch.ops.vllm, "sfa_forward_pre_shared", ns["torch"].ops.vllm.sfa_forward_pre_shared, raising=False
             )
+            monkeypatch.setattr(
+                torch.ops.vllm, "sfa_forward_full", ns["torch"].ops.vllm.sfa_forward_full, raising=False
+            )
             ns["fusion_pass_compile"] = lambda gm, inputs, passes, interval: module.npugraph_ex_compile(
                 gm,
                 inputs,
@@ -382,7 +388,8 @@ def test_existing_sfa_planner_contract_through_new_backend(compiler, monkeypatch
 
     monkeypatch.setattr(existing, "methods", load_methods)
     existing.test_ascend_aot_keeps_group_storage_without_clones(
-        existing.resident_api.__wrapped__(), mtp, v2, bounded, namespace_suffix="_npugraph", decoder_cp=decoder_cp
+        existing.resident_api.__wrapped__(), mtp, v2, bounded, namespace_suffix="_npugraph", decoder_cp=decoder_cp,
+        full_operator=full_operator,
     )
     assert state.identity_copy_counts and not any(state.identity_copy_counts)
 

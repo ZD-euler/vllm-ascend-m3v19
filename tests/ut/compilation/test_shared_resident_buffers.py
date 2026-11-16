@@ -26,8 +26,9 @@ def planner_api():
 @pytest.mark.parametrize("mtp", [1, 2])
 @pytest.mark.parametrize("bounded", [False, True])
 @pytest.mark.parametrize("decoder_cp", [False, True])
+@pytest.mark.parametrize("full_operator", [False, True])
 def test_ascend_aot_keeps_group_storage_without_clones(
-    planner_api, mtp, v2, bounded, decoder_cp, namespace_suffix=""
+    planner_api, mtp, v2, bounded, decoder_cp, full_operator, namespace_suffix="",
 ):
     torch._dynamo.reset()  # Each case represents a fresh worker/configuration.
     _, (producer, consumer), group, _ = grouped(planner_api, mtp, bounded)
@@ -43,29 +44,46 @@ def test_ascend_aot_keeps_group_storage_without_clones(
             "sfa_forward_pre_fake",
             "sfa_forward_pre_shared",
             "sfa_forward_pre_shared_fake",
+            "sfa_forward_full",
+            "sfa_forward_full_fake",
         },
         ns,
     )
     observed_writes = []
 
-    def pre(layer, hidden, cache, metadata, gather, output, *, resident_reads, resident_writes):
+    def pre(layer, hidden, cache, metadata, gather, output, *, resident_reads, resident_writes, copy_bridge=True):
         current = producer if layer == "producer" else consumer
         if resident_writes:
             observed_writes.append(tuple(t.data_ptr() for t in resident_writes))
         full_rows = hidden.repeat(4, 1)[:mtp] if decoder_cp else hidden
         raw = full_rows[:, :1].to(torch.int32).expand(-1, 2048).unsqueeze(1)
         values = plan(current, raw, writes=resident_writes, reads=resident_reads)
-        return (hidden[:, None, :].clone(), hidden[:, None, :2].clone(), *(t.clone() for t in values))
+        assert copy_bridge is not full_operator
+        return (hidden[:, None, :].clone(), hidden[:, None, :2].clone(),
+                *((t.clone() for t in values) if copy_bridge else values))
 
     producer.cross_layer_graph_pre = consumer.cross_layer_graph_pre = pre
+    ns["get_forward_context"] = lambda: NS(sfa_full_graph_active=True)
+    for impl in (producer, consumer):
+        impl._staged_graph_content_diagnostic_enabled = lambda _: False
+        impl._shared_retrieval_edges = lambda: ({}, {})
+        impl.cross_layer_lmcache_retrieve = lambda *args: None
+
+        def post(layer, query, rope, topk, cache, metadata, output, **kwargs):
+            output.copy_(topk[:query.shape[0], 0, :output.shape[-1]])
+
+        impl.cross_layer_graph_post = post
     ns["_mla_runtime_state"] = lambda name: (producer if name == "producer" else consumer, name, (), None)
-    namespace = f"resident_islands_{mtp}_{int(v2)}_{int(bounded)}_{int(decoder_cp)}{namespace_suffix}"
+    namespace = (
+        f"resident_islands_{mtp}_{int(v2)}_{int(bounded)}_{int(decoder_cp)}_{int(full_operator)}{namespace_suffix}"
+    )
+    function = "sfa_forward_full" if full_operator else "sfa_forward_pre_shared"
     lib = torch.library.Library(namespace, "DEF")
     lib.define(
-        "pre" + torch.library.infer_schema(ns["sfa_forward_pre_shared"], mutates_args=["output", "resident_writes"])
+        "pre" + torch.library.infer_schema(ns[function], mutates_args=["output", "resident_writes"])
     )
-    lib.impl("pre", ns["sfa_forward_pre_shared"], "CPU")
-    lib._register_fake("pre", ns["sfa_forward_pre_shared_fake"])
+    lib.impl("pre", ns[function], "CPU")
+    lib._register_fake("pre", ns[function + "_fake"])
     op = getattr(torch.ops, namespace).pre
     compiler = dict(
         functools=functools,
@@ -74,7 +92,8 @@ def test_ascend_aot_keeps_group_storage_without_clones(
         make_graph_return_tuple=make_graph_return_tuple,
         select_decomp_table=select_decomp_table,
         COMPILATION_PASS_KEY="passes",
-        torch=NS(ops=NS(vllm=NS(sfa_forward_pre_shared=op), higher_order=torch.ops.higher_order)),
+        torch=NS(ops=NS(vllm=NS(sfa_forward_pre_shared=torch.ops.aten.sin if full_operator else op,
+                               sfa_forward_full=op if full_operator else None), higher_order=torch.ops.higher_order)),
     )
     methods(
         "vllm_ascend/compilation/compiler_interface.py",
@@ -92,9 +111,17 @@ def test_ascend_aot_keeps_group_storage_without_clones(
         return compiler["fusion_pass_compile"](graph, inputs, {"passes": lambda g: g}, None)[0]
 
     def write(x, buffers):
+        if full_operator:
+            output = torch.empty_like(x)
+            op(x, False, output, "producer", "", [], buffers)
+            return output
         return op(x, False, torch.empty_like(x), "producer", 1, 4, 2, 2048, mtp, 1, mtp * 2048, [], buffers)
 
     def read(x, buffers):
+        if full_operator:
+            output = torch.empty_like(x)
+            op(x, False, output, "consumer", "", buffers, [])
+            return output
         return op(x, False, torch.empty_like(x), "consumer", 1, 4, 2, 2048, mtp, 1, mtp * 2048, buffers, [])
 
     with config.patch(enable_auto_functionalized_v2=v2):
@@ -102,9 +129,12 @@ def test_ascend_aot_keeps_group_storage_without_clones(
         read_compiled = torch.compile(read, backend=backend, fullgraph=True, dynamic=False)
         for value in (1, 7):
             first = write_compiled(torch.full((1 if decoder_cp else mtp, 4), float(value)), group.writes)
-            second = read_compiled(first[0][:, 0], group.reads)
-            assert torch.equal(first[2], second[2]) and second[2].eq(value + 100).all()
-            assert torch.equal(first[4], second[4])
+            second = read_compiled(first if full_operator else first[0][:, 0], group.reads)
+            if full_operator:
+                assert torch.equal(first, second) and second.eq(value + 100).all()
+            else:
+                assert torch.equal(first[2], second[2]) and second[2].eq(value + 100).all()
+                assert torch.equal(first[4], second[4])
     assert observed_writes == [tuple(t.data_ptr() for t in group.writes)] * 2
 
 

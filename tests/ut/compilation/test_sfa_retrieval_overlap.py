@@ -12,7 +12,6 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-
 from sfa_test_support import extract, load_module
 from test_sfa_full_graph import graph_module as graph_fixture
 
@@ -552,6 +551,7 @@ def test_each_layer_copies_once_with_layer_specific_values(runtime, active):
 @pytest.mark.parametrize("shared_storage", [False, True])
 def test_aot_resolves_late_destinations_inside_prefetch_operator(v2, shared_storage, namespace_suffix=""):
     import functools
+
     from torch._dynamo.backends.common import aot_autograd
     from torch._inductor import config
     from torch._inductor.compile_fx import graph_returns_tuple, make_graph_return_tuple
@@ -639,7 +639,8 @@ def test_disabled_mla_keeps_original_operator_sequence():
     exec(compile(ast.fix_missing_locations(module), str(source), "exec"), ns)
     impl = NS(shared_resident_plan=None, local_num_heads=1, kv_lora_rank=4, qk_rope_head_dim=2,
               index_topk=2048, _staged_sfa_graph_capture_sizes=(4,), decode_threshold=2)
-    layer = NS(use_cross_layer_sfa=True, use_retrieval_overlap=False, target_sfa_debug=False, mla_attn=NS(impl=impl),
+    layer = NS(use_full_graph_sfa=False, use_cross_layer_sfa=True,
+               use_retrieval_overlap=False, target_sfa_debug=False, mla_attn=NS(impl=impl),
                prefix="layer", next_layer_name="next")
     ns["forward"](layer, x, x)
     assert events == ["pre", "retrieve", "post"]
@@ -723,7 +724,8 @@ def test_graph_reset_retains_real_layout_but_profile_release_requires_clear(runt
     assert owner.pairs["g0l0"][1][0] is fresh["g0l1"][0]
 
 
-def test_compile_before_kv_initialization_keeps_prefetch_dispatch():
+@pytest.mark.parametrize("full_graph", [False, True])
+def test_compile_before_kv_initialization_keeps_prefetch_dispatch(full_graph):
     """Model profiling compiles without KV; later execution bypasses guards."""
     from torch.fx.experimental.proxy_tensor import make_fx
 
@@ -737,6 +739,7 @@ def test_compile_before_kv_initialization_keeps_prefetch_dispatch():
         args[6].copy_(args[0] + 2)
 
     ops = NS(sfa_forward_pre=pre, sfa_forward_pre_shared=pre,
+             sfa_forward_full=lambda *args: args[2].copy_(args[0] + 2),
              sfa_lmcache_retrieve=lambda *args: None,
              sfa_forward_post=serial_post, sfa_forward_post_prefetch=overlap_post)
     source = ROOT / "vllm_ascend/ops/mla.py"
@@ -749,7 +752,8 @@ def test_compile_before_kv_initialization_keeps_prefetch_dispatch():
     exec(compile(ast.fix_missing_locations(mod), str(source), "exec"), ns)
     impl = NS(shared_resident_plan=None, local_num_heads=1, kv_lora_rank=4, qk_rope_head_dim=2,
               index_topk=2048, _staged_sfa_graph_capture_sizes=(4,), decode_threshold=2)
-    layer = NS(use_cross_layer_sfa=True, use_retrieval_overlap=True, target_sfa_debug=False,
+    layer = NS(use_full_graph_sfa=full_graph, use_cross_layer_sfa=True,
+               use_retrieval_overlap=True, target_sfa_debug=False,
                mla_attn=NS(impl=impl), prefix="layer", next_layer_name="next")
     x = torch.ones(2, 4)
     compiled = make_fx(lambda value: ns["forward"](layer, value, value))(x)

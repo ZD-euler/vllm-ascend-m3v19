@@ -13,7 +13,8 @@ pytest.importorskip("torch_npu")
 @pytest.mark.parametrize("rows", [1, 2, 8, 32])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("dcp_size", [1, 8])
-def test_sfa_preparation_replay_preserves_causal_ids_and_query_bits(rows, dtype, dcp_size):
+@pytest.mark.parametrize("packed", [False, True])
+def test_sfa_preparation_replay_preserves_causal_ids_and_query_bits(rows, dtype, dcp_size, packed):
     from vllm_ascend.ops.triton.sfa_dcp import prepare_sfa_dcp_topk
     from vllm_ascend.ops.triton.sfa_query import copy_sfa_query_bridge
 
@@ -27,6 +28,9 @@ def test_sfa_preparation_replay_preserves_causal_ids_and_query_bits(rows, dtype,
     r_storage = torch.zeros(rows + 1, heads, 576, dtype=dtype, device="npu")
     query, rope = q_storage[:, 1:rows + 1].transpose(0, 1), r_storage[1:, :, 512:]
     destinations = [torch.full((rows + 3, heads, d), 7, dtype=dtype, device="npu") for d in (512, 64)]
+    if packed:
+        packet = torch.full((rows + 3, heads, 576), 7, dtype=dtype, device="npu")
+        destinations = packet.split((512, 64), dim=-1)
 
     def forward():
         if dcp_size > 1:

@@ -18,7 +18,16 @@ OPS = ROOT / "vllm_ascend/ops/triton/sfa_dcp.py"
 
 
 @pytest.fixture
-def gather_queries():
+def gather_queries(monkeypatch):
+    from test_sfa_dcp_prepare import ops
+
+    _, copy_queries, _ = ops.__wrapped__()
+    module = ModuleType("vllm_ascend.ops.triton.sfa_query")
+    module.pack_sfa_dcp_queries = extract(
+        ROOT / "vllm_ascend/ops/triton/sfa_query.py", "pack_sfa_dcp_queries",
+        {"copy_sfa_query_bridge": copy_queries},
+    )
+    monkeypatch.setitem(sys.modules, module.__name__, module)
     tl = HostTL()
     kernel = extract(OPS, "_unpack_queries", {"tl": tl})
 

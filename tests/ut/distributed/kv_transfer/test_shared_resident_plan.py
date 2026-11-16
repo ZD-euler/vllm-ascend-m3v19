@@ -93,7 +93,7 @@ def methods(path, names, namespace):
 
 @pytest.fixture
 def api():
-    ns = dict(vars(resident), np=np, envs=NS(VLLM_ASCEND_MTP_DRAFT_DEBUG=False))
+    ns = dict(vars(resident), np=np, HAS_TRITON=False, envs=NS(VLLM_ASCEND_MTP_DRAFT_DEBUG=False))
     ns["_configured_resident_shards"] = lambda mtp: (4, 4 * mtp)
     ns["prepare_sparse_indices"] = Mock(return_value="legacy")
     ns["prepare_resident_sharded_union_"] = Mock()
