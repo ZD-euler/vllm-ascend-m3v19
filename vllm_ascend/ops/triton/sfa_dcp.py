@@ -153,7 +153,6 @@ def execute_sfa_dcp(
     topk: torch.Tensor, counts: torch.Tensor, block_table: torch.Tensor,
     query_ends: torch.Tensor, local_seq_lens: torch.Tensor, scale: float, group,
     *, prefetch: tuple | None = None, query_gather: SfaDcpQueryGather | None = None,
-    raw_packet: bool = False, combine_tile: int = 512,
 ) -> torch.Tensor:
     """Gather only query heads, then return the merged output for this head owner."""
     if query_gather is None:
@@ -174,37 +173,31 @@ def execute_sfa_dcp(
     if prefetch is not None:
         edge, selected, miss_counts, slots, destinations = prefetch
         edge.launch(selected, miss_counts, slots, destinations)
-    if raw_packet or combine_tile != 512:
-        return merge_sfa_dcp(*partial, group.device_group, raw_packet=raw_packet, combine_tile=combine_tile)
     return merge_sfa_dcp(*partial, group.device_group)
 
 
 @triton.jit
 def _pack(partial, maximum, total, send, rows: tl.constexpr, heads: tl.constexpr,
-          local_heads: tl.constexpr, value_dim: tl.constexpr, RAW: tl.constexpr = False):
-    width: tl.constexpr = value_dim // 2 if RAW else value_dim
-    padding: tl.constexpr = 8 if RAW else 16
-    features = tl.arange(0, width)
-    bytes_ = tl.arange(0, padding)
+          local_heads: tl.constexpr, value_dim: tl.constexpr):
+    features = tl.arange(0, value_dim)
+    bytes_ = tl.arange(0, 16)
     for row in range(tl.program_id(0), rows * heads, tl.num_programs(0)):
         token, head = row // heads, row % heads
         peer = head // local_heads
-        dest = ((peer * rows + token) * local_heads + head % local_heads) * (width + padding)
-        tl.store(send + dest + features, tl.load(partial + row * width + features))
+        dest = ((peer * rows + token) * local_heads + head % local_heads) * (value_dim + 16)
+        tl.store(send + dest + features, tl.load(partial + row * value_dim + features))
         exp_sum = tl.load(total + row)
         max_logit = tl.where(exp_sum > 0, tl.load(maximum + row), -float("inf"))
         max_bits = tl.cast(max_logit, tl.int32, bitcast=True)
         sum_bits = tl.cast(tl.where(exp_sum > 0, exp_sum, 0.0), tl.int32, bitcast=True)
-        # Preserve both FP32 statistics in either aligned packet format.
+        # Keep both FP32 statistics in the existing aligned BF16/FP16 packet.
         # Adding log(exp_sum) to max_logit here can round away the local mass.
-        # The numerical-byte format uses signed shifts: CANN 8.5.1 cannot
-        # lower uint32 -> float stores, while 0..255 is exact in FP16/BF16.
-        if RAW:
-            digits = tl.where(bytes_ == 0, max_bits, tl.where(bytes_ == 1, sum_bits, 0))
-        else:
-            bits = tl.where(bytes_ < 4, max_bits, sum_bits)
-            digits = tl.where(bytes_ < 8, (bits >> (8 * (bytes_ % 4))) & 255, 0)
-        tl.store(send + dest + width + bytes_, digits)
+        # CANN 8.5.1 cannot lower the uint32 -> float conversion at the store.
+        # Signed shifts preserve each byte after masking, and 0..255 is exact
+        # in both packet dtypes. Use signed conversion on unpack as well.
+        bits = tl.where(bytes_ < 4, max_bits, sum_bits)
+        digits = (bits >> (8 * (bytes_ % 4))) & 255
+        tl.store(send + dest + value_dim + bytes_, tl.where(bytes_ < 8, digits, 0))
 
 
 @triton.jit
@@ -216,33 +209,26 @@ def _unpack_stat(ptr):
 
 
 @triton.jit
-def _combine(recv, output, local_rows: tl.constexpr, world: tl.constexpr, value_dim: tl.constexpr,
-             stats_fp32=None, TILE: tl.constexpr = 512):
-    features = tl.arange(0, TILE)
+def _combine(recv, output, local_rows: tl.constexpr, world: tl.constexpr, value_dim: tl.constexpr):
+    features = tl.arange(0, value_dim)
     peers = tl.arange(0, world)
     stride = value_dim + 16
-    tiles: tl.constexpr = value_dim // TILE
-    for item in range(tl.program_id(0), local_rows * tiles, tl.num_programs(0)):
-        row, first = item // tiles, item % tiles * TILE
-        if stats_fp32 is None:
-            stats = recv + (peers * local_rows + row) * stride + value_dim
-            maxima = _unpack_stat(stats)
-            sums = _unpack_stat(stats + 4)
-        else:
-            stats = stats_fp32 + (peers * local_rows + row) * (stride // 2) + value_dim // 2
-            maxima, sums = tl.load(stats), tl.load(stats + 1)
+    for row in range(tl.program_id(0), local_rows, tl.num_programs(0)):
+        stats = recv + (peers * local_rows + row) * stride + value_dim
+        maxima = _unpack_stat(stats)
+        sums = _unpack_stat(stats + 4)
         best = tl.max(maxima, axis=0)
         best = tl.where(best == -float("inf"), 0.0, best)
         weights = sums * tl.exp(maxima - best)
         total = tl.sum(weights, axis=0)
         # Normalize before multiplying partials so finite BF16 values stay in range.
         weights = weights / tl.where(total > 0, total, 1.0)
-        result = tl.zeros((TILE,), tl.float32)
+        result = tl.zeros((value_dim,), tl.float32)
         for peer in tl.static_range(world):
-            offset = (peer * local_rows + row) * stride + first
+            offset = (peer * local_rows + row) * stride
             partial = tl.load(recv + offset + features).to(tl.float32)
             result += get_element(weights, (peer,)) * partial
-        tl.store(output + row * value_dim + first + features, result)
+        tl.store(output + row * value_dim + features, result)
 
 
 def merge_sfa_dcp(
@@ -250,15 +236,12 @@ def merge_sfa_dcp(
     maximum: torch.Tensor,
     total: torch.Tensor,
     group: dist.ProcessGroup,
-    *, raw_packet: bool = False, combine_tile: int = 512,
 ) -> torch.Tensor:
     """Exchange only the partials needed by each TP head owner."""
     rows, heads, value_dim = partial.shape
     world = dist.get_world_size(group)
     if world not in (2, 4, 8) or heads % world or not rows or value_dim != 512:
         raise ValueError("invalid head-parallel DCP attention geometry")
-    if combine_tile not in (128, 256, 512):
-        raise ValueError("DCP combine tile must be 128, 256 or 512")
     if (
         partial.dtype not in (torch.float16, torch.bfloat16)
         or not partial.is_contiguous()
@@ -270,19 +253,12 @@ def merge_sfa_dcp(
     ):
         raise ValueError("DCP attention requires contiguous partials and FP32 statistics")
     local_heads = heads // world
-    width = (value_dim + 16) // 2 if raw_packet else value_dim + 16
-    send = partial.new_empty((world, rows, local_heads, width), dtype=torch.int32 if raw_packet else partial.dtype)
+    send = partial.new_empty((world, rows, local_heads, value_dim + 16))
     recv = torch.empty_like(send)
     output = partial.new_empty((rows, local_heads, value_dim))
     init_device_properties_triton()
     cores = get_vectorcore_num()
-    _pack[(min(rows * heads, cores),)](
-        partial.view(torch.int32) if raw_packet else partial, maximum, total, send,
-        rows, heads, local_heads, value_dim, raw_packet,
-    )
+    _pack[(min(rows * heads, cores),)](partial, maximum, total, send, rows, heads, local_heads, value_dim)
     dist.all_to_all_single(recv, send, group=group)
-    _combine[(min(rows * local_heads * (value_dim // combine_tile), cores),)](
-        recv.view(partial.dtype) if raw_packet else recv, output, rows * local_heads, world, value_dim,
-        recv.view(torch.float32) if raw_packet else None, combine_tile,
-    )
+    _combine[(min(rows * local_heads, cores),)](recv, output, rows * local_heads, world, value_dim)
     return output

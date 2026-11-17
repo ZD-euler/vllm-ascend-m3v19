@@ -30,7 +30,7 @@ from benchmark_sfa_target_preparation import (
 
 
 class AttentionPipeline(Pipeline):
-    def __init__(self, args, inputs, sources, group, direct, *, dcp_options=None, early_gather=False):
+    def __init__(self, args, inputs, sources, group, direct, *, early_gather=False):
         from lmcache_ascend.v1.npu_connector.sparse_graph import SparseGraphTransfer
 
         from vllm_ascend.compilation.sfa_retrieval_overlap import RetrievalEdge
@@ -39,7 +39,7 @@ class AttentionPipeline(Pipeline):
         # to bridge removal. The reference reproduces the parent commit's path.
         super().__init__(args, inputs, sources, optimized=True)
         self.direct, self.group = direct, group
-        self.dcp_options, self.early_gather = dcp_options or {}, early_gather
+        self.early_gather = early_gather
         if args.dcp_size == 1:
             self.dcp.layout = None
         self.layer_caches = [self.caches]
@@ -130,7 +130,6 @@ class AttentionPipeline(Pipeline):
                 (LATENT + ROPE) ** -0.5,
                 self.group,
                 prefetch=prefetch,
-                **getattr(self, "dcp_options", {}),
                 **({"query_gather": pending} if pending is not None else {}),
             )
         else:

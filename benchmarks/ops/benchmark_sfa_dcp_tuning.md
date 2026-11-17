@@ -1,22 +1,9 @@
-# DCP packet, combine tiling and early gather
+# Early DCP query gathering
 
-These candidates preserve one query all-gather and one output all-to-all per
-attention layer. Native attention and the mathematical weighted merge are
-unchanged. All serving controls default to the existing behavior.
-
-| Candidate | Change |
-| --- | --- |
-| `raw` | INT32 packet containing 256 raw output words, exact FP32 max/sum words and six padding words |
-| `tile128` | Four 128-feature combine tiles per output head |
-| `tile256` | Two 256-feature combine tiles per output head |
-| `early` | Submit query gathering before resident planning/retrieval; join before unpack/SFA |
-| `raw_tile128` | Raw packet plus 128-feature combine tiles |
-| `combined` | Raw packet, 128-feature combine tiles and early gathering |
-
-Both packet formats use 1,056 bytes per head. The raw representation removes
-numerical byte encoding/decoding without rounding either FP32 statistic. The
-tiled combine preserves rank accumulation order and normalization before
-multiplication, including all-empty rows and large finite values.
+The `early` candidate preserves one query all-gather and one output all-to-all
+per attention layer. Native attention, the 1,056-byte FP16/BF16 packet and the
+original weighted combine are unchanged. The unsuccessful raw-packet and
+combine-tiling experiments have been removed.
 
 Early submission keeps the packet, receive buffer and work handle in a local
 context until the communication stream rejoins. No per-layer global pending
@@ -31,7 +18,7 @@ requires no C++ rebuild. The benchmark uses the companion LMCache-Ascend sparse
 transfer implementation and registered host memory, as the copy-reduction
 benchmark did. Set `--lmcache-ascend-dir` to its actual checkout.
 
-Start with one candidate and batch:
+Start with one batch:
 
 ```bash
 cd /workspace/sqh/vllm-ascend
@@ -42,7 +29,7 @@ python3 -m torch.distributed.run \
   --nnodes=1 --node-rank=0 --nproc-per-node=8 \
   benchmarks/ops/benchmark_sfa_dcp_tuning.py \
   --lmcache-ascend-dir /workspace/qzy/LMCache-Ascend \
-  --requests 1 --variants raw --steps 2 --warmup-steps 1 \
+  --requests 1 --variants early --steps 2 --warmup-steps 1 \
   --trials 2 --iterations 2 --json dcp-tuning-smoke.json
 ```
 
@@ -50,25 +37,25 @@ For the full comparison replace the final three lines with:
 
 ```bash
   --lmcache-ascend-dir /workspace/qzy/LMCache-Ascend \
-  --requests 1 2 4 8 --variants raw tile128 early combined \
-  --steps 8 --warmup-steps 2 --trials 10 --iterations 10 \
+  --requests 1 2 4 8 --variants early \
+  --steps 16 --warmup-steps 4 --trials 10 --iterations 10 \
   --json dcp-tuning.json
 ```
 
-Every candidate gets a paired baseline using the current optimized bridge
-path. The JSON `direct` arm means the named candidate here; `baseline` has all
-three changes disabled. Positive `median_reduction_percent` means improvement.
+The paired baseline uses the same optimized bridge path and late gathering.
+The JSON `direct` arm means early gathering; positive
+`median_reduction_percent` means improvement. The optional `--variants early`
+argument is retained for existing commands; `early` is the only valid value.
 Console output contains one short `RESULT` line per case; full per-rank timing
 samples and miss counts are saved only in the JSON file. Use `rg '^RESULT'`
 on the console log to extract the summaries. The JSON file is updated after
 every completed case, so existing results can be summarized without rerunning.
-The benchmark passes explicit options and does not depend on the three serving
-knobs below. `VLLM_ASCEND_DCP_HCCL_HOST` still controls the actual communicator;
+The benchmark selects gathering timing explicitly and does not depend on the
+serving knob below. `VLLM_ASCEND_DCP_HCCL_HOST` still controls the communicator;
 unset it for an AIV comparison.
 
 Useful additional cases:
 
-- `--variants tile256 raw_tile128` isolates tiling size and packet/tiling interaction.
 - `--layouts bounded mixed --padding 1` exercises irregular and padded rows.
 - `--layers 1` isolates a planner-producing layer; `--layers 4` adds more consumers.
 - `--no-overlap-retrieval` separates query overlap from existing next-layer retrieval overlap.
@@ -92,26 +79,43 @@ Eager and repeated graph replay must preserve attention outputs, planner state,
 miss counts and retrieved data before timing starts. All real graphs remain
 alive during the comparison; their communicator is not reused after cleanup.
 
-## Serving controls
+## Serving control
 
-Set independently before restarting workers, after qualifying on the deployment
-runtime. Flags affect DCP>1 only:
+Set before restarting workers. This affects DCP>1 only and defaults to disabled:
 
 ```bash
-export VLLM_ASCEND_SFA_DCP_RAW_PACKET=1        # default 0
-export VLLM_ASCEND_SFA_DCP_COMBINE_TILE=128    # default 512; valid 128/256/512
-export VLLM_ASCEND_SFA_DCP_EARLY_GATHER=1      # default 0
+export VLLM_ASCEND_SFA_DCP_EARLY_GATHER=1
 ```
 
-Raw packets and tiling apply to both target and draft DCP attention. Early
-gathering applies to full target graphs with active shared resident plans;
+Remove the retired settings from older launch scripts:
+
+```bash
+unset VLLM_ASCEND_SFA_DCP_RAW_PACKET VLLM_ASCEND_SFA_DCP_COMBINE_TILE
+```
+
+Early gathering applies to full target graphs with active shared resident plans;
 staged islands, eager fallbacks, diagnostics and MTP retain late submission.
-The packet layout is process-group-wide: use identical settings on every rank.
+Use identical settings on every rank.
+
+## Further optimization boundary
+
+The normal path joins the gather only before unpacking its result, and failure
+cleanup does not issue a second device wait after a successful join. Moving
+submission earlier would require rescheduling query projection relative to KV
+preparation; the existing order releases fresh KV temporaries before projecting
+queries. A faster schedule is not established by the current measurements.
+
+Early gathering has no explicit AIV budget. The current-layer sparse H2D load
+uses its automatic launch width; the existing 12-block limit applies only to
+next-layer prefetch and does not reserve disjoint physical cores. Profile the
+whole attention path and individual kernel durations before adding core limits
+or changing submission order. Keep logical resident sharding and Top-K fixed
+when comparing resource allocation.
 
 ## Qualification
 
-Host tests cover DCP2/4/8, FP16/BF16 bits, all three tile sizes, empty shards,
-large maxima/sums, one-collective routing and asynchronous source lifetime.
+Host tests cover DCP2/4/8, FP16/BF16 bits, empty shards, large maxima/sums,
+one-collective routing and asynchronous source lifetime.
 They do not compile Triton or run HCCL. The NPU test changes queries and counts
 between replays and checks both baseline parity and a dense CPU reference:
 
@@ -126,6 +130,6 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m torch.distributed.run \
 
 The single-NPU `test_dcp_exchange_pack_combine_capture` cases in
 `tests/e2e/singlecard/test_sfa_dcp_merge_npu.py` additionally cover extreme
-statistics and compilation of each packet/tile combination without HCCL.
+statistics and compilation of the original pack/combine kernels without HCCL.
 Full-server qualification and throughput measurements remain separate from
-this attention benchmark; no speedup is assumed from fewer encoding operations.
+this attention benchmark.

@@ -1997,14 +1997,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.num_kv_heads = num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
 
-        self._dcp_exchange_options = {}
-        if envs.VLLM_ASCEND_SFA_DCP_RAW_PACKET:
-            self._dcp_exchange_options["raw_packet"] = True
-        combine_tile = envs.VLLM_ASCEND_SFA_DCP_COMBINE_TILE
-        if combine_tile not in (128, 256, 512):
-            raise ValueError("VLLM_ASCEND_SFA_DCP_COMBINE_TILE must be 128, 256 or 512")
-        if combine_tile != 512:
-            self._dcp_exchange_options["combine_tile"] = combine_tile
         self._dcp_early_gather = envs.VLLM_ASCEND_SFA_DCP_EARLY_GATHER
 
         # MLA Args
@@ -3669,7 +3661,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         return execute_sfa_dcp(
             query, rope, kv_cache, dcp.topk, dcp.counts, metadata.block_table,
             metadata.cum_query_lens, dcp.local_seq_lens, self.scale, get_dcp_group(),
-            **getattr(self, "_dcp_exchange_options", {}),
         )
 
     def _prepare_decode_sparse_indices(
@@ -4117,7 +4108,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_output = execute_sfa_dcp(
                 ql_nope, q_pe, kv_cache, topk_indices, dcp.counts, block_table,
                 actual_seq_lengths_query, dcp.local_seq_lens, self.scale, get_dcp_group(), prefetch=prefetch,
-                **getattr(self, "_dcp_exchange_options", {}),
                 **({"query_gather": query_gather} if query_gather is not None else {}),
             )
         else:

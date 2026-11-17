@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""A/B complete DCP preparation, real sparse H2D and native attention.
+"""A/B early query gathering through real sparse H2D and native attention.
 
-Each candidate retains one query all-gather and one output all-to-all per
-layer. The baseline already includes the merged query/bridge copy reductions.
+Both arms retain one query all-gather and one output all-to-all per layer,
+with the same packet format and merged query/bridge copy reductions.
 """
 
 import argparse
@@ -20,30 +20,14 @@ from benchmark_sfa_copy_reduction import AttentionPipeline, measure_case
 from benchmark_sfa_target_preparation import ROOT, make_inputs
 
 
-def variant_options(name):
-    # Return fresh per-instance options; never mutate serving environment state.
-    if name not in ("raw", "tile128", "tile256", "early", "raw_tile128", "combined"):
-        raise ValueError(f"unknown DCP tuning variant: {name}")
-    options = {}
-    if name in ("raw", "raw_tile128", "combined"):
-        options["raw_packet"] = True
-    if name in ("tile128", "raw_tile128", "combined"):
-        options["combine_tile"] = 128
-    if name == "tile256":
-        options["combine_tile"] = 256
-    return options, name in ("early", "combined")
-
-
 def tuning_pipeline(args, inputs, sources, group, candidate):
-    options, early = variant_options(args.variant) if candidate else ({}, False)
     return AttentionPipeline(
         args,
         inputs,
         sources,
         group,
         direct=True,
-        dcp_options=options,
-        early_gather=early,
+        early_gather=candidate,
     )
 
 
@@ -88,8 +72,8 @@ def main():
     parser.add_argument(
         "--variants",
         nargs="+",
-        default=["raw", "tile128", "early", "combined"],
-        choices=("raw", "tile128", "tile256", "early", "raw_tile128", "combined"),
+        default=["early"],
+        choices=("early",),
     )
     parser.add_argument("--layouts", nargs="+", choices=("uniform", "bounded", "mixed"), default=["uniform"])
     parser.add_argument("--padding", type=int, default=0)

@@ -103,8 +103,7 @@ def test_query_unpack_bit_exact_capture_without_hccl(world, dtype):
 @torch.inference_mode()
 @pytest.mark.parametrize("world", [2, 4, 8])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("raw,tile", [(False, 512), (False, 128), (True, 512), (True, 128), (True, 256)])
-def test_dcp_exchange_pack_combine_capture(world, dtype, raw, tile):
+def test_dcp_exchange_pack_combine_capture(world, dtype):
     from vllm_ascend.ops.triton.sfa_dcp import _combine, _pack
 
     rows, local_heads, dim = 4, 2, 512
@@ -125,20 +124,18 @@ def test_dcp_exchange_pack_combine_capture(world, dtype, raw, tile):
     partial[:, 3].fill_(1e36 if dtype == torch.bfloat16 else 60000)
     partial[total == 0] = 0
     partial_npu, maximum_npu, total_npu = (t.npu() for t in (partial, maximum, total))
-    send = torch.empty((world, world, rows, local_heads, (dim + 16) // 2 if raw else dim + 16),
-                       dtype=torch.int32 if raw else dtype, device="npu")
+    send = torch.empty((world, world, rows, local_heads, dim + 16), dtype=dtype, device="npu")
     recv = torch.empty_like(send)
     output = torch.empty((world, rows, local_heads, dim), dtype=dtype, device="npu")
 
     def forward():
         for peer in range(world):
-            _pack[(1,)](partial_npu[peer].view(torch.int32) if raw else partial_npu[peer],
-                        maximum_npu[peer], total_npu[peer], send[peer], rows, heads, local_heads, dim, raw)
+            _pack[(1,)](partial_npu[peer], maximum_npu[peer], total_npu[peer], send[peer],
+                        rows, heads, local_heads, dim)
         # Simulate only packet routing; both production Triton kernels run unchanged.
         recv.copy_(send.transpose(0, 1))
         for peer in range(world):
-            _combine[(1,)](recv[peer].view(dtype) if raw else recv[peer], output[peer],
-                           rows * local_heads, world, dim, recv[peer].view(torch.float32) if raw else None, tile)
+            _combine[(1,)](recv[peer], output[peer], rows * local_heads, world, dim)
 
     forward()  # Compile outside capture; fails here on the old unsigned casts.
     torch.npu.synchronize()

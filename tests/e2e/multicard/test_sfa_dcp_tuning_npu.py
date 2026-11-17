@@ -30,18 +30,8 @@ def tuning_world():
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize(
-    "raw,tile,early",
-    [
-        (True, 512, False),
-        (False, 128, False),
-        (False, 256, False),
-        (False, 512, True),
-        (True, 128, True),
-    ],
-)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_native_dcp_tuning_replay(tuning_world, raw, tile, early, dtype):
+def test_native_dcp_early_gather_replay(tuning_world, dtype):
     from vllm.distributed.device_communicators.base_device_communicator import DeviceCommunicatorBase
 
     from vllm_ascend.ops.triton.sfa_dcp import execute_sfa_dcp, start_sfa_dcp_query_gather
@@ -72,7 +62,7 @@ def test_native_dcp_tuning_replay(tuning_world, raw, tile, early, dtype):
     graphs, outputs = [], []
 
     def forward(candidate):
-        pending = start_sfa_dcp_query_gather(query, rope, group) if candidate and early else None
+        pending = start_sfa_dcp_query_gather(query, rope, group) if candidate else None
         try:
             # Real data dependency: attention must see the latest counts while
             # query gathering can execute independently of their publication.
@@ -89,8 +79,6 @@ def test_native_dcp_tuning_replay(tuning_world, raw, tile, early, dtype):
                 576**-0.5,
                 group,
                 query_gather=pending,
-                raw_packet=candidate and raw,
-                combine_tile=tile if candidate else 512,
             )
         finally:
             if pending is not None:
