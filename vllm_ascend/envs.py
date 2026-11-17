@@ -252,6 +252,8 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DCP_HCCL_HOST": lambda: bool(int(os.getenv("VLLM_ASCEND_DCP_HCCL_HOST", "0"))),
     # 0 (default) late query gather; 1 overlap the same gather with independent
     # target preparation in full SFA graphs with shared resident plans.
+    # Prefetched shared-index consumers retain late gathering; consumers with
+    # a serial H2D load can overlap that load even without an indexer.
     # Staged/eager/MTP paths keep late submission. Non-sensitive; restart required.
     "VLLM_ASCEND_SFA_DCP_EARLY_GATHER": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_DCP_EARLY_GATHER", "0"))),
     # Experimental: combine stable target batch and preparation agreements.

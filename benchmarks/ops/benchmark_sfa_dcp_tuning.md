@@ -10,6 +10,9 @@ context until the communication stream rejoins. No per-layer global pending
 state, temporary probe, or extra collective is introduced. In serving, submit
 occurs immediately after query projection/RoPE, before indexer postprocessing.
 The ordinary full-attention call owns cleanup, including preparation failures.
+Prefetched shared-index consumers use late gathering, because their load joins
+before projection and their plan is already available. Consumers without an
+incoming prefetch edge retain early gathering to overlap their serial H2D load.
 
 ## Benchmark
 
@@ -37,7 +40,7 @@ For the full comparison replace the final three lines with:
 
 ```bash
   --lmcache-ascend-dir /workspace/qzy/LMCache-Ascend \
-  --requests 1 2 4 8 --variants early \
+  --requests 1 2 4 8 --variants early --layers 4 \
   --steps 16 --warmup-steps 4 --trials 10 --iterations 10 \
   --json dcp-tuning.json
 ```
@@ -68,8 +71,9 @@ combine. It excludes projection/indexer compute, output projection, MoE,
 sampling and server scheduling. Query and raw Top-K inputs are precomputed;
 early gathering overlaps actual planner/H2D work, with no synthetic delay.
 Thus it does not measure the extra overlap available during a real indexer.
-Consumer queries start gathering only after the previous retrieval edge joins,
-matching production's dependency order.
+Prefetched consumers use the original late gather, matching production's
+dependency order. Use `--layers 4` for a model with one indexer in each four-layer
+group; the default remains two layers for compatibility with earlier results.
 
 Samples report microseconds per step for the entire layer group (two layers by
 default), including communication completion. They divide graph time by steps,

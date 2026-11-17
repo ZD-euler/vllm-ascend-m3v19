@@ -494,6 +494,12 @@ def sfa_forward_full(
     )
     pending = []
     early = direct and getattr(impl, "_dcp_early_gather", False) and getattr(metadata, "sfa_dcp", None) is not None
+    if early and impl.skip_topk:
+        incoming, _ = impl._shared_retrieval_edges()
+        # Prefetched consumers join before projection and reuse the producer's
+        # plan. No independent device work remains before query unpack/SFA.
+        # Without prefetch, retain overlap with this consumer's serial H2D.
+        early = attn_layer_name not in incoming
 
     def query_ready(query, rope):
         from vllm_ascend.ops.triton.sfa_dcp import start_sfa_dcp_query_gather

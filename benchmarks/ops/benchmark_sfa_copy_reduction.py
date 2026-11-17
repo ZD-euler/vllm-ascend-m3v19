@@ -89,7 +89,7 @@ class AttentionPipeline(Pipeline):
             if layer and self.edges:
                 self.edges[layer - 1].join()
             pending = None
-            if getattr(self, "early_gather", False):
+            if getattr(self, "early_gather", False) and (not layer or not self.edges):
                 from vllm_ascend.ops.triton.sfa_dcp import start_sfa_dcp_query_gather
 
                 pending = start_sfa_dcp_query_gather(*queries, self.group)

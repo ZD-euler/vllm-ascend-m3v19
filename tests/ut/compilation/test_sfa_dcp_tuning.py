@@ -106,8 +106,10 @@ def test_early_attention_uses_one_gather_and_keeps_prefetch_order(gather_queries
 
 @pytest.mark.parametrize("failure", [None, "prepare", "retrieve", "post"])
 @pytest.mark.parametrize("eligible", [False, True])
-def test_full_operator_owns_early_gather_through_failure_cleanup(monkeypatch, failure, eligible):
+@pytest.mark.parametrize("consumer,prefetched", [(False, False), (True, False), (True, True)])
+def test_full_operator_owns_early_gather_through_failure_cleanup(monkeypatch, failure, eligible, consumer, prefetched):
     events, pending = [], []
+    overlap = eligible and not prefetched
     output = torch.zeros(2, 8, 512)
     counts = torch.ones(1, dtype=torch.int32)
 
@@ -123,7 +125,7 @@ def test_full_operator_owns_early_gather_through_failure_cleanup(monkeypatch, fa
 
     def pre(*args, query_ready=None, **kwargs):
         events.append("project")
-        assert (query_ready is not None) == eligible
+        assert (query_ready is not None) == overlap
         if query_ready:
             query_ready(output, output)
         events.append("prepare")
@@ -138,18 +140,19 @@ def test_full_operator_owns_early_gather_through_failure_cleanup(monkeypatch, fa
 
     def post(*args, **kwargs):
         events.append("post")
-        assert kwargs.get("query_gather") is (pending[0] if eligible else None)
+        assert kwargs.get("query_gather") is (pending[0] if overlap else None)
         if failure == "post":
             raise RuntimeError(failure)
 
     impl = NS(
         shared_resident_plan=NS(active=True),
+        skip_topk=consumer,
         _dcp_early_gather=True,
         _staged_graph_content_diagnostic_enabled=lambda _: False,
         cross_layer_graph_pre=pre,
         cross_layer_lmcache_retrieve=retrieve,
         cross_layer_graph_post=post,
-        _shared_retrieval_edges=lambda: ({}, {}),
+        _shared_retrieval_edges=lambda: ({"layer": object()} if prefetched else {}, {}),
     )
     run = extract(
         ROOT / "vllm_ascend/ops/mla.py",
@@ -165,8 +168,8 @@ def test_full_operator_owns_early_gather_through_failure_cleanup(monkeypatch, fa
             run(output, False, output, "layer", "next", [], [])
     else:
         run(output, False, output, "layer", "next", [], [])
-    assert events[:3] == ["project", "gather", "prepare"] if eligible else events[:2] == ["project", "prepare"]
-    assert events[-1] == "join" if eligible else "join" not in events
+    assert events[:3] == ["project", "gather", "prepare"] if overlap else events[:2] == ["project", "prepare"]
+    assert events[-1] == "join" if overlap else "join" not in events
 
 
 @pytest.fixture
@@ -184,7 +187,8 @@ def test_benchmark_only_changes_gather_timing(tuning_bench, monkeypatch):
 
 
 @pytest.mark.parametrize("fail_prepare", [False, True])
-def test_whole_pipeline_overlaps_only_independent_work_and_joins(monkeypatch, tuning_bench, fail_prepare):
+@pytest.mark.parametrize("prefetched", [False, True])
+def test_whole_pipeline_overlaps_only_independent_work_and_joins(monkeypatch, tuning_bench, fail_prepare, prefetched):
     pipeline = tuning_bench.AttentionPipeline.__new__(tuning_bench.AttentionPipeline)
     events = []
     tensor = torch.zeros(2, 8, 512)
@@ -204,8 +208,11 @@ def test_whole_pipeline_overlaps_only_independent_work_and_joins(monkeypatch, tu
             raise RuntimeError("prepare failed")
         return (tensor,) * 6
 
-    def attend(*args, query_gather, prefetch):
-        query_gather.wait()
+    def attend(*args, query_gather=None, prefetch=None):
+        if query_gather is not None:
+            query_gather.wait()
+        else:
+            events.append("late_gather")
         events.append("attention")
         if prefetch is not None:
             prefetch[0].launch(*prefetch[1:])
@@ -221,9 +228,11 @@ def test_whole_pipeline_overlaps_only_independent_work_and_joins(monkeypatch, tu
     pipeline.layer_caches = [(tensor, tensor)] * 2
     pipeline.bridges = [()] * 2
     pipeline.transfers = [NS(load=lambda *args: events.append("load"))] * 2
-    pipeline.edges = [
-        NS(join=lambda: events.append("join"), launch=lambda *args: events.append("prefetch"), destinations=())
-    ]
+    pipeline.edges = (
+        [NS(join=lambda: events.append("join"), launch=lambda *args: events.append("prefetch"), destinations=())]
+        if prefetched
+        else []
+    )
     pipeline.counts = pipeline.attention_table = pipeline.attention_ends = pipeline.local_lens = tensor
     pipeline.prepare = prepare
     if fail_prepare:
@@ -232,18 +241,32 @@ def test_whole_pipeline_overlaps_only_independent_work_and_joins(monkeypatch, tu
         assert events == ["gather", "plan", "wait"]
     else:
         pipeline.step(None)
-        assert events == [
-            "gather",
-            "plan",
-            "load",
-            "wait",
-            "attention",
-            "prefetch",
-            "merge",
-            "join",
-            "gather",
-            "wait",
-            "attention",
-            "merge",
-        ]
+        if prefetched:
+            assert events == [
+                "gather",
+                "plan",
+                "load",
+                "wait",
+                "attention",
+                "prefetch",
+                "merge",
+                "join",
+                "late_gather",
+                "attention",
+                "merge",
+            ]
+        else:
+            assert events == [
+                "gather",
+                "plan",
+                "load",
+                "wait",
+                "attention",
+                "merge",
+                "gather",
+                "load",
+                "wait",
+                "attention",
+                "merge",
+            ]
     assert all(context.work is None for context in pending)
