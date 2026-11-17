@@ -1302,11 +1302,13 @@ def get_hccl_config_for_pg_options(group_name: str) -> dict | None:
     # result in memory misalignment problems.
     if group_name and "mc2" in group_name:
         return None
-    hccl_config_map = {
-        "dp": {"hccl_buffer_size": calculate_dp_buffer_size()},
-        "dynamic_eplb": {"hccl_buffer_size": _DYNAMIC_EPLB_BUFFER_SIZE},
-    }
-    config = hccl_config_map.get(group_name, get_default_buffer_config())
+    # Only DP sizing needs a model config. Standalone DCP/TP callers have none.
+    if group_name == "dp":
+        config = {"hccl_buffer_size": calculate_dp_buffer_size()}
+    elif group_name == "dynamic_eplb":
+        config = {"hccl_buffer_size": _DYNAMIC_EPLB_BUFFER_SIZE}
+    else:
+        config = get_default_buffer_config()
     if group_name == "dcp" and envs_ascend.VLLM_ASCEND_DCP_HCCL_HOST:
         config["hccl_op_expansion_mode"] = _HCCL_OP_EXPANSION_MODE_HOST
         logger.info(

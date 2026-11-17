@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU checks of production communicator options and mixed-mode graph budgets."""
 
+import math
 import os
 import sys
 from types import ModuleType
@@ -42,6 +43,33 @@ def test_default_and_invalid_override(options, monkeypatch):
     monkeypatch.setenv("VLLM_ASCEND_DCP_HCCL_HOST", "invalid")
     with pytest.raises(ValueError):
         options.create_hccl_pg_options("dcp")
+
+
+@pytest.mark.parametrize("host", [False, True])
+@pytest.mark.parametrize("name", ["dcp", "tp", "ep", "pcp", "dynamic_eplb", "mc2", "mc2_dcp", "other", None])
+def test_standalone_non_dp_options_do_not_read_model_config(options, monkeypatch, host, name):
+    read_config = Mock(side_effect=AssertionError("Current vLLM config is not set"))
+    monkeypatch.setattr(sys.modules["vllm.config"], "get_current_vllm_config", read_config, raising=False)
+    # Restore the actual sizing implementation: the ordinary fixture replaces
+    # it with a constant, which previously hid this standalone startup failure.
+    calculate = extract(ROOT / "vllm_ascend/utils.py", "calculate_dp_buffer_size", {
+        "torch": options.torch, "math": math, "_MIN_DP_BUFFER_SIZE": options._MIN_DP_BUFFER_SIZE,
+    })
+    monkeypatch.setattr(options, "calculate_dp_buffer_size", calculate)
+    monkeypatch.setenv("VLLM_ASCEND_DCP_HCCL_HOST", str(int(host)))
+    actual = options.create_hccl_pg_options(name).hccl_config
+    if name and "mc2" in name:
+        assert actual is None
+    else:
+        expected = {"hccl_buffer_size": options._DYNAMIC_EPLB_BUFFER_SIZE if name == "dynamic_eplb" else 200}
+        if name == "dcp" and host:
+            expected["hccl_op_expansion_mode"] = 1
+        assert actual == expected
+    read_config.assert_not_called()
+    # DP still requires its real configuration; do not silently invent one.
+    with pytest.raises(AssertionError, match="Current vLLM config is not set"):
+        options.create_hccl_pg_options("dp")
+    read_config.assert_called_once_with()
 
 
 def test_deployed_group_constructor_receives_host_options(options, monkeypatch, caplog):
