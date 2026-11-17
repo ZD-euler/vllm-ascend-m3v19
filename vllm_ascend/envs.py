@@ -250,6 +250,18 @@ env_variables: dict[str, Callable[[], Any]] = {
     # TP/EP/DP/MC2 keep their existing settings. Non-sensitive; startup-only,
     # requires worker restart and reserves HOST communication graph streams.
     "VLLM_ASCEND_DCP_HCCL_HOST": lambda: bool(int(os.getenv("VLLM_ASCEND_DCP_HCCL_HOST", "0"))),
+    # Experimental DCP output packet: 0 (default) numerical byte encoding;
+    # 1 raw INT32 transport, preserving FP16/BF16 values and both FP32 stats.
+    # Non-sensitive; read at layer initialization, requires worker restart.
+    "VLLM_ASCEND_SFA_DCP_RAW_PACKET": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_DCP_RAW_PACKET", "0"))),
+    # DCP combine feature tile: 128, 256 or 512 (default/current behavior).
+    # Smaller tiles expose more programs for small batches. Non-sensitive;
+    # read at layer initialization, requires worker restart.
+    "VLLM_ASCEND_SFA_DCP_COMBINE_TILE": lambda: int(os.getenv("VLLM_ASCEND_SFA_DCP_COMBINE_TILE", "512")),
+    # 0 (default) late query gather; 1 overlap the same gather with independent
+    # target preparation in full SFA graphs with shared resident plans.
+    # Staged/eager/MTP paths keep late submission. Non-sensitive; restart required.
+    "VLLM_ASCEND_SFA_DCP_EARLY_GATHER": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_DCP_EARLY_GATHER", "0"))),
     # Experimental: combine stable target batch and preparation agreements.
     # 0 (default): existing protocol; 1: qualified MP TP x DP. Non-sensitive; restart required.
     "VLLM_ASCEND_SFA_SINGLE_AGREEMENT": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_SINGLE_AGREEMENT", "0"))),

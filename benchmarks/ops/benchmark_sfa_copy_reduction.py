@@ -30,7 +30,7 @@ from benchmark_sfa_target_preparation import (
 
 
 class AttentionPipeline(Pipeline):
-    def __init__(self, args, inputs, sources, group, direct):
+    def __init__(self, args, inputs, sources, group, direct, *, dcp_options=None, early_gather=False):
         from lmcache_ascend.v1.npu_connector.sparse_graph import SparseGraphTransfer
 
         from vllm_ascend.compilation.sfa_retrieval_overlap import RetrievalEdge
@@ -39,6 +39,7 @@ class AttentionPipeline(Pipeline):
         # to bridge removal. The reference reproduces the parent commit's path.
         super().__init__(args, inputs, sources, optimized=True)
         self.direct, self.group = direct, group
+        self.dcp_options, self.early_gather = dcp_options or {}, early_gather
         if args.dcp_size == 1:
             self.dcp.layout = None
         self.layer_caches = [self.caches]
@@ -81,60 +82,77 @@ class AttentionPipeline(Pipeline):
     def step(self, frame):
         from vllm_ascend.ops.triton.sfa_dcp import execute_sfa_dcp
 
-        prepared = self.prepare(frame)
         self.attention_outputs = []
         for layer, (queries, caches, transfer, bridge) in enumerate(
             zip(self.queries, self.layer_caches, self.transfers, self.bridges)
         ):
             if layer and self.edges:
                 self.edges[layer - 1].join()
-            outputs = (*queries, *prepared[2:])
-            # Use the real bridge implementation for both the baseline and
-            # DCP=1's query-only copy. The DCP direct arm packs at all-gather.
-            if not self.direct or self.args.dcp_size == 1:
-                owner = SimpleNamespace(_ensure_staged_sfa_bridge_buffers=lambda _, bridge=bridge: bridge)
-                outputs = self.copy_bridge(owner, queries[0], outputs, copy_payload=not self.direct)
-            query, rope, topk, selected, counts, slots = outputs
-            if not layer or not self.edges:
-                transfer.load(selected, counts, slots)
-            prefetch = None
-            if layer < len(self.edges):
-                edge = self.edges[layer]
-                prefetch = (edge, selected, counts, slots, edge.destinations)
-            if self.args.dcp_size > 1:
-                result = execute_sfa_dcp(
-                    query,
-                    rope,
-                    caches,
-                    topk,
-                    self.counts,
-                    self.attention_table,
-                    self.attention_ends,
-                    self.local_lens,
-                    (LATENT + ROPE) ** -0.5,
-                    self.group,
-                    prefetch=prefetch,
-                )
-            else:
-                result = torch.ops._C_ascend.npu_sparse_flash_attention(
-                    query,
-                    caches[0],
-                    caches[0],
-                    topk,
-                    (LATENT + ROPE) ** -0.5,
-                    1,
-                    self.attention_table,
-                    self.attention_ends,
-                    self.local_lens,
-                    rope,
-                    caches[1],
-                    "TND",
-                    "PA_BSND",
-                    3,
-                )
-                if prefetch is not None:
-                    prefetch[0].launch(*prefetch[1:])
-            self.attention_outputs.append(result)
+            pending = None
+            if getattr(self, "early_gather", False):
+                from vllm_ascend.ops.triton.sfa_dcp import start_sfa_dcp_query_gather
+
+                pending = start_sfa_dcp_query_gather(*queries, self.group)
+            try:
+                # Only the producer runs the planner. Consumer layers have
+                # little independent work after their queries become ready.
+                if layer == 0:
+                    prepared = self.prepare(frame)
+                self._attend_layer(layer, queries, caches, transfer, bridge, prepared, pending, execute_sfa_dcp)
+            finally:
+                if pending is not None:
+                    pending.wait()
+
+    def _attend_layer(self, layer, queries, caches, transfer, bridge, prepared, pending, execute_sfa_dcp):
+        outputs = (*queries, *prepared[2:])
+        # Use the real bridge implementation for both the baseline and
+        # DCP=1's query-only copy. The DCP direct arm packs at all-gather.
+        if not self.direct or self.args.dcp_size == 1:
+            owner = SimpleNamespace(_ensure_staged_sfa_bridge_buffers=lambda _, bridge=bridge: bridge)
+            outputs = self.copy_bridge(owner, queries[0], outputs, copy_payload=not self.direct)
+        query, rope, topk, selected, counts, slots = outputs
+        if not layer or not self.edges:
+            transfer.load(selected, counts, slots)
+        prefetch = None
+        if layer < len(self.edges):
+            edge = self.edges[layer]
+            prefetch = (edge, selected, counts, slots, edge.destinations)
+        if self.args.dcp_size > 1:
+            result = execute_sfa_dcp(
+                query,
+                rope,
+                caches,
+                topk,
+                self.counts,
+                self.attention_table,
+                self.attention_ends,
+                self.local_lens,
+                (LATENT + ROPE) ** -0.5,
+                self.group,
+                prefetch=prefetch,
+                **getattr(self, "dcp_options", {}),
+                **({"query_gather": pending} if pending is not None else {}),
+            )
+        else:
+            result = torch.ops._C_ascend.npu_sparse_flash_attention(
+                query,
+                caches[0],
+                caches[0],
+                topk,
+                (LATENT + ROPE) ** -0.5,
+                1,
+                self.attention_table,
+                self.attention_ends,
+                self.local_lens,
+                rope,
+                caches[1],
+                "TND",
+                "PA_BSND",
+                3,
+            )
+            if prefetch is not None:
+                prefetch[0].launch(*prefetch[1:])
+        self.attention_outputs.append(result)
         self.current_outputs = outputs
 
     def snapshot(self, *, include_cache=True):
@@ -169,7 +187,7 @@ def verify(pipelines, control, golden=None, *, phase="eager"):
     return misses
 
 
-def measure_case(args, control):
+def measure_case(args, control, *, pipeline_factory=AttentionPipeline):
     from vllm.distributed.device_communicators.base_device_communicator import DeviceCommunicatorBase
 
     from vllm_ascend.utils import create_hccl_pg_options
@@ -195,7 +213,7 @@ def measure_case(args, control):
     try:
         sources = Sources(args.lmcache_ascend_dir, args.requests, args.history, device)
         for direct in (False, True):
-            pipelines.append(AttentionPipeline(args, inputs, sources, group, direct))
+            pipelines.append(pipeline_factory(args, inputs, sources, group, direct))
         misses = []
         for step, frame in enumerate(frames):
             for pipeline in pipelines:
@@ -205,9 +223,9 @@ def measure_case(args, control):
         golden = [(p.snapshot(include_cache=False), [t.cpu() for t in p.attention_outputs]) for p in pipelines]
         graphs = []
         # Both variants' real graphs stay alive throughout parity and timing.
-        for pipeline in pipelines:
+        for index, pipeline in enumerate(pipelines):
             if not args.rank:
-                print(f"Capturing {'direct' if pipeline.direct else 'baseline'} layer group", flush=True)
+                print(f"Capturing {'candidate' if index else 'baseline'} layer group", flush=True)
             warm = pipeline.capture(frames[: args.warmup_steps])
             timed = pipeline.capture(frames[args.warmup_steps :])
             graphs.append((warm, timed))

@@ -40,11 +40,14 @@ def gather_queries(monkeypatch):
                     kernel(Pointer(packed), Pointer(query), Pointer(rope), *args)
             return run
 
-    return extract(OPS, "_gather_sfa_dcp_queries", {
+    namespace = {
         "torch": torch, "_unpack_queries": Launch(),
         "init_device_properties_triton": lambda: None, "get_vectorcore_num": lambda: 7,
         "triton": SimpleNamespace(next_power_of_2=lambda n: 1 << (n - 1).bit_length()),
-    })
+    }
+    for name in ("_sfa_dcp_query_packet", "_unpack_sfa_dcp_queries", "_gather_sfa_dcp_queries"):
+        extract(OPS, name, namespace)
+    return namespace["_gather_sfa_dcp_queries"]
 
 
 @pytest.mark.parametrize("world", [2, 4, 8])

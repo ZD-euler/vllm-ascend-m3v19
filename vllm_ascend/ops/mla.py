@@ -25,7 +25,7 @@ import re
 import torch
 from torch import nn
 from vllm.config import CacheConfig, get_current_vllm_config
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_dcp_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.mla import MLAModules, MultiHeadLatentAttentionWrapper
@@ -492,23 +492,40 @@ def sfa_forward_full(
         and group is not None and group.active
         and not impl._staged_graph_content_diagnostic_enabled(attn_layer_name)
     )
-    query, rope, topk, selected, counts, slots = impl.cross_layer_graph_pre(
-        attn_layer_name, hidden_states, kv_cache, metadata, need_gather_q_kv, output,
-        resident_reads=resident_reads or None, resident_writes=resident_writes or None,
-        copy_bridge=not direct,
-    )
-    impl.cross_layer_lmcache_retrieve(
-        attn_layer_name, next_layer_name, selected, counts, slots, metadata, context,
-    )
-    _, outgoing = impl._shared_retrieval_edges()
-    edge = outgoing.get(attn_layer_name)
-    prefetch = None
-    if edge is not None:
-        capacity = edge.transfer.request_capacity
-        prefetch = (edge, selected[:capacity], counts[:capacity], slots[:capacity], edge.destinations)
-    impl.cross_layer_graph_post(
-        attn_layer_name, query, rope, topk, kv_cache, metadata, output, prefetch=prefetch,
-    )
+    pending = []
+    early = direct and getattr(impl, "_dcp_early_gather", False) and getattr(metadata, "sfa_dcp", None) is not None
+
+    def query_ready(query, rope):
+        from vllm_ascend.ops.triton.sfa_dcp import start_sfa_dcp_query_gather
+
+        if pending:
+            raise RuntimeError("DCP query gather submitted twice in one attention call")
+        pending.append(start_sfa_dcp_query_gather(query, rope, get_dcp_group()))
+
+    try:
+        query, rope, topk, selected, counts, slots = impl.cross_layer_graph_pre(
+            attn_layer_name, hidden_states, kv_cache, metadata, need_gather_q_kv, output,
+            resident_reads=resident_reads or None, resident_writes=resident_writes or None,
+            copy_bridge=not direct, **({"query_ready": query_ready} if early else {}),
+        )
+        impl.cross_layer_lmcache_retrieve(
+            attn_layer_name, next_layer_name, selected, counts, slots, metadata, context,
+        )
+        _, outgoing = impl._shared_retrieval_edges()
+        edge = outgoing.get(attn_layer_name)
+        prefetch = None
+        if edge is not None:
+            capacity = edge.transfer.request_capacity
+            prefetch = (edge, selected[:capacity], counts[:capacity], slots[:capacity], edge.destinations)
+        impl.cross_layer_graph_post(
+            attn_layer_name, query, rope, topk, kv_cache, metadata, output, prefetch=prefetch,
+            **({"query_gather": pending[0]} if pending else {}),
+        )
+    finally:
+        if pending:
+            # Usually already joined before SFA. Also protect packet lifetime
+            # if planning/retrieval fails after asynchronous submission.
+            pending[0].wait()
 
 
 def sfa_forward_full_fake(

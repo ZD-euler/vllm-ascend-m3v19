@@ -1997,6 +1997,16 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.num_kv_heads = num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
 
+        self._dcp_exchange_options = {}
+        if envs.VLLM_ASCEND_SFA_DCP_RAW_PACKET:
+            self._dcp_exchange_options["raw_packet"] = True
+        combine_tile = envs.VLLM_ASCEND_SFA_DCP_COMBINE_TILE
+        if combine_tile not in (128, 256, 512):
+            raise ValueError("VLLM_ASCEND_SFA_DCP_COMBINE_TILE must be 128, 256 or 512")
+        if combine_tile != 512:
+            self._dcp_exchange_options["combine_tile"] = combine_tile
+        self._dcp_early_gather = envs.VLLM_ASCEND_SFA_DCP_EARLY_GATHER
+
         # MLA Args
         self.q_lora_rank = kwargs["q_lora_rank"]
         self.kv_lora_rank = kwargs["kv_lora_rank"]
@@ -3659,6 +3669,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         return execute_sfa_dcp(
             query, rope, kv_cache, dcp.topk, dcp.counts, metadata.block_table,
             metadata.cum_query_lens, dcp.local_seq_lens, self.scale, get_dcp_group(),
+            **getattr(self, "_dcp_exchange_options", {}),
         )
 
     def _prepare_decode_sparse_indices(
@@ -3777,6 +3788,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         cp_query_lens: torch.Tensor | None = None,
         cp_key_lens: torch.Tensor | None = None,
         dcp: DcpSFABatch | None = None,
+        query_ready=None,
     ) -> tuple[torch.Tensor, ...]:
         """Pre-retrieval compute captured by the outer PIECEWISE graph.
 
@@ -3863,6 +3875,8 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
         q_pe = self.rope_single(q_pe, cos, sin)
+        if query_ready is not None:
+            query_ready(ql_nope, q_pe)
 
         if self.has_indexer:
             if self.use_sparse_c8_indexer:
@@ -4094,6 +4108,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         trace_label: str,
         prefetch: tuple | None = None,
         dcp: DcpSFABatch | None = None,
+        query_gather=None,
     ) -> torch.Tensor:
         kv_cache = (kv_cache_nope, kv_cache_pe)
         if dcp is not None:
@@ -4102,6 +4117,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_output = execute_sfa_dcp(
                 ql_nope, q_pe, kv_cache, topk_indices, dcp.counts, block_table,
                 actual_seq_lengths_query, dcp.local_seq_lens, self.scale, get_dcp_group(), prefetch=prefetch,
+                **getattr(self, "_dcp_exchange_options", {}),
+                **({"query_gather": query_gather} if query_gather is not None else {}),
             )
         else:
             attn_output = self._execute_sparse_flash_attention_process(
@@ -4430,6 +4447,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         resident_reads: list[torch.Tensor] | None = None,
         resident_writes: list[torch.Tensor] | None = None,
         copy_bridge: bool = True,
+        query_ready=None,
     ) -> tuple[torch.Tensor, ...]:
         """Run graph A, or the complete native path outside staged replay."""
         context = get_forward_context()
@@ -4604,6 +4622,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             cp_query_lens=(attn_metadata.dsa_cp_context.actual_seq_lengths_query if self.dsa_cp_decoder else None),
             cp_key_lens=(attn_metadata.dsa_cp_context.actual_seq_lengths_key if self.dsa_cp_decoder else None),
             dcp=getattr(attn_metadata, "sfa_dcp", None),
+            **({"query_ready": query_ready} if query_ready is not None else {}),
         )
         if copy_bridge or getattr(attn_metadata, "sfa_dcp", None) is None:
             # Ordinary SFA still needs contiguous query planes. A DCP full
@@ -5332,6 +5351,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         output: torch.Tensor,
         *,
         prefetch: tuple | None = None,
+        query_gather=None,
     ) -> None:
         graph_key = getattr(get_forward_context(), "staged_sfa_graph_key", None)
         if attn_metadata is None or graph_key is None:
@@ -5354,6 +5374,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             trace_label="cross_layer",
             prefetch=prefetch,
             dcp=getattr(attn_metadata, "sfa_dcp", None),
+            **({"query_gather": query_gather} if query_gather is not None else {}),
         )
         if self._staged_graph_content_diagnostic_enabled(layer_name):
             state = self._staged_sfa_capture_state
