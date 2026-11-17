@@ -58,6 +58,10 @@ For the full comparison replace the final three lines with:
 Every candidate gets a paired baseline using the current optimized bridge
 path. The JSON `direct` arm means the named candidate here; `baseline` has all
 three changes disabled. Positive `median_reduction_percent` means improvement.
+Console output contains one short `RESULT` line per case; full per-rank timing
+samples and miss counts are saved only in the JSON file. Use `rg '^RESULT'`
+on the console log to extract the summaries. The JSON file is updated after
+every completed case, so existing results can be summarized without rerunning.
 The benchmark passes explicit options and does not depend on the three serving
 knobs below. `VLLM_ASCEND_DCP_HCCL_HOST` still controls the actual communicator;
 unset it for an AIV comparison.

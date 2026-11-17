@@ -67,6 +67,19 @@ def measure_variant(args, control):
     return result
 
 
+def format_case_summary(case):
+    medians, means = case["slowest_rank_median"], case["slowest_rank_mean"]
+    samples = len(case["per_rank_samples"][0]["baseline"])
+    return (
+        f"RESULT {case['variant']} {case['layout']} batch={case['requests']} padding={case['padding']} "
+        f"DCP={case['dcp_size']} layers={case['layers']} steps={case['steps']} "
+        f"samples={samples} parity={case['parity']} "
+        f"median_us={medians['baseline']:.3f}->{medians['direct']:.3f} "
+        f"mean_us={means['baseline']:.3f}->{means['direct']:.3f} "
+        f"reduction={case['median_reduction_percent']:+.2f}%"
+    )
+
+
 @torch.inference_mode()
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -153,10 +166,12 @@ def main():
                     )
                     case = measure_variant(case_args, control)
                     if not args.rank:
-                        print(json.dumps(case), flush=True)
                         result["cases"].append(case)
                         args.json.parent.mkdir(parents=True, exist_ok=True)
                         args.json.write_text(json.dumps(result, indent=2), encoding="utf-8")
+                        print(format_case_summary(case), flush=True)
+        if not args.rank:
+            print(f"Saved full results and per-rank samples to {args.json}", flush=True)
     finally:
         dist.destroy_process_group()
 
