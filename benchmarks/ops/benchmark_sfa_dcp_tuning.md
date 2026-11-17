@@ -109,6 +109,11 @@ submission earlier would require rescheduling query projection relative to KV
 preparation; the existing order releases fresh KV temporaries before projecting
 queries. A faster schedule is not established by the current measurements.
 
+The separate [query-first consumer benchmark](benchmark_sfa_dcp_query_first.md)
+includes projections and current-KV writes to measure this reorder. Its opt-in
+`VLLM_ASCEND_SFA_DCP_QUERY_FIRST` setting extends early gathering to prefetched
+consumers; the benchmark on this page keeps the original KV-first schedule.
+
 Early gathering has no explicit AIV budget. The current-layer sparse H2D load
 uses its automatic launch width; the existing 12-block limit applies only to
 next-layer prefetch and does not reserve disjoint physical cores. Profile the

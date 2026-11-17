@@ -1998,6 +1998,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.kv_cache_dtype = kv_cache_dtype
 
         self._dcp_early_gather = envs.VLLM_ASCEND_SFA_DCP_EARLY_GATHER
+        self._dcp_query_first = envs.VLLM_ASCEND_SFA_DCP_QUERY_FIRST
 
         # MLA Args
         self.q_lora_rank = kwargs["q_lora_rank"]
@@ -3780,6 +3781,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         cp_key_lens: torch.Tensor | None = None,
         dcp: DcpSFABatch | None = None,
         query_ready=None,
+        query_first: bool = False,
     ) -> tuple[torch.Tensor, ...]:
         """Pre-retrieval compute captured by the outer PIECEWISE graph.
 
@@ -3829,6 +3831,13 @@ class AscendSFAImpl(MLAAttentionImpl):
             k_li = None
             assert indexer_cache is None
             kv_cache = (kv_cache_nope, kv_cache_pe)
+        if query_first:
+            assert not self.has_indexer and not self.dsa_cp_decoder and query_ready is not None
+            ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
+            q_pe = self.rope_single(q_pe, cos, sin)
+            # Submit Q exchange, then join any incoming retrieval before the
+            # first cache access below. Q projection itself never reads KV.
+            query_ready(ql_nope, q_pe)
         current_kv = self.exec_kv(
             kv_no_split,
             cos,
@@ -3864,10 +3873,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         # Do not extend their storage lifetime through query/indexer planning.
         del current_kv
 
-        ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
-        q_pe = self.rope_single(q_pe, cos, sin)
-        if query_ready is not None:
-            query_ready(ql_nope, q_pe)
+        if not query_first:
+            ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
+            q_pe = self.rope_single(q_pe, cos, sin)
+            if query_ready is not None:
+                query_ready(ql_nope, q_pe)
 
         if self.has_indexer:
             if self.use_sparse_c8_indexer:
@@ -4438,13 +4448,17 @@ class AscendSFAImpl(MLAAttentionImpl):
         resident_writes: list[torch.Tensor] | None = None,
         copy_bridge: bool = True,
         query_ready=None,
+        query_first: bool = False,
     ) -> tuple[torch.Tensor, ...]:
         """Run graph A, or the complete native path outside staged replay."""
         context = get_forward_context()
         if getattr(self, "_retrieval_overlap", None) is not None:
             incoming, _ = self._shared_retrieval_edges()
-            if layer_name in incoming:
+            if layer_name in incoming and not query_first:
                 incoming[layer_name].join()
+        if query_first:
+            assert query_ready is not None and attn_metadata is not None
+            assert getattr(context, "staged_sfa_graph_key", None) is not None
         if attn_metadata is None:
             self.forward(
                 layer_name,
@@ -4516,6 +4530,13 @@ class AscendSFAImpl(MLAAttentionImpl):
             state.producer_event = producer_event
         initialized_capacity = state.initialized_cache_capacity
         if is_dummy and graph_key.request_capacity > initialized_capacity:
+            # Warmup can touch cache storage before exec_kv. Preserve that
+            # dependency even when the ordinary consumer wait is deferred.
+            if query_first:
+                incoming, _ = self._shared_retrieval_edges()
+                edge = incoming.get(layer_name)
+                if edge is not None and edge.pending_capture_launch:
+                    edge.join()
             for cache in kv_cache:
                 cache[initialized_capacity : graph_key.request_capacity].zero_()
             state.initialized_cache_capacity = graph_key.request_capacity
@@ -4613,6 +4634,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             cp_key_lens=(attn_metadata.dsa_cp_context.actual_seq_lengths_key if self.dsa_cp_decoder else None),
             dcp=getattr(attn_metadata, "sfa_dcp", None),
             **({"query_ready": query_ready} if query_ready is not None else {}),
+            **({"query_first": True} if query_first else {}),
         )
         if copy_bridge or getattr(attn_metadata, "sfa_dcp", None) is None:
             # Ordinary SFA still needs contiguous query planes. A DCP full

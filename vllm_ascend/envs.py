@@ -256,6 +256,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # a serial H2D load can overlap that load even without an indexer.
     # Staged/eager/MTP paths keep late submission. Non-sensitive; restart required.
     "VLLM_ASCEND_SFA_DCP_EARLY_GATHER": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_DCP_EARLY_GATHER", "0"))),
+    # 0 (default): KV before Q; 1: project Q/start gathering before current-KV
+    # writes on shared-index consumers, deferring incoming H2D waits to cache
+    # access. Requires EARLY_GATHER and full target DCP graphs. Non-sensitive;
+    # restart required. Experimental: qualify AIV contention on the target NPU.
+    "VLLM_ASCEND_SFA_DCP_QUERY_FIRST": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_DCP_QUERY_FIRST", "0"))),
     # Experimental: combine stable target batch and preparation agreements.
     # 0 (default): existing protocol; 1: qualified MP TP x DP. Non-sensitive; restart required.
     "VLLM_ASCEND_SFA_SINGLE_AGREEMENT": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_SINGLE_AGREEMENT", "0"))),

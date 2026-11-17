@@ -494,12 +494,23 @@ def sfa_forward_full(
     )
     pending = []
     early = direct and getattr(impl, "_dcp_early_gather", False) and getattr(metadata, "sfa_dcp", None) is not None
+    query_first = (
+        early and getattr(impl, "_dcp_query_first", False) and impl.skip_topk
+        and not impl.has_indexer and not impl.dsa_cp_decoder
+        and getattr(context, "staged_sfa_graph_key", None) is not None
+    )
+    incoming_edge = None
     if early and impl.skip_topk:
         incoming, _ = impl._shared_retrieval_edges()
-        # Prefetched consumers join before projection and reuse the producer's
-        # plan. No independent device work remains before query unpack/SFA.
-        # Without prefetch, retain overlap with this consumer's serial H2D.
-        early = attn_layer_name not in incoming
+        incoming_edge = incoming.get(attn_layer_name) if query_first else None
+        if incoming_edge is not None and not incoming_edge.pending_capture_launch:
+            raise RuntimeError("Q-first DCP consumer has no pending incoming retrieval")
+        # The opt-in reorder exposes current-KV work even on prefetched layers.
+        early = query_first or attn_layer_name not in incoming
+
+    def join_incoming():
+        if incoming_edge is not None and incoming_edge.pending_capture_launch:
+            incoming_edge.join()
 
     def query_ready(query, rope):
         from vllm_ascend.ops.triton.sfa_dcp import start_sfa_dcp_query_gather
@@ -507,12 +518,14 @@ def sfa_forward_full(
         if pending:
             raise RuntimeError("DCP query gather submitted twice in one attention call")
         pending.append(start_sfa_dcp_query_gather(query, rope, get_dcp_group()))
+        join_incoming()
 
     try:
         query, rope, topk, selected, counts, slots = impl.cross_layer_graph_pre(
             attn_layer_name, hidden_states, kv_cache, metadata, need_gather_q_kv, output,
             resident_reads=resident_reads or None, resident_writes=resident_writes or None,
             copy_bridge=not direct, **({"query_ready": query_ready} if early else {}),
+            **({"query_first": True} if query_first else {}),
         )
         impl.cross_layer_lmcache_retrieve(
             attn_layer_name, next_layer_name, selected, counts, slots, metadata, context,
@@ -528,10 +541,13 @@ def sfa_forward_full(
             **({"query_gather": pending[0]} if pending else {}),
         )
     finally:
-        if pending:
-            # Usually already joined before SFA. Also protect packet lifetime
-            # if planning/retrieval fails after asynchronous submission.
-            pending[0].wait()
+        try:
+            join_incoming()
+        finally:
+            if pending:
+                # Usually already joined before SFA. Also protect packet lifetime
+                # if planning/retrieval fails after asynchronous submission.
+                pending[0].wait()
 
 
 def sfa_forward_full_fake(
