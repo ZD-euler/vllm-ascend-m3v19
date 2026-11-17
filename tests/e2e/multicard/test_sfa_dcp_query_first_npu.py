@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Real current-KV, sparse H2D and DCP replay parity for Q-first consumers."""
+"""Real current-KV, sparse H2D and DCP replay parity for overlap schedules."""
 
 import os
 from datetime import timedelta
@@ -36,9 +36,20 @@ def query_first_world():
 @torch.inference_mode()
 @pytest.mark.parametrize("overlap_retrieval", [False, True])
 @pytest.mark.parametrize("layout,padding", [("uniform", 0), ("mixed", 1)])
-def test_query_first_group_replay(query_first_world, monkeypatch, overlap_retrieval, layout, padding):
+@pytest.mark.parametrize(
+    "comparison,query_first",
+    [
+        ("query-first", False),
+        ("prefetch-after-pack", False),
+        ("prefetch-after-pack", True),
+    ],
+)
+def test_query_first_group_replay(
+    query_first_world, monkeypatch, overlap_retrieval, layout, padding, comparison, query_first
+):
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[3] / "benchmarks/ops"))
     from benchmark_sfa_copy_reduction import measure_case
+    from benchmark_sfa_dcp_prefetch import prefetch_pipeline
     from benchmark_sfa_dcp_query_first import QueryFirstPipeline
 
     world, control, root = query_first_world
@@ -68,9 +79,11 @@ def test_query_first_group_replay(query_first_world, monkeypatch, overlap_retrie
         q_rank=128,
         qk_nope=128,
         value_dim=128,
+        query_first=query_first,
     )
     # measure_case checks eager and three reset/replay cycles, exact planner,
     # retrieved/current KV, attention and local output-projection parity.
-    result = measure_case(args, control, pipeline_factory=QueryFirstPipeline)
+    factory = QueryFirstPipeline if comparison == "query-first" else prefetch_pipeline
+    result = measure_case(args, control, pipeline_factory=factory)
     assert result["parity"] == "passed"
     assert all(value > 0 for value in result["slowest_rank_median"].values())

@@ -181,8 +181,15 @@ class QueryFirstPipeline(AttentionPipeline):
 
 
 @torch.inference_mode()
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+def main(*, comparison="query-first", pipeline_factory=QueryFirstPipeline, description=__doc__):
+    parser = argparse.ArgumentParser(description=description)
+    if comparison == "prefetch-after-pack":
+        parser.add_argument(
+            "--query-first",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="hold consumer Q-first scheduling fixed in both arms",
+        )
     parser.add_argument("--lmcache-ascend-dir", type=Path, required=True)
     parser.add_argument("--requests", type=int, nargs="+", default=[1, 2, 4, 8])
     parser.add_argument("--layouts", nargs="+", choices=("uniform", "bounded", "mixed"), default=["uniform"])
@@ -204,7 +211,7 @@ def main():
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--profile-dir", type=Path)
-    parser.add_argument("--json", type=Path, default=Path("sfa-dcp-query-first.json"))
+    parser.add_argument("--json", type=Path, default=Path(f"sfa-dcp-{comparison}.json"))
     args = parser.parse_args()
     args.dcp_size, args.rank, args.device = (int(os.environ[name]) for name in ("WORLD_SIZE", "RANK", "LOCAL_RANK"))
     if (
@@ -261,10 +268,10 @@ def main():
                     }
                 )
                 if not args.rank:
-                    print(f"Starting query-first {layout} batch={requests} DCP={args.dcp_size}", flush=True)
-                case = measure_case(case_args, control, pipeline_factory=QueryFirstPipeline)
+                    print(f"Starting {comparison} {layout} batch={requests} DCP={args.dcp_size}", flush=True)
+                case = measure_case(case_args, control, pipeline_factory=pipeline_factory)
                 case.update(
-                    variant="query-first",
+                    variant=comparison,
                     slowest_rank_mean={
                         name: statistics.mean(
                             max(rank[name][i] for rank in case["per_rank_samples"])

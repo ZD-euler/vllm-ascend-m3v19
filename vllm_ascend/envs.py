@@ -261,6 +261,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # access. Requires EARLY_GATHER and full target DCP graphs. Non-sensitive;
     # restart required. Experimental: qualify AIV contention on the target NPU.
     "VLLM_ASCEND_SFA_DCP_QUERY_FIRST": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_DCP_QUERY_FIRST", "0"))),
+    # 0 (default): prefetch after SFA; 1: release next-layer H2D after output
+    # packing, alongside async all-to-all. Requires full target DCP graphs and
+    # SHARED_RETRIEVAL_OVERLAP. Non-sensitive; restart required. Benchmark AIV
+    # contention and the shorter prefetch window before enabling in production.
+    "VLLM_ASCEND_SFA_DCP_PREFETCH_AFTER_PACK": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_SFA_DCP_PREFETCH_AFTER_PACK", "0"))
+    ),
     # Experimental: combine stable target batch and preparation agreements.
     # 0 (default): existing protocol; 1: qualified MP TP x DP. Non-sensitive; restart required.
     "VLLM_ASCEND_SFA_SINGLE_AGREEMENT": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_SINGLE_AGREEMENT", "0"))),

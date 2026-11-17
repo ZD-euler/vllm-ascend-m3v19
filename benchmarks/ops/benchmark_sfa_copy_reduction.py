@@ -131,6 +131,11 @@ class AttentionPipeline(Pipeline):
                 self.group,
                 prefetch=prefetch,
                 **({"query_gather": pending} if pending is not None else {}),
+                **(
+                    {"prefetch_after_pack": True}
+                    if prefetch is not None and getattr(self, "prefetch_after_pack", False)
+                    else {}
+                ),
             )
         else:
             result = torch.ops._C_ascend.npu_sparse_flash_attention(

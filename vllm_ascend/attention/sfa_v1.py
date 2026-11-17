@@ -1999,6 +1999,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         self._dcp_early_gather = envs.VLLM_ASCEND_SFA_DCP_EARLY_GATHER
         self._dcp_query_first = envs.VLLM_ASCEND_SFA_DCP_QUERY_FIRST
+        self._dcp_prefetch_after_pack = envs.VLLM_ASCEND_SFA_DCP_PREFETCH_AFTER_PACK
 
         # MLA Args
         self.q_lora_rank = kwargs["q_lora_rank"]
@@ -4119,6 +4120,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                 ql_nope, q_pe, kv_cache, topk_indices, dcp.counts, block_table,
                 actual_seq_lengths_query, dcp.local_seq_lens, self.scale, get_dcp_group(), prefetch=prefetch,
                 **({"query_gather": query_gather} if query_gather is not None else {}),
+                **({"prefetch_after_pack": True}
+                   if prefetch is not None and getattr(self, "_dcp_prefetch_after_pack", False) else {}),
             )
         else:
             attn_output = self._execute_sparse_flash_attention_process(

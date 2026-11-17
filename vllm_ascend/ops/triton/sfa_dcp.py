@@ -153,6 +153,7 @@ def execute_sfa_dcp(
     topk: torch.Tensor, counts: torch.Tensor, block_table: torch.Tensor,
     query_ends: torch.Tensor, local_seq_lens: torch.Tensor, scale: float, group,
     *, prefetch: tuple | None = None, query_gather: SfaDcpQueryGather | None = None,
+    prefetch_after_pack: bool = False,
 ) -> torch.Tensor:
     """Gather only query heads, then return the merged output for this head owner."""
     if query_gather is None:
@@ -170,6 +171,8 @@ def execute_sfa_dcp(
         query, rope, kv_cache[0], kv_cache[1], topk, counts,
         block_table[:requests], query_ends[:requests], local_seq_lens, scale,
     )
+    if prefetch is not None and prefetch_after_pack:
+        return merge_sfa_dcp(*partial, group.device_group, prefetch=prefetch)
     if prefetch is not None:
         edge, selected, miss_counts, slots, destinations = prefetch
         edge.launch(selected, miss_counts, slots, destinations)
@@ -236,6 +239,7 @@ def merge_sfa_dcp(
     maximum: torch.Tensor,
     total: torch.Tensor,
     group: dist.ProcessGroup,
+    *, prefetch: tuple | None = None,
 ) -> torch.Tensor:
     """Exchange only the partials needed by each TP head owner."""
     rows, heads, value_dim = partial.shape
@@ -259,6 +263,18 @@ def merge_sfa_dcp(
     init_device_properties_triton()
     cores = get_vectorcore_num()
     _pack[(min(rows * heads, cores),)](partial, maximum, total, send, rows, heads, local_heads, value_dim)
-    dist.all_to_all_single(recv, send, group=group)
+    if prefetch is None:
+        dist.all_to_all_single(recv, send, group=group)
+    else:
+        # Submit before recording the copy-stream start, but do not join yet:
+        # RetrievalEdge's event must depend on _pack, not all-to-all completion.
+        work = dist.all_to_all_single(recv, send, group=group, async_op=True)
+        try:
+            edge, selected, miss_counts, slots, destinations = prefetch
+            edge.launch(selected, miss_counts, slots, destinations)
+        finally:
+            # Keep both packet buffers alive and order _combine, also if the
+            # transfer launch fails. This is the HCCL stream dependency.
+            work.wait()
     _combine[(min(rows * local_heads, cores),)](recv, output, rows * local_heads, world, value_dim)
     return output
