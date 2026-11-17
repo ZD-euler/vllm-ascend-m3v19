@@ -8,6 +8,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 import pytest
 
@@ -45,6 +47,9 @@ def service():
         concurrency_gate=None,
         require_profile=True,
         dynamic_route=False,
+        start_lock=threading.Lock(),
+        started_batches={},
+        capability_version=3,
     )
 
     class Handler(BaseHTTPRequestHandler):
@@ -68,9 +73,10 @@ def service():
             elif self.path == "/profile_routes":
                 self.reply(
                     {
-                        "version": 2,
+                        "version": state.capability_version,
                         "target_decoder": True,
                         "prefill_batch_barrier": True,
+                        "deferred_profile_start": True,
                         "decoder_urls": [state.url],
                     }
                 )
@@ -113,10 +119,28 @@ def service():
                 state.completions.append(body)
                 state.received_headers = dict(self.headers)
                 state.request_headers.append(dict(self.headers))
-                if state.require_profile:
-                    assert state.profiling
                 if state.concurrency_gate:
                     state.concurrency_gate.wait(timeout=10)
+                start_header = self.headers.get("X-VLLM-Profile-Start")
+                if start_header:
+                    key = self.headers["X-VLLM-Profile-Batch"]
+                    with state.start_lock:
+                        if key not in state.started_batches:
+                            requested_at = time.time_ns()
+                            try:
+                                for url in json.loads(start_header):
+                                    with urlopen(Request(url + "/start_profile", data=b"{}"), timeout=5):
+                                        pass
+                            except HTTPError as error:
+                                self.reply(json.loads(error.read()), error.code)
+                                return
+                            state.started_batches[key] = {
+                                "requested_at_ns": requested_at,
+                                "ready_at_ns": time.time_ns(),
+                                "decoder_urls": json.loads(start_header),
+                            }
+                if state.require_profile:
+                    assert state.profiling
                 if state.fail_request:
                     self.reply({"error": "decode failed"}, 500)
                     return
@@ -129,11 +153,13 @@ def service():
                             "prompt_tokens": len(body["prompt"]),
                             "completion_tokens": state.output_count or body["max_tokens"],
                         },
-                        "vllm_profile_routes": (
-                            [{"decoder_url": state.url + "/v1", "request_id": "request", "decoder_dp_rank": 0}]
-                            if state.dynamic_route
-                            else state.routes
-                        ),
+                        "vllm_profile_routes": [
+                            {**route, **({"profile_start": state.started_batches[key]} if start_header else {})}
+                            for route in (
+                                [{"decoder_url": state.url + "/v1", "request_id": "request", "decoder_dp_rank": 0}]
+                                if state.dynamic_route or not state.routes else state.routes
+                            )
+                        ],
                     }
                 )
             else:
@@ -167,10 +193,12 @@ def test_default_exact_tokens_and_complete_profile(client_tool, service, tmp_pat
     assert payload["ignore_eos"] is True
     assert payload["stream"] is False
     assert payload["add_special_tokens"] is False
-    assert service.calls[-3:] == ["/start_profile", "/v1/completions", "/stop_profile"]
+    assert service.calls[-3:] == ["/v1/completions", "/start_profile", "/stop_profile"]
     assert service.events == [*range(128), "stopped"]
     result = json.loads((output / "result.json").read_text())
     assert result["status"] == "captured"
+    assert result["profile_start_trigger"] == "proxy_after_prefill"
+    assert result["profile_started_at_ns"] == result["profile_start"]["ready_at_ns"]
     assert result["measurement"]["completion_tokens"] == 128
     assert state_header(service, "x-vllm-profile-routes") == "1"
     assert result["decoder_instances"][0]["profile_dir"] == "/profiles/D0"
@@ -278,7 +306,7 @@ def test_exports_only_new_profiles_after_stop(client_tool, service, tmp_path, mo
     assert result["raw_profiles"] == [str(service.raw_dir.resolve())]
 
 
-def test_all_four_decoders_start_before_request_and_all_stop(client_tool, monkeypatch):
+def test_proxy_receives_four_start_targets_and_client_stops_after_decode(client_tool, monkeypatch):
     events = []
 
     class Decoder:
@@ -289,13 +317,14 @@ def test_all_four_decoders_start_before_request_and_all_stop(client_tool, monkey
             events.append((self.base_url, path))
 
     decoders = [Decoder(f"D{index}") for index in range(4)]
-    monkeypatch.setattr(client_tool, "run_requests", lambda *args: events.append(("proxy", "decode completed")))
+    def run(*args, profile_urls):
+        assert profile_urls == [decoder.base_url for decoder in decoders]
+        events.append(("proxy", "decode completed"))
+        return [{"routes": [{"profile_start": {"ready_at_ns": 123}}]}]
+
+    monkeypatch.setattr(client_tool, "run_requests", run)
     client_tool.profile_request(decoders, None, "model", [[1]], 128, None, {})
     assert events == [
-        ("D0", "/start_profile"),
-        ("D1", "/start_profile"),
-        ("D2", "/start_profile"),
-        ("D3", "/start_profile"),
         ("proxy", "decode completed"),
         ("D3", "/stop_profile"),
         ("D2", "/stop_profile"),
@@ -304,7 +333,7 @@ def test_all_four_decoders_start_before_request_and_all_stop(client_tool, monkey
     ]
 
 
-def test_partial_start_cleans_up_all_attempted_decoders(client_tool):
+def test_proxy_start_error_stops_requested_decoders(client_tool, monkeypatch):
     events = []
 
     class Decoder:
@@ -313,14 +342,15 @@ def test_partial_start_cleans_up_all_attempted_decoders(client_tool):
 
         def request(self, path, body):
             events.append((self.base_url, path))
-            if self.base_url == "D1" and path == "/start_profile":
-                raise TimeoutError("start reply lost")
+
+    def fail(*args, **kwargs):
+        raise TimeoutError("start reply lost")
+
+    monkeypatch.setattr(client_tool, "run_requests", fail)
 
     with pytest.raises(TimeoutError, match="start reply lost"):
         client_tool.profile_request([Decoder("D0"), Decoder("D1")], None, "model", [1], 128, None, {})
     assert events == [
-        ("D0", "/start_profile"),
-        ("D1", "/start_profile"),
         ("D1", "/stop_profile"),
         ("D0", "/stop_profile"),
     ]
@@ -377,9 +407,12 @@ def test_warmup_completes_before_capture(client_tool, service, tmp_path):
         service.url,
         "--warmup",
     )
-    start = service.calls.index("/start_profile")
-    assert service.calls[:start].count("/v1/completions") == 4
-    assert service.calls[start:].count("/v1/completions") == 4
+    assert len(service.started_batches) == 1
+    assert all(
+        not any(key.lower() == "x-vllm-profile-start" for key in headers)
+        for headers in service.request_headers[:4]
+    )
+    assert all(any(key.lower() == "x-vllm-profile-start" for key in headers) for headers in service.request_headers[4:])
     assert len(service.completions) == 8
     result = json.loads((tmp_path / "capture/result.json").read_text())
     assert len(result["warmup"]) == len(result["measurements"]) == 4
@@ -410,7 +443,7 @@ def test_concurrent_failure_drains_other_requests_before_stop(client_tool, monke
     monkeypatch.setattr(client_tool, "measured_request", complete)
     with pytest.raises(RuntimeError, match="1 of 2"):
         client_tool.profile_request([Decoder()], None, "model", [[0], [1]], 128, tmp_path, {})
-    assert events == ["/start_profile", "/stop_profile"]
+    assert events == ["/stop_profile"]
     assert (tmp_path / "session-000/error.json").exists()
     assert (tmp_path / "session-001/measurement.json").exists()
 
@@ -433,4 +466,12 @@ def test_wrong_target_rejected_before_profile(client_tool, service, tmp_path):
             "--d-url",
             "http://wrong:7920",
         )
+    assert "/start_profile" not in service.calls
+
+
+def test_old_proxy_is_rejected_before_prefill_or_profile(client_tool, service, tmp_path):
+    service.capability_version = 2
+    with pytest.raises(ValueError, match="after prefill"):
+        invoke(client_tool, service, tmp_path / "capture")
+    assert "/v1/completions" not in service.calls
     assert "/start_profile" not in service.calls

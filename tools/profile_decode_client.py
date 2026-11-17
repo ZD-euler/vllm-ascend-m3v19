@@ -3,9 +3,10 @@
 """Capture the entire decode request on existing vLLM Ascend D instances.
 
 Send requests through the existing P/D proxy with --base-url and pass each
-possible decoder's direct API address with --d-url. Profiling starts on all
-listed decoders before the request and stops after its full response. This
-includes D-side KV loading and every generation step. The default request has
+possible decoder's direct API address with --d-url. The proxy starts profiling
+on all listed decoders after every P request in the batch is ready, then submits
+the batch to D. Profiling stops after the full response. This includes D-side
+KV loading and every generation step. The default request has
 exactly 50,000 input tokens and generates 128 output tokens.
 
 Run inside the D container and pass --profile-dir to export newly created
@@ -197,13 +198,13 @@ def report_routes(measurement, instances, report):
 
 
 def check_proxy(client, target, concurrency):
-    if target is None and concurrency == 1:
-        return
     capabilities = client.request("/profile_routes")
-    if capabilities.get("version", 0) < 2 or not capabilities.get("target_decoder"):
-        raise ValueError("Update and restart the P/D proxy to enable targeted concurrent profiling")
-    if concurrency > 1 and not capabilities.get("prefill_batch_barrier"):
+    if capabilities.get("version", 0) < 3 or not capabilities.get("deferred_profile_start"):
+        raise ValueError("Update and restart the P/D proxy to start profiling after prefill completes")
+    if not capabilities.get("prefill_batch_barrier"):
         raise ValueError("The P/D proxy must support the profiling prefill barrier")
+    if target is not None and not capabilities.get("target_decoder"):
+        raise ValueError("The P/D proxy must support a target decoder")
     if target is not None and target not in capabilities.get("decoder_urls", []):
         raise ValueError(f"Target {target!r} is absent from the proxy decoder list")
 
@@ -227,7 +228,7 @@ def make_prompts(client, model, count, concurrency):
     return prompts
 
 
-def run_requests(client, model, prompts, output_tokens, root, target, gate_timeout):
+def run_requests(client, model, prompts, output_tokens, root, target, gate_timeout, profile_urls=None):
     concurrency = len(prompts)
     batch_id = uuid.uuid4().hex
     directories = []
@@ -240,7 +241,7 @@ def run_requests(client, model, prompts, output_tokens, root, target, gate_timeo
         headers = {}
         if target:
             headers["X-VLLM-Profile-Target"] = target
-        if concurrency > 1:
+        if concurrency > 1 or profile_urls:
             headers.update(
                 {
                     "X-VLLM-Profile-Batch": batch_id,
@@ -249,6 +250,8 @@ def run_requests(client, model, prompts, output_tokens, root, target, gate_timeo
                     "X-VLLM-Profile-Batch-Timeout": str(gate_timeout),
                 }
             )
+        if profile_urls:
+            headers["X-VLLM-Profile-Start"] = json.dumps(profile_urls)
         result = measured_request(client, model, prompts[index], output_tokens, directories[index], headers)
         result["session"] = index
         if target and (
@@ -279,22 +282,32 @@ def run_requests(client, model, prompts, output_tokens, root, target, gate_timeo
 
 
 def profile_request(decoders, client, model, prompts, output_tokens, root, report, target=None, gate_timeout=600):
-    attempted = []
     request_error = None
     try:
-        for decoder in decoders:
-            # Include an attempted start in cleanup if its HTTP reply times out.
-            attempted.append(decoder)
-            decoder.request("/start_profile", {})
-            print(f"{PREFIX} started {decoder.base_url}", flush=True)
-        report["profile_started_at_ns"] = time.time_ns()
-        return run_requests(client, model, prompts, output_tokens, root, target, gate_timeout)
+        print(f"{PREFIX} proxy will start D profiling after every P request is ready", flush=True)
+        measurements = run_requests(
+            client, model, prompts, output_tokens, root, target, gate_timeout,
+            profile_urls=[decoder.base_url for decoder in decoders],
+        )
+        starts = [
+            route["profile_start"]
+            for measurement in measurements
+            for route in measurement["routes"]
+            if "profile_start" in route
+        ]
+        if not starts:
+            raise RuntimeError("The P/D proxy did not confirm starting profiling after prefill")
+        report["profile_start"] = starts[0]
+        report["profile_started_at_ns"] = starts[0]["ready_at_ns"]
+        return measurements
     except BaseException as error:
         request_error = error
         raise
     finally:
         stop_errors = []
-        for decoder in reversed(attempted):
+        # A lost request response can hide a successful proxy-side start.
+        # Stop each requested D even when one request reports an error.
+        for decoder in reversed(decoders):
             try:
                 decoder.request("/stop_profile", {})
                 print(f"{PREFIX} stopped {decoder.base_url}", flush=True)
@@ -337,8 +350,9 @@ def capture(args):
         "prefix_tokens": args.prefix_tokens,
         "output_tokens": args.output_tokens,
         "profile_dir": str(args.profile_dir) if args.profile_dir else None,
-        "capture_scope": "D-side batch including initial KV loading and all generation steps",
-        "prefill_batch_barrier": args.concurrency > 1,
+        "capture_scope": "After every P request is ready, D-side KV loading and all generation steps",
+        "prefill_batch_barrier": True,
+        "profile_start_trigger": "proxy_after_prefill",
     }
     try:
         check_proxy(client, target, args.concurrency)

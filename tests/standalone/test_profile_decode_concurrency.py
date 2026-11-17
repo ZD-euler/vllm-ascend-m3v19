@@ -100,7 +100,8 @@ def test_inconsistent_batch_wakes_waiting_member(mismatch):
 
 @pytest.mark.parametrize("proxy", [normal, enhanced], ids=["normal", "enhanced"])
 @pytest.mark.parametrize("fail_prefill", [False, True])
-def test_sixteen_prefills_target_one_decoder_and_release_together(monkeypatch, proxy, fail_prefill):
+@pytest.mark.parametrize("deferred", [False, True])
+def test_sixteen_prefills_target_one_decoder_and_release_together(monkeypatch, proxy, fail_prefill, deferred):
     async def run():
         monkeypatch.setattr(normal, "NodeListener", lambda _: None)
         state = proxy.ProxyState(
@@ -116,6 +117,7 @@ def test_sixteen_prefills_target_one_decoder_and_release_together(monkeypatch, p
         )
         prefills = []
         decodes = []
+        profile_starts = []
         started = 0
         everyone_at_decode = asyncio.Event()
 
@@ -133,6 +135,8 @@ def test_sixteen_prefills_target_one_decoder_and_release_together(monkeypatch, p
         async def decode(index, payload):
             nonlocal started
             assert len(prefills) == 16
+            if deferred:
+                assert profile_starts == [3]
             assert index == 3
             assert payload["kv_transfer_params"]["source"] == "normal"
             decodes.append(index)
@@ -148,6 +152,10 @@ def test_sixteen_prefills_target_one_decoder_and_release_together(monkeypatch, p
 
         def make_post(index):
             async def post(api, json, **kwargs):
+                if api.endswith("/start_profile"):
+                    assert len(prefills) == 16
+                    profile_starts.append(index)
+                    return httpx.Response(200, request=httpx.Request("POST", api))
                 return httpx.Response(
                     200,
                     json=await decode(index, json),
@@ -164,8 +172,11 @@ def test_sixteen_prefills_target_one_decoder_and_release_together(monkeypatch, p
             monkeypatch.setattr(proxy, "stream_service_response_with_retry", stream)
 
         async def invoke(index):
+            request = batch_request(index, 16)
+            if deferred:
+                request.headers["x-vllm-profile-start"] = json.dumps(["http://D1:7921"])
             try:
-                response = await proxy._handle_completions("/completions", batch_request(index, 16))
+                response = await proxy._handle_completions("/completions", request)
             except RuntimeError:
                 if fail_prefill:
                     return None
@@ -182,11 +193,13 @@ def test_sixteen_prefills_target_one_decoder_and_release_together(monkeypatch, p
             results = await asyncio.wait_for(asyncio.gather(*(invoke(index) for index in range(16))), 5)
             if fail_prefill:
                 assert decodes == []
+                assert profile_starts == []
                 assert all(result is None or "error" in result for result in results)
             else:
                 assert decodes == [3] * 16
                 assert set(prefills) == {0, 1}
                 assert all(result["vllm_profile_routes"][0]["decoder_url"] == "http://D1:7921/v1" for result in results)
+                assert profile_starts == ([3] if deferred else [])
             assert state.request_num == 0
             assert all(decoder.active_tokens == 0 for decoder in state.decoders)
             assert all(prefiller.active_tokens == pytest.approx(0) for prefiller in state.prefillers)

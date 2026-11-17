@@ -2679,7 +2679,7 @@ async def _handle_completions(api: str, request: Request):
         original_request_id = instance_info.request_id
         stream_flag = bool(req_data.get("stream", False))
         profile_routes = (
-            [profile_route(instance_info)]
+            [profile_route(instance_info, profiling_request)]
             if not stream_flag and getattr(request, "headers", {}).get("x-vllm-profile-routes") == "1"
             else None
         )
@@ -2748,7 +2748,7 @@ async def _handle_completions(api: str, request: Request):
                     target_decoder_idx=profiling_request.target_decoder_idx,
                 )
                 if profile_routes is not None:
-                    profile_routes.append(profile_route(instance_info))
+                    profile_routes.append(profile_route(instance_info, profiling_request))
                 released_kv = False
         
         async def generate_stream():
