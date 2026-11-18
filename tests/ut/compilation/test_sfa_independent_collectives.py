@@ -15,7 +15,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 import torch.distributed as dist
-from sfa_test_support import extract
+from sfa_test_support import definitions, extract
 from test_sfa_independent import ROOT, independent
 
 
@@ -23,6 +23,15 @@ def _import_vote(tp):
     for name in ("LMCache-NPU", "LMCache"):
         source = ROOT.parent / name / "lmcache/integration/vllm/vllm_service_factory.py"
         if source.is_file():
+            control_source = source.parents[2] / "v1/control_group.py"
+            if control_source.is_file():
+                namespace = dict(torch=torch, dist=dist)
+                definitions(control_source, ["LMCacheControlGroup"], namespace)
+                # Borrow the fixture's group; the LMCache factory regressions
+                # separately verify real group ownership and queue selection.
+                control = object.__new__(namespace["LMCacheControlGroup"])
+                control._group, control._closed = tp.cpu_group, False
+                return control.collective_all_true
             return extract(source, "collective_all_true", dict(torch=torch, dist=dist, tpg=tp))
     pytest.skip("Requires the matching sibling LMCache checkout")
 
