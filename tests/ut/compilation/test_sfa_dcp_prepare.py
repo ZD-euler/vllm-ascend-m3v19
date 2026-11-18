@@ -2,8 +2,10 @@
 """Addressing and ownership tests for shared SFA and DCP preparation kernels."""
 
 import sys
+import weakref
 from contextlib import nullcontext
 from types import MethodType, ModuleType, SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -52,15 +54,16 @@ def ops():
     )
 
 
-@pytest.mark.parametrize("rows,width", [(0, 2048), (1, 2048), (2, 2048), (9, 7), (32, 2048)])
+@pytest.mark.parametrize("rows,width", [(0, 2048), (1, 2048), (2, 2048), (3, 2048), (9, 7), (17, 2048), (32, 2048)])
 @pytest.mark.parametrize("active", [0, 1, 32])
-def test_mask_tiles_preserve_global_ids_causality_and_counts(ops, rows, width, active):
+@pytest.mark.parametrize("position_dtype", [torch.int32, torch.int64])
+def test_mask_tiles_preserve_global_ids_causality_and_counts(ops, rows, width, active, position_dtype):
     prepare, _, calls = ops
     active = min(rows, active)
     raw = (torch.arange(rows * width, dtype=torch.int32) % 1027 - 2).reshape(rows, 1, width)
     original = raw.clone()
     # Short position storage checks that inactive rows never read it.
-    positions = torch.arange(active, dtype=torch.int64) * 128
+    positions = torch.arange(active, dtype=position_dtype) * 128
     output = torch.full_like(raw, -99)
     counts = torch.full((rows, 16), -77, dtype=torch.int32)
     prepare(raw, positions, output, counts, active, 8, 3, 128, local=False)
@@ -70,6 +73,91 @@ def test_mask_tiles_preserve_global_ids_causality_and_counts(ops, rows, width, a
     assert torch.equal(output, expected) and torch.equal(raw, original)
     assert torch.all(counts == -77)
     assert not calls if rows == 0 else calls == [("_mask_topk", (min((rows * width + 255) // 256, 7),))]
+
+
+@pytest.mark.parametrize("max_rows", [1, 7, 32])
+def test_mask_warmup_exercises_each_row_count_and_both_position_types(ops, monkeypatch, max_rows):
+    prepare, _, calls = ops
+    seen, allocations = [], []
+
+    def launch(raw, positions, output, counts, active, *args, **kwargs):
+        assert raw.data_ptr() != output.data_ptr()
+        allocations.extend(
+            weakref.ref(value._base if value._base is not None else value) for value in (raw, positions, output)
+        )
+        prepare(raw, positions, output, counts, active, *args, **kwargs)
+        assert torch.all(raw == -1) and torch.all(output == -1)
+        seen.append((raw.shape[0], positions.dtype))
+
+    def finish():
+        assert len(seen) == 2 * max_rows
+        assert all(reference() is not None for reference in allocations)
+
+    sync = Mock(side_effect=finish)
+    monkeypatch.setattr(
+        torch, "npu", SimpleNamespace(current_stream=lambda: SimpleNamespace(synchronize=sync)), raising=False
+    )
+    warm = extract(OPS, "warmup_sfa_dcp_mask", dict(torch=torch, prepare_sfa_dcp_topk=launch))
+    warm(max_rows, 7, torch.device("cpu"))
+    assert seen == [(rows, dtype) for dtype in (torch.int32, torch.int64) for rows in range(1, max_rows + 1)]
+    assert all(name == "_mask_topk" for name, _ in calls)
+    sync.assert_called_once()
+    assert all(reference() is None for reference in allocations)
+
+
+@pytest.mark.parametrize("dcp,query_width,max_tokens", [(False, 2, 256), (True, 1, 256), (True, 2, 256), (True, 2, 5)])
+@pytest.mark.parametrize("failure", [False, True])
+def test_worker_warms_dcp_mask_before_readiness_and_propagates_failure(
+    monkeypatch, dcp, query_width, max_tokens, failure
+):
+    events = []
+
+    def warm(rows, width, device):
+        assert (rows, width, device) == (min(3 * query_width, max_tokens), 2048, "npu:0")
+        events.append("mask")
+        if failure:
+            raise RuntimeError("mask warmup failed")
+
+    module = ModuleType("vllm_ascend.ops.triton.sfa_dcp")
+    module.warmup_sfa_dcp_mask = warm
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    runner = SimpleNamespace(
+        dsa_decoder_dcp=dcp,
+        max_num_reqs=3,
+        max_num_tokens=max_tokens,
+        decode_threshold=query_width,
+        dsa_index_topk=2048,
+        capture_model=lambda: events.append("capture"),
+        _sfa_full_graph=SimpleNamespace(entries=[]),
+        _sfa_single_agreement=SimpleNamespace(activate=lambda keys: events.append("activate")),
+    )
+    config = SimpleNamespace(compile_sizes=[], cudagraph_mode=0, get_compile_ranges=lambda: [], compilation_time=1)
+    worker = SimpleNamespace(
+        model_runner=runner,
+        device="npu:0",
+        model_config=SimpleNamespace(enforce_eager=False, seed=0),
+        vllm_config=SimpleNamespace(compilation_config=config),
+        _wait_for_decoder_ep_startup=lambda: None,
+    )
+    compile_model = extract(
+        ROOT / "vllm_ascend/worker/worker.py",
+        "compile_or_warm_up_model",
+        dict(
+            CUDAGraphMode=SimpleNamespace(NONE=0),
+            cold_perf_enabled=lambda: False,
+            startup_phase=lambda *args, **kwargs: nullcontext(),
+            get_ascend_device_type=lambda: "a5",
+            AscendDeviceType=SimpleNamespace(A5="a5"),
+            set_random_seed=lambda seed: events.append("seed"),
+        ),
+    )
+    if dcp and failure:
+        with pytest.raises(RuntimeError, match="mask warmup failed"):
+            compile_model(worker)
+        assert events == ["capture", "mask"]
+    else:
+        assert compile_model(worker) == 1
+        assert events == ["capture", *(["mask"] if dcp else []), "seed", "activate"]
 
 
 @pytest.mark.parametrize("local,mixed", [(True, False), (False, True), (True, True)])

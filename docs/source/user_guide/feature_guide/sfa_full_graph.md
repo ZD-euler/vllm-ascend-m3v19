@@ -79,6 +79,20 @@ Synthetic warmup/capture sequence lengths are bounded by `max_model_len` and
 both KV groups' logical block-table capacities. The 6144-token workspace
 heuristic is not a minimum context length; live request lengths are unchanged.
 
+Decoder DCP also warms the native Top-K mask after graph capture, before the
+worker reports ready. This runs on every decoder worker, independently of
+async MTP preparation. It exercises all row counts from 1 through
+`min(max_num_batched_tokens, max_num_seqs * decode_threshold)` using private
+buffers and both INT32/INT64 position inputs. Row counts and active-row counts
+are runtime arguments, so changes of decode batch size or padding reuse the
+same compiled mask. The causal/rejection predicate is unchanged. Warmup adds
+no collective and only a startup stream wait; a failure aborts initialization.
+No new configuration or native rebuild is required. NPU regression:
+
+```bash
+python -m pytest --noconftest -q tests/e2e/singlecard/test_sfa_dcp_mask_warmup.py
+```
+
 The startup stream-budget estimate counts two target root layouts per request
 bucket, plus a captured retrieval stream per layout when shared retrieval overlap
 is enabled. It retains the conservative draft-layer-plus-one allowance, including

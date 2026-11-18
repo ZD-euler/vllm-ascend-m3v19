@@ -11,8 +11,8 @@ from vllm.triton_utils import tl, triton
 from vllm_ascend.ops.triton.triton_utils import get_element, get_vectorcore_num, init_device_properties_triton
 
 
-@triton.jit
-def _mask_topk(raw, positions, output, rows: tl.constexpr, width: tl.constexpr,
+@triton.jit(do_not_specialize=["rows", "actual_rows"])
+def _mask_topk(raw, positions, output, rows, width: tl.constexpr,
                actual_rows, TILE: tl.constexpr):
     col = tl.arange(0, TILE)
     for start in range(tl.program_id(0) * TILE, rows * width, tl.num_programs(0) * TILE):
@@ -80,6 +80,21 @@ def prepare_sfa_dcp_topk(
     _prepare_topk[(min(rows, get_vectorcore_num()),)](
         topk, positions, output, counts, row_requests, rows, width, actual_rows, world, rank, block, local
     )
+
+
+def warmup_sfa_dcp_mask(max_rows: int, width: int, device: torch.device) -> None:
+    """Warm eager draft row counts before serving, including non-graph buckets."""
+    raw = torch.full((max_rows, 1, width), -1, dtype=torch.int32, device=device)
+    output = torch.empty_like(raw)
+    counts = raw.new_empty(0)
+    position_buffers = [torch.zeros(max_rows, dtype=dtype, device=device) for dtype in (torch.int32, torch.int64)]
+    for positions in position_buffers:
+        for rows in range(1, max_rows + 1):
+            # Global-ID masking ignores counts and DCP ownership. Reuse the
+            # live launch path with private buffers, without any collectives.
+            prepare_sfa_dcp_topk(raw[:rows], positions[:rows], output[:rows], counts, rows, 1, 0, 1, local=False)
+    # Finish private writes before releasing their storage or reporting ready.
+    torch.npu.current_stream().synchronize()
 
 
 @triton.jit

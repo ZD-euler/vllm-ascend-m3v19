@@ -1116,6 +1116,18 @@ class NPUWorker(WorkerBase):
         if get_ascend_device_type() != AscendDeviceType.A5:
             with startup_phase(self, "atb_warmup"):
                 self._warm_up_atb()
+        if getattr(self.model_runner, "dsa_decoder_dcp", False) is True:
+            from vllm_ascend.ops.triton.sfa_dcp import warmup_sfa_dcp_mask
+
+            with startup_phase(self, "dcp_mask_warmup"):
+                warmup_sfa_dcp_mask(
+                    min(
+                        self.model_runner.max_num_tokens,
+                        self.model_runner.max_num_reqs * self.model_runner.decode_threshold,
+                    ),
+                    self.model_runner.dsa_index_topk,
+                    self.device,
+                )
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
