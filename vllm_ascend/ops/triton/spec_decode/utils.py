@@ -17,6 +17,9 @@
 
 from vllm.triton_utils import tl, triton
 
+# Small batches use the same tile in startup and the live proposer.
+PREPARE_INPUTS_BLOCK_SIZE = 4
+
 
 @triton.jit(do_not_specialize=["num_reqs"])
 def prepare_next_mtp_tokens_kernel(

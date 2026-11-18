@@ -7,18 +7,18 @@ from vllm.triton_utils import tl, triton
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num, init_device_properties_triton
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["items", "qs1"])
 def _copy_query_bridge(
     query,
     rope,
     query_out,
     rope_out,
-    items: tl.constexpr,
+    items,
     heads: tl.constexpr,
     query_dim: tl.constexpr,
     rope_dim: tl.constexpr,
     qs0: tl.constexpr,
-    qs1: tl.constexpr,
+    qs1,
     qs2: tl.constexpr,
     rs0: tl.constexpr,
     rs1: tl.constexpr,

@@ -103,11 +103,11 @@ class AsyncSFAModelRunner(NPUModelRunner):
                         live_origins=origins, seq_local=lengths[1].new_empty(n + 1),
                         local_capacity=n + 1, DCP_WORLD=self.dcp_size, DCP_RANK=self.dcp_rank,
                     )
-                    if self._mixed_indexer_c8_names:
-                        layout.update(
-                            slots_c8=slots[1].new_empty(capacity, dtype=torch.long), MIXED_C8=True,
-                            table_c8=tables[1], stride_c8=tables[1].stride(0),
-                        )
+                if getattr(self.ascend_config, "indexer_c8_shared_block_factor", 1) == 2:
+                    layout.update(
+                        slots_c8=slots[1].new_empty(capacity, dtype=torch.long), MIXED_C8=True,
+                        table_c8=tables[1], stride_c8=tables[1].stride(0),
+                    )
                 prepare_async_mtp_kernel[(triton.cdiv(max(capacity // 2, n + 1), 32),)](
                     self._async_bases,
                     counts,

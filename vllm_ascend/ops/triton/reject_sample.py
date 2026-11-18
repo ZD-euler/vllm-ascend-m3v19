@@ -41,7 +41,7 @@ def bonus_renew_1(
     tl.store(output_token_ids_ptr + position * 2 + 1, bonus_token_id)
 
 
-@triton.jit(do_not_specialize=["max_spec_len"])
+@triton.jit(do_not_specialize=["vec_len"])
 def rejection_greedy_sample_spec_len_1_triton(
     output_token_ids_ptr,  # [batch_size, 2]
     draft_token_ids_ptr,  # [num_tokens]
@@ -139,7 +139,7 @@ def rejection_greedy_sample_triton(
             )
 
 
-@triton.jit(do_not_specialize=["max_spec_len"])
+@triton.jit(do_not_specialize=["max_spec_len", "vec_len"])
 def rejection_random_sample_kernel(
     output_token_ids_ptr,  # [batch_size, max_spec_len + 1]
     cu_num_draft_tokens_ptr,  # [batch_size]

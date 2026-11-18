@@ -105,27 +105,25 @@ def test_mask_warmup_exercises_each_row_count_and_both_position_types(ops, monke
     assert all(reference() is None for reference in allocations)
 
 
-@pytest.mark.parametrize("dcp,query_width,max_tokens", [(False, 2, 256), (True, 1, 256), (True, 2, 256), (True, 2, 5)])
+@pytest.mark.parametrize("dcp,eager", [(False, False), (True, False), (False, True), (True, True)])
 @pytest.mark.parametrize("failure", [False, True])
-def test_worker_warms_dcp_mask_before_readiness_and_propagates_failure(
-    monkeypatch, dcp, query_width, max_tokens, failure
-):
+def test_worker_warms_decode_before_readiness_and_propagates_failure(monkeypatch, dcp, eager, failure):
     events = []
 
-    def warm(rows, width, device):
-        assert (rows, width, device) == (min(3 * query_width, max_tokens), 2048, "npu:0")
-        events.append("mask")
+    def warm(value):
+        assert value is runner
+        events.append("kernels")
         if failure:
-            raise RuntimeError("mask warmup failed")
+            raise RuntimeError("kernel warmup failed")
 
-    module = ModuleType("vllm_ascend.ops.triton.sfa_dcp")
-    module.warmup_sfa_dcp_mask = warm
+    module = ModuleType("vllm_ascend.ops.triton.decode_warmup")
+    module.warmup_decode_kernels = warm
     monkeypatch.setitem(sys.modules, module.__name__, module)
     runner = SimpleNamespace(
         dsa_decoder_dcp=dcp,
         max_num_reqs=3,
-        max_num_tokens=max_tokens,
-        decode_threshold=query_width,
+        max_num_tokens=256,
+        decode_threshold=2,
         dsa_index_topk=2048,
         capture_model=lambda: events.append("capture"),
         _sfa_full_graph=SimpleNamespace(entries=[]),
@@ -135,7 +133,7 @@ def test_worker_warms_dcp_mask_before_readiness_and_propagates_failure(
     worker = SimpleNamespace(
         model_runner=runner,
         device="npu:0",
-        model_config=SimpleNamespace(enforce_eager=False, seed=0),
+        model_config=SimpleNamespace(enforce_eager=eager, seed=0),
         vllm_config=SimpleNamespace(compilation_config=config),
         _wait_for_decoder_ep_startup=lambda: None,
     )
@@ -151,13 +149,14 @@ def test_worker_warms_dcp_mask_before_readiness_and_propagates_failure(
             set_random_seed=lambda seed: events.append("seed"),
         ),
     )
-    if dcp and failure:
-        with pytest.raises(RuntimeError, match="mask warmup failed"):
+    captured = [] if eager else ["capture"]
+    if failure:
+        with pytest.raises(RuntimeError, match="kernel warmup failed"):
             compile_model(worker)
-        assert events == ["capture", "mask"]
+        assert events == [*captured, "kernels"]
     else:
         assert compile_model(worker) == 1
-        assert events == ["capture", *(["mask"] if dcp else []), "seed", "activate"]
+        assert events == [*captured, "kernels", "seed", "activate"]
 
 
 @pytest.mark.parametrize("local,mixed", [(True, False), (False, True), (True, True)])

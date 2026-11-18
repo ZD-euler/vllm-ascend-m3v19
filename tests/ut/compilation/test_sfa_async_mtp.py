@@ -750,14 +750,26 @@ def test_uniform_graph_cpu_lengths_may_alias_runner_buffer(setup):
 
 
 @pytest.mark.parametrize("dcp", [False, True])
-def test_kernel_warmup_is_after_capture_and_uses_private_outputs(setup, monkeypatch, dcp):
-    r, _, _, events, _ = setup
+@pytest.mark.parametrize("mixed", [False, True])
+def test_kernel_warmup_is_after_capture_and_uses_private_outputs(setup, monkeypatch, dcp, mixed):
+    r, _, _, events, ns = setup
     r.max_num_reqs, r.device = 3, torch.device("cpu")
     r._sfa_full_graph = SimpleNamespace(entries=[r._async_snapshot.key])
     r._async_bases = torch.zeros(4, dtype=torch.int32)
     r.max_num_reqs = 4
     r.dsa_decoder_dcp, r.dcp_size, r.dcp_rank = dcp, 4, 1
-    r._mixed_indexer_c8_names = ("indexer",) if dcp else None
+    r.ascend_config = SimpleNamespace(indexer_c8_shared_block_factor=2 if mixed else 1)
+    original = ns["prepare_async_mtp_kernel"]
+
+    class CheckedKernel:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                assert kwargs.get("MIXED_C8", False) == mixed
+                assert ("live_origins" in kwargs) == dcp
+                original[grid](*args, **kwargs)
+            return launch
+
+    ns["prepare_async_mtp_kernel"] = CheckedKernel()
     r.drafter = SimpleNamespace(warmup_next_mtp_tokens=lambda: events.append("next_token_warmup"))
     for group in r.input_batch.block_table.block_tables:
         group.block_table = SimpleNamespace(gpu=group.table)

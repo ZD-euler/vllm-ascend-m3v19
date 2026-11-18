@@ -5,15 +5,15 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["TABLE_SIZE", "SLOT_SIZE"])
 def _map_indexer_metadata(
     table,
     slots,
     mapping,
     out_table,
     out_slots,
-    TABLE_SIZE: tl.constexpr,
-    SLOT_SIZE: tl.constexpr,
+    TABLE_SIZE,
+    SLOT_SIZE,
     TABLE_WIDTH: tl.constexpr,
     TABLE_STRIDE: tl.constexpr,
     BLOCK: tl.constexpr,

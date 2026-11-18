@@ -411,6 +411,7 @@ def test_failed_single_fallback_keeps_guardian_attached(contract_runner, monkeyp
 def test_startup_selects_one_agreement_protocol(monkeypatch, single_requested, qualification):
     from test_sfa_single_agreement import policy as single_policy
 
+    monkeypatch.setitem(sys.modules, "vllm_ascend.ops.triton.decode_warmup", NS(warmup_decode_kernels=Mock()))
     runner, ns = single_policy()
     tp = NS(cpu_group="cache-tp", ranks=[0, 1], rank_in_group=0, world_size=2)
     ep = NS(cpu_group="ep", rank_in_group=0, world_size=4)

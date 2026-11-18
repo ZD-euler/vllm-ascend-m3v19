@@ -146,7 +146,7 @@ def _triton_rope(
         tl.store(k_start_ptr + second_half_k_offsets, new_k_tile_2, mask=second_k_mask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_tokens"])
 def _triton_rope_siso(
     qk_ptr,
     qk_row_stride,

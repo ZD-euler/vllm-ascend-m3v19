@@ -58,6 +58,9 @@ from vllm_ascend.compilation.acl_graph import (
     update_full_graph_params,
 )
 from vllm_ascend.ops.triton.spec_decode.utils import (
+    PREPARE_INPUTS_BLOCK_SIZE as _PREPARE_INPUTS_BLOCK_SIZE,
+)
+from vllm_ascend.ops.triton.spec_decode.utils import (
     pack_mtp_tokens_positions_kernel,
     prepare_dcp_mtp_draft_kernel,
     prepare_inputs_padded_kernel,
@@ -81,9 +84,6 @@ from vllm_ascend.utils import (
     staged_sfa_graph_capture_sizes,
     staged_sfa_graph_configured,
 )
-
-# Currently we will fix block size to a small one since `num_reqs` can't be too large
-_PREPARE_INPUTS_BLOCK_SIZE = 4
 
 
 @dataclass

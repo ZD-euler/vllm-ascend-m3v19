@@ -24,8 +24,8 @@ def _mask_topk(raw, positions, output, rows, width: tl.constexpr,
                  offset < rows * width)
 
 
-@triton.jit
-def _prepare_topk(raw, positions, output, counts, row_requests, rows: tl.constexpr,
+@triton.jit(do_not_specialize=["rows", "actual_rows"])
+def _prepare_topk(raw, positions, output, counts, row_requests, rows,
                   width: tl.constexpr, actual_rows, world: tl.constexpr,
                   rank: tl.constexpr, block: tl.constexpr, local: tl.constexpr):
     col = tl.arange(0, width)
@@ -97,8 +97,8 @@ def warmup_sfa_dcp_mask(max_rows: int, width: int, device: torch.device) -> None
     torch.npu.current_stream().synchronize()
 
 
-@triton.jit
-def _unpack_queries(packed, query, rope, rows: tl.constexpr, heads: tl.constexpr,
+@triton.jit(do_not_specialize=["rows"])
+def _unpack_queries(packed, query, rope, rows, heads: tl.constexpr,
                     world: tl.constexpr, query_dim: tl.constexpr, rope_dim: tl.constexpr,
                     query_block: tl.constexpr, rope_block: tl.constexpr):
     q_col = tl.arange(0, query_block)
@@ -194,8 +194,8 @@ def execute_sfa_dcp(
     return merge_sfa_dcp(*partial, group.device_group)
 
 
-@triton.jit
-def _pack(partial, maximum, total, send, rows: tl.constexpr, heads: tl.constexpr,
+@triton.jit(do_not_specialize=["rows"])
+def _pack(partial, maximum, total, send, rows, heads: tl.constexpr,
           local_heads: tl.constexpr, value_dim: tl.constexpr):
     features = tl.arange(0, value_dim)
     bytes_ = tl.arange(0, 16)
@@ -226,8 +226,8 @@ def _unpack_stat(ptr):
     return tl.cast(bits, tl.float32, bitcast=True)
 
 
-@triton.jit
-def _combine(recv, output, local_rows: tl.constexpr, world: tl.constexpr, value_dim: tl.constexpr):
+@triton.jit(do_not_specialize=["local_rows"])
+def _combine(recv, output, local_rows, world: tl.constexpr, value_dim: tl.constexpr):
     features = tl.arange(0, value_dim)
     peers = tl.arange(0, world)
     stride = value_dim + 16
