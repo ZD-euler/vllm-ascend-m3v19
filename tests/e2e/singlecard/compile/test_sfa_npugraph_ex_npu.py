@@ -18,14 +18,13 @@ pytest.importorskip("torchair")
 from torch._inductor import config as inductor_config
 from vllm.config import CUDAGraphMode
 
+from vllm_ascend.compilation import compiler_interface
 from vllm_ascend.compilation.compiler_interface import COMPILATION_PASS_KEY, npugraph_ex_compile
 from vllm_ascend.compilation.sfa_retrieval_overlap import RetrievalEdge
 
 
-@pytest.mark.parametrize("v2", [False, True])
-@pytest.mark.parametrize("alias_output", [False, True])
-@torch.inference_mode()
-def test_real_backend_preserves_resident_storage_and_captured_overlap(monkeypatch, v2, alias_output):
+@pytest.fixture
+def sfa_config(monkeypatch):
     for name, value in {
         "VLLM_ASCEND_SFA_STAGED_GRAPH": "1",
         "VLLM_ASCEND_SFA_FULL_GRAPH": "1",
@@ -37,7 +36,7 @@ def test_real_backend_preserves_resident_storage_and_captured_overlap(monkeypatc
     }.items():
         monkeypatch.setenv(name, value)
     torch.npu.set_device(0)
-    cfg = NS(
+    return NS(
         model_config=NS(use_mla=True, hf_text_config=NS(index_topk=2048), enforce_eager=False),
         compilation_config=NS(cudagraph_mode=CUDAGraphMode.PIECEWISE),
         parallel_config=NS(
@@ -50,6 +49,13 @@ def test_real_backend_preserves_resident_storage_and_captured_overlap(monkeypatc
         kv_transfer_config=object(),
         lora_config=None,
     )
+
+
+@pytest.mark.parametrize("v2", [False, True])
+@pytest.mark.parametrize("alias_output", [False, True])
+@torch.inference_mode()
+def test_real_backend_preserves_resident_storage_and_captured_overlap(monkeypatch, sfa_config, v2, alias_output):
+    cfg = sfa_config
     backing = torch.zeros(12, device="npu")
     resident = backing[4::2]  # Strided, with unused storage to check for overwrite.
     output = backing[:4] if alias_output else torch.zeros(4, device="npu")
@@ -125,6 +131,51 @@ def test_real_backend_preserves_resident_storage_and_captured_overlap(monkeypatc
             assert len(compilations) == count
             if not alias_output:
                 assert seen and set(seen) == {resident.data_ptr()}
+    finally:
+        torch.npu.synchronize()
+        torch._dynamo.reset()
+
+
+@pytest.mark.parametrize("layout", ["duplicate", "overlap"])
+@torch.inference_mode()
+def test_compiler_recovers_mutable_alias_attributes_and_replays(monkeypatch, sfa_config, layout):
+    # Use the production adapter and installed TorchAir. The parameter's custom
+    # attributes precede inputs which inference AOT may fold into one tensor.
+    monkeypatch.setattr(
+        compiler_interface,
+        "get_ascend_config",
+        lambda: NS(ascend_compilation_config=NS(enable_npugraph_ex=True, enable_static_kernel=False)),
+    )
+
+    def forward(weight, left, right):
+        left.add_(weight)
+        return right * 2
+
+    weight = torch.nn.Parameter(torch.ones(4, device="npu"), requires_grad=False)
+    backing = torch.zeros(8, device="npu")
+    left = backing[:4]
+    right = left if layout == "duplicate" else backing[2:6]
+    instance = compiler_interface.AscendCompiler()
+    instance.vllm_config = sfa_config
+    try:
+        compiled, _ = instance.compile(
+            torch.fx.symbolic_trace(forward), [weight, left, right], {COMPILATION_PASS_KEY: lambda gm: gm}, None
+        )
+        compiled(weight, left, right)
+        torch.npu.synchronize()
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            result = compiled(weight, left, right)
+        torch.npu.synchronize()
+        backing.zero_()
+        expected = torch.zeros(8)
+        for step in (1, 2, 3):
+            weight.fill_(step)
+            graph.replay()
+            torch.npu.synchronize()
+            expected[:4].add_(step)
+            torch.testing.assert_close(backing.cpu(), expected)
+            torch.testing.assert_close(result.cpu(), (expected[:4] if layout == "duplicate" else expected[2:6]) * 2)
     finally:
         torch.npu.synchronize()
         torch._dynamo.reset()

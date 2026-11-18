@@ -36,6 +36,8 @@ def compiler(monkeypatch, sizing):
         hook_available=True,
         keep_mutations=False,
         identity_copy_counts=[],
+        input_attrs=False,
+        aot_input_counts=[],
     )
 
     @contextmanager
@@ -63,7 +65,9 @@ def compiler(monkeypatch, sizing):
     ascend = sys.modules["vllm_ascend.ascend_config"]
     monkeypatch.setattr(ascend, "AscendCompilationConfig", object, raising=False)
     monkeypatch.setattr(
-        ascend, "get_ascend_config", lambda: NS(ascend_compilation_config=NS(enable_npugraph_ex=state.enabled))
+        ascend,
+        "get_ascend_config",
+        lambda: NS(ascend_compilation_config=NS(enable_npugraph_ex=state.enabled, enable_static_kernel=False)),
     )
     monkeypatch.setitem(sys.modules, "vllm_ascend.utils", sizing)
     monkeypatch.setattr(torch, "npu", NS(set_compile_mode=Mock()), raising=False)
@@ -78,8 +82,16 @@ def compiler(monkeypatch, sizing):
     def get_backend(*, compiler_config):
         def backend(gm, inputs):
             state.calls.append("backend")
+            # TorchAir saves negative positions BEFORE AOT folds mutable aliases.
+            attrs = {
+                i - len(inputs): {"_torchair_is_parameter": True}
+                for i, value in enumerate(inputs)
+                if state.input_attrs and isinstance(value, torch.nn.Parameter)
+            }
 
             def inner(graph, example_inputs):
+                state.aot_input_counts.append((len(inputs), len(example_inputs)))
+                attrs_module._set_inputs_custom_attr(example_inputs, attrs)
                 hook = getattr(compiler_config, "post_grad_custom_pre_pass", None)
                 if hook is not None:
                     graph = hook(graph, example_inputs, compiler_config)
@@ -98,6 +110,15 @@ def compiler(monkeypatch, sizing):
 
         return backend
 
+    # Reproduce the upstream helper's traceback as well as its stale-index bug.
+    attrs_module = ModuleType("torchair.npu_fx_compiler")
+    exec(
+        "def _set_inputs_custom_attr(inputs, attrs):\n"
+        "    for index, values in attrs.items():\n"
+        "        for name, value in values.items():\n"
+        "            setattr(inputs[index], name, value)\n",
+        attrs_module.__dict__,
+    )
     torchair = ModuleType("torchair")
     torchair.CompilerConfig = compiler_config
     torchair.get_npu_backend = get_backend
@@ -232,6 +253,141 @@ def test_disabled_backend_does_not_construct_torchair(compiler, monkeypatch):
     fn, _ = module.AscendCompiler().compile(graph, [torch.ones(2)], {module.COMPILATION_PASS_KEY: lambda g: g}, None)
     torch.testing.assert_close(fn(torch.ones(2))[0], torch.full((2,), 2.0))
     factory.assert_not_called()
+
+
+@pytest.mark.parametrize("layout", ["duplicate", "overlap", "unique"])
+@pytest.mark.parametrize("tuple_output", [False, True])
+@pytest.mark.parametrize("dcp", [1, 4])
+def test_torchair_attribute_index_failure_uses_regular_sfa_fusion(compiler, monkeypatch, layout, tuple_output, dcp):
+    module, state = compiler
+    state.input_attrs = state.keep_mutations = True
+    cfg = config()
+    cfg.parallel_config.decode_context_parallel_size = dcp
+    cfg.kv_transfer_config = NS(kv_connector="LMCacheAscendConnectorV1Dynamic", is_kv_consumer=True)
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "false")
+
+    def forward(weight, left, right):
+        left.add_(weight)
+        result = right * 2
+        return (result,) if tuple_output else result
+
+    def inputs():
+        weight = torch.nn.Parameter(torch.ones(4), requires_grad=False)
+        storage = torch.zeros(8)
+        left = storage[:4]
+        right = left if layout == "duplicate" else storage[2:6] if layout == "overlap" else torch.zeros(4)
+        return [weight, left, right]
+
+    graph = torch.fx.symbolic_trace(forward)
+    original = graph.code
+    config_pass = Mock(side_effect=lambda gm: gm)
+    passes = {module.COMPILATION_PASS_KEY: config_pass}
+    # Establish the actual AOT contraction and original failure, without a
+    # fabricated IndexError in the compiler entry point.
+    if layout != "unique":
+        with torch.inference_mode(), pytest.raises(IndexError, match="list index out of range"):
+            module.npugraph_ex_compile(
+                copy.deepcopy(graph), inputs(), passes, cfg, NS(enable_static_kernel=False), None
+            )
+        assert state.aot_input_counts == [(3, 2)]
+        config_pass.assert_not_called()
+    state.calls.clear()
+    fallback = Mock(wraps=module.fusion_pass_compile)
+    monkeypatch.setattr(module, "fusion_pass_compile", fallback)
+    compiler_instance = module.AscendCompiler()
+    compiler_instance.vllm_config = cfg
+    actual, expected = inputs(), inputs()
+    with torch.inference_mode():
+        compiled, handle = compiler_instance.compile(graph, actual, passes, None)
+        for _ in range(3):
+            torch.testing.assert_close(compiled(*actual), forward(*expected))
+            for value, reference in zip(actual, expected):
+                torch.testing.assert_close(value, reference)
+    assert fallback.call_count == int(layout != "unique")
+    assert state.calls == (["backend"] if layout != "unique" else ["backend", "generic_lowering"])
+    config_pass.assert_called_once()
+    assert graph.code == original and handle is None
+
+
+@pytest.mark.parametrize("v2", [False, True])
+def test_attribute_recovery_preserves_shared_resident_storage(compiler, monkeypatch, v2):
+    module, state = compiler
+    state.input_attrs = state.keep_mutations = True
+    lib = torch.library.Library(f"sfa_attr_recovery_{int(v2)}", "DEF")
+    lib.define("pre(Tensor weight, Tensor(a!) output, Tensor(b!)[] resident_writes) -> ()")
+    addresses = []
+
+    def pre(weight, output, resident_writes):
+        addresses.append(resident_writes[0].data_ptr())
+        resident_writes[0].add_(weight)
+        output.copy_(resident_writes[0])
+
+    lib.impl("pre", pre, "CPU")
+    lib._register_fake("pre", lambda weight, output, resident_writes: None)
+    op = getattr(torch.ops, f"sfa_attr_recovery_{int(v2)}").pre
+    monkeypatch.setattr(torch.ops.vllm, "sfa_forward_pre_shared", op, raising=False)
+
+    def forward(weight, output, resident, reader):
+        op(weight, output, [resident])
+        return reader + output
+
+    graph = torch.fx.symbolic_trace(forward)
+    weight = torch.nn.Parameter(torch.ones(4), requires_grad=False)
+    output, resident = torch.zeros(4), torch.zeros(4)
+    instance = module.AscendCompiler()
+    instance.vllm_config = config()
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        with torch.inference_mode(), inductor_config.patch(enable_auto_functionalized_v2=v2):
+            compiled, _ = instance.compile(
+                graph, [weight, output, resident, resident], {module.COMPILATION_PASS_KEY: lambda gm: gm}, None
+            )
+            for step in (1, 2, 3):
+                torch.testing.assert_close(
+                    compiled(weight, output, resident, resident), torch.full((4,), float(2 * step))
+                )
+                torch.testing.assert_close(resident, torch.full((4,), float(step)))
+    finally:
+        if was_enabled:
+            gc.enable()
+    assert state.aot_input_counts == [(4, 3)] and state.calls == ["backend"]
+    assert addresses == [resident.data_ptr()] * 3
+
+
+@pytest.mark.parametrize("failure", [IndexError("unrelated index error"), RuntimeError("unrelated backend failure")])
+def test_unrelated_torchair_errors_are_not_hidden(compiler, monkeypatch, failure):
+    module, _ = compiler
+    monkeypatch.setattr(module, "npugraph_ex_compile", Mock(side_effect=failure))
+    fallback = Mock()
+    monkeypatch.setattr(module, "fusion_pass_compile", fallback)
+    instance = module.AscendCompiler()
+    instance.vllm_config = config()
+    with pytest.raises(type(failure), match="unrelated"):
+        instance.compile(torch.fx.symbolic_trace(lambda x: (x + 1,)), [torch.ones(2)], {}, None)
+    fallback.assert_not_called()
+
+
+@pytest.mark.parametrize("case", ["other_module", "nested_error", "non_sfa"])
+def test_attribute_recovery_is_limited_to_the_reported_sfa_failure(compiler, monkeypatch, case):
+    module, _ = compiler
+    attrs = ModuleType("other.compiler" if case == "other_module" else "torchair.npu_fx_compiler")
+    exec(
+        "def nested_error():\n    return [][0]\n"
+        "def _set_inputs_custom_attr(*args):\n"
+        + ("    nested_error()\n" if case == "nested_error" else "    return [][0]\n"),
+        attrs.__dict__,
+    )
+    monkeypatch.setattr(module, "npugraph_ex_compile", attrs._set_inputs_custom_attr)
+    fallback = Mock()
+    monkeypatch.setattr(module, "fusion_pass_compile", fallback)
+    if case == "non_sfa":
+        monkeypatch.setenv("VLLM_ASCEND_SFA_FULL_GRAPH", "0")
+    instance = module.AscendCompiler()
+    instance.vllm_config = config()
+    with pytest.raises(IndexError):
+        instance.compile(torch.fx.symbolic_trace(lambda x: (x + 1,)), [torch.ones(2)], {}, None)
+    fallback.assert_not_called()
 
 
 def test_pass_failure_restores_context_without_fallback(compiler):

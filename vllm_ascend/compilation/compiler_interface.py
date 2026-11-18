@@ -18,6 +18,7 @@
 import copy
 import functools
 import hashlib
+import traceback
 from collections.abc import Callable
 from typing import Any
 
@@ -35,7 +36,7 @@ from vllm.logger import logger
 from vllm_ascend.ascend_config import AscendCompilationConfig, get_ascend_config
 from vllm_ascend.utils import COMPILATION_PASS_KEY, sfa_full_graph_enabled, staged_sfa_graph_configured
 
-_SFA_NPUGRAPH_EX_REVISION = "sfa_npugraph_ex_v1"
+_SFA_NPUGRAPH_EX_REVISION = "sfa_npugraph_ex_v2"
 
 
 def compile_fx(graph: GraphModule, example_inputs: list, inner_compile: Callable, decompositions: dict) -> Callable:
@@ -248,6 +249,7 @@ class AscendCompiler(CompilerInterface):
     ) -> tuple[Callable | None, Any | None]:
         # inductor can inplace modify the graph, so we need to copy it
         # see https://github.com/pytorch/pytorch/issues/138980
+        original_graph = graph
         graph = copy.deepcopy(graph)
 
         from torch._guards import detect_fake_mode
@@ -269,8 +271,36 @@ class AscendCompiler(CompilerInterface):
         if ascend_compilation_config.enable_npugraph_ex:
             logger.info("enable_npugraph_ex is enabled, which will bring graph compilation optimization.")
             assert hasattr(self, "vllm_config")
-            return npugraph_ex_compile(
-                graph, example_inputs, compiler_config, self.vllm_config, ascend_compilation_config, compile_range, key
-            )
-        else:
-            return fusion_pass_compile(graph, example_inputs, compiler_config, compile_range, key)
+            try:
+                return npugraph_ex_compile(
+                    graph,
+                    example_inputs,
+                    compiler_config,
+                    self.vllm_config,
+                    ascend_compilation_config,
+                    compile_range,
+                    key,
+                )
+            except IndexError as error:
+                if not (
+                    staged_sfa_graph_configured(self.vllm_config)
+                    and sfa_full_graph_enabled(self.vllm_config)
+                    and any(
+                        frame.f_code.co_name == "_set_inputs_custom_attr"
+                        and frame.f_globals.get("__name__", "").endswith("torchair.npu_fx_compiler")
+                        for frame, _ in list(traceback.walk_tb(error.__traceback__))[-1:]
+                    )
+                ):
+                    raise
+                # AOT can merge mutable aliases; affected TorchAir versions
+                # restore attributes using stale pre-AOT indices. Retry only
+                # this fragment with the established alias-aware SFA compiler.
+                logger.warning(
+                    "TorchAir input-attribute indices do not match AOT inputs; "
+                    "using regular SFA fusion for subgraph %s (range %s). "
+                    "Full SFA graphs remain enabled; TorchAir-only fusions may be lost for this subgraph.",
+                    key,
+                    compile_range,
+                )
+                graph = copy.deepcopy(original_graph)
+        return fusion_pass_compile(graph, example_inputs, compiler_config, compile_range, key)

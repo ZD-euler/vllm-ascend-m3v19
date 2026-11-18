@@ -119,6 +119,16 @@ compilation explicitly. A distinct compiler hash separates the new route from
 older compiled artifacts. Static kernels are a separate qualification step;
 start with the setting above.
 
+Some TorchAir versions restore tensor attributes by their pre-AOT input indices.
+AOT can merge duplicate or overlapping mutable inputs, making those indices
+invalid. If `_set_inputs_custom_attr` raises `IndexError`, full SFA retries only
+that subgraph through the existing regular fusion compiler, starting from the
+original graph. Other compiler failures still propagate. A warning identifies
+the subgraph and compile range; DCP, resident-buffer reuse and full-SFA capture
+remain enabled. This adds startup compilation work and can lose TorchAir-only
+fusions in the affected fragment, so remeasure serving performance. No runtime
+retry, new per-step collective, configuration change or native rebuild is added.
+
 Before serving, run the installed-backend probe in an NPU container:
 
 ```bash
