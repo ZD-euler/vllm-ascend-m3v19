@@ -125,13 +125,17 @@ def test_group_creation_failure_does_not_install_an_active_policy(monkeypatch):
     monkeypatch.setitem(sys.modules, "vllm_ascend.worker.sfa_independent", independent)
     monkeypatch.setattr(dist, "new_group", Mock(side_effect=RuntimeError("group setup failed")))
     activate = extract(ROOT / "vllm_ascend/worker/worker.py", "activate_independent_dp", {})
+    single = NS(active=False)
     worker = NS(
-        model_runner=NS(_sfa_independent=None), dp_guardian=object(),
-        parallel_config=NS(data_parallel_size=2), _independent_dp_contract=dict(digest="a" * 64, capacity=24),
+        model_runner=NS(_sfa_independent=None, _sfa_single_agreement=single),
+        dp_guardian=object(),
+        parallel_config=NS(data_parallel_size=2),
+        _independent_dp_contract=dict(digest="a" * 64, capacity=24),
     )
     with pytest.raises(RuntimeError, match="group setup failed"):
         activate(worker, True)
     assert worker.model_runner._sfa_independent is None
+    assert worker.model_runner._sfa_single_agreement is single and not single.active
 
 
 def _gloo_overlap_worker(rank, port):

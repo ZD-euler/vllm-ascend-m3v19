@@ -28,14 +28,30 @@ installed Mooncake library. Restart the whole decoder DP/EP cohort together.
 
 ```bash
 export VLLM_ASCEND_SFA_INDEPENDENT_DP=1
-export VLLM_ASCEND_SFA_SINGLE_AGREEMENT=0
+export VLLM_ASCEND_SFA_SINGLE_AGREEMENT=1
 # Optional guardian health lease; default 30 seconds, valid range [2, 86400].
 # This does not replace the existing model-execution/startup timeout settings.
 export VLLM_ASCEND_SFA_GUARD_TIMEOUT_S=30
 ```
 
-Keep the existing full-SFA, KV, graph and MTP configuration. The flag must match
-on all DP peers. Startup logs `[SFA independent DP] active` only after every TP
+Keep the existing full-SFA, KV, graph and MTP configuration. Both flags must match
+on all DP peers. All four combinations are accepted:
+
+| SINGLE_AGREEMENT | INDEPENDENT_DP | Execution mode |
+| --- | --- | --- |
+| 0 | 0 | Existing coordinated protocol |
+| 1 | 0 | Single agreement when supported; otherwise existing coordinated protocol |
+| 0 | 1 | Independent DP when qualified; otherwise existing coordinated protocol |
+| 1 | 1 | Independent DP when qualified; otherwise single agreement when supported, or existing coordinated protocol |
+
+Independent DP takes precedence. Single agreement stays inactive until the
+startup qualification decision and is removed when independent DP activates.
+It adds no cross-DP vote or per-step work in independent mode. If qualification
+selects a common fallback, single agreement activates before serving, when
+supported. Its existing eligibility is unchanged; DCP greater than one still
+uses the coordinated fallback when independent DP is ineligible.
+
+Startup logs `[SFA independent DP] active` only after every TP
 worker installs the common qualified mode. Static ineligibility chooses the
 established protocol for the whole cohort; mixed flags/contracts fail startup.
 

@@ -1120,7 +1120,9 @@ class NPUWorker(WorkerBase):
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
         single = getattr(self.model_runner, "_sfa_single_agreement", None)
-        if single is not None:
+        # A supervised cohort selects independent mode or this fallback after
+        # capture qualification. Never activate both live protocols.
+        if single is not None and getattr(self, "dp_guardian", None) is None:
             single.activate(self.model_runner._sfa_full_graph.entries)
         return self.vllm_config.compilation_config.compilation_time
 
@@ -1148,7 +1150,11 @@ class NPUWorker(WorkerBase):
                 self.parallel_config.data_parallel_size,
                 contract["capacity"],
             )
+            self.model_runner._sfa_single_agreement = None
         else:
+            single = getattr(self.model_runner, "_sfa_single_agreement", None)
+            if single is not None:
+                single.activate(self.model_runner._sfa_full_graph.entries)
             self.dp_guardian.close()
             self.dp_guardian = None
 

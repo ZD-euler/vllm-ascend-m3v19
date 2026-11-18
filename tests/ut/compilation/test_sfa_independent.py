@@ -4,6 +4,7 @@
 import gc
 import importlib.util
 import sys
+from contextlib import nullcontext
 from enum import IntEnum
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -390,6 +391,105 @@ def test_unqualified_runner_can_install_common_fallback(contract_runner, monkeyp
     guard.close.assert_called_once()
     assert worker.dp_guardian is None
     create.assert_not_called()
+
+
+def test_failed_single_fallback_keeps_guardian_attached(contract_runner, monkeypatch):
+    monkeypatch.setitem(sys.modules, "vllm_ascend.worker.sfa_independent", independent)
+    activate = extract(ROOT / "vllm_ascend/worker/worker.py", "activate_independent_dp", {})
+    single = NS(activate=Mock(side_effect=ValueError("capture keys differ")))
+    runner = NS(_sfa_single_agreement=single, _sfa_full_graph=NS(entries=[]))
+    guard = Mock()
+    worker = NS(model_runner=runner, dp_guardian=guard)
+    with pytest.raises(ValueError, match="capture keys differ"):
+        activate(worker, False)
+    guard.close.assert_not_called()
+    assert worker.dp_guardian is guard
+
+
+@pytest.mark.parametrize("single_requested", [False, True])
+@pytest.mark.parametrize("qualification", ["disabled", "static_fallback", "dynamic_fallback", "qualified"])
+def test_startup_selects_one_agreement_protocol(monkeypatch, single_requested, qualification):
+    from test_sfa_single_agreement import policy as single_policy
+
+    runner, ns = single_policy()
+    tp = NS(cpu_group="cache-tp", ranks=[0, 1], rank_in_group=0, world_size=2)
+    ep = NS(cpu_group="ep", rank_in_group=0, world_size=4)
+    votes, signatures = [], []
+
+    def vote(value, *, group):
+        votes.append(group)
+        if value.ndim == 1:
+            value.mul_(ep.world_size)
+        else:
+            value.copy_(value[:, :1].expand_as(value).clone())
+
+    def gather(rows, value, *, group):
+        signatures.append(group)
+        rows[:] = [value] * len(rows)
+
+    monkeypatch.setattr(independent.dist, "all_reduce", vote)
+    monkeypatch.setattr(independent.dist, "all_gather_object", gather)
+    create = Mock(return_value="routing-tp")
+    monkeypatch.setattr(independent.dist, "new_group", create)
+    monkeypatch.setitem(sys.modules, "vllm.distributed", NS(get_tp_group=lambda: tp))
+    monkeypatch.setitem(sys.modules, "vllm_ascend.worker.sfa_independent", independent)
+    ns["envs"].VLLM_ASCEND_SFA_SINGLE_AGREEMENT = single_requested
+    runner._sfa_preparation_groups = (("sfa_full_graph::prepare_agreement_ep", ep.cpu_group),)
+    runner._async_snapshot = None
+    runner.parallel_config.tensor_parallel_size = tp.world_size
+    runner._sfa_single_agreement = runner._sfa_independent = None
+    ns["initialize_single_agreement"](runner, ep)
+    single = runner._sfa_single_agreement
+    runner._sfa_full_graph = NS(entries=[ns["StagedSFAGraphKey"].fixed_spec(4, 2)])
+    runner.capture_model = Mock()
+    pending = qualification in ("dynamic_fallback", "qualified")
+    guard = Mock() if pending else None
+    config = NS(compile_sizes=[], cudagraph_mode=0, get_compile_ranges=lambda: [], compilation_time=0)
+    worker = NS(
+        model_runner=runner,
+        dp_guardian=guard,
+        vllm_config=NS(compilation_config=config),
+        model_config=NS(enforce_eager=False, seed=0),
+        parallel_config=NS(data_parallel_size=2),
+        _wait_for_decoder_ep_startup=Mock(),
+        _independent_dp_contract=dict(digest="a" * 64, capacity=32),
+    )
+    source = ROOT / "vllm_ascend/worker/worker.py"
+    warmup = extract(
+        source,
+        "compile_or_warm_up_model",
+        dict(
+            CUDAGraphMode=NS(NONE=0),
+            cold_perf_enabled=lambda: False,
+            startup_phase=lambda *a, **kw: nullcontext(),
+            get_ascend_device_type=lambda: "a5",
+            AscendDeviceType=NS(A5="a5"),
+            set_random_seed=Mock(),
+        ),
+    )
+    warmup(worker)
+    runner.capture_model.assert_called_once()
+    assert signatures == (["ep"] if single_requested and not pending else [])
+    if single is not None:
+        assert single.active == (not pending)
+    if pending:
+        extract(source, "activate_independent_dp", {})(worker, qualification == "qualified")
+
+    if qualification == "qualified":
+        assert runner._sfa_single_agreement is None and runner._sfa_independent is not None
+        assert not signatures  # No EP activation vote, even when both flags are on.
+        guard.close.assert_not_called()
+        create.assert_called_once()
+        runner._sfa_independent.agree(8, 1, 1, False, requests=4)
+        assert votes == ["ep", "routing-tp"]  # Only the startup vote crosses DP.
+    else:
+        assert runner._sfa_independent is None
+        assert signatures == (["ep"] if single_requested else [])
+        assert single is None or single.active
+        create.assert_not_called()
+        if pending:
+            guard.close.assert_called_once()
+            assert worker.dp_guardian is None
 
 
 @pytest.mark.parametrize("field,value", [("global_bs", 64), ("enable_dispatch_v2", False), ("need_comm_alg", True)])
