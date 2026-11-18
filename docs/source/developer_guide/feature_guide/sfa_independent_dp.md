@@ -39,11 +39,24 @@ on all DP peers. Startup logs `[SFA independent DP] active` only after every TP
 worker installs the common qualified mode. Static ineligibility chooses the
 established protocol for the whole cohort; mixed flags/contracts fail startup.
 
-The initial qualification scope is Linux MP execution, one host per TP group,
-fixed EP membership, PP=PCP=DCP=1, no DBO, regular MC2 V2 on A2/A3, and either no
-speculation or the existing one-token MTP schedule. Recovery must remain within
-the existing MC2 token bound. Other configurations retain the established path.
-Different draft TP subgroups and fused/hierarchical MC2 need separate qualification.
+The scope is Linux MP execution, one host per TP group, fixed EP membership,
+PP=PCP=1, no DBO, regular MC2 V2, and either no speculation or the existing
+one-token MTP schedule. DCP=1 supports A2/A3. Decoder DCP additionally supports
+the existing A2 two-group layout with local DCP=TP in {2, 4, 8}, 128-token
+interleave, and full SFA graphs. Generic context parallelism, external-launcher
+DP, different draft TP subgroups and fused/hierarchical MC2 remain outside this
+mode. DP must exceed one; setting this flag with DP=1 provides no optimization.
+
+For decoder DCP, restart with the two flags above and the existing DCP/graph/cache
+settings. No new knob or native rebuild is needed. With independent DP requested,
+the recompute scheduler bounds recovery to the existing MC2 query-token capacity;
+this budget is **not divided by DCP size**. Coordinated DCP retains its original
+recovery budget. Bounded recovery can require more prefill/recovery steps, so
+compare recovery latency as well as steady decoding. Worker qualification checks
+the actual DCP/TP rank ordering, selected decoder backend, MC2 capacity, DCP
+communication/overlap settings and relevant source fingerprints before activation.
+All DCP query gathers/result exchanges and the TP-only route check remain; no
+additional per-layer host checks, device copies or synchronization are introduced.
 
 CANN 8.5.1 remains the target stack: unequal-token dispatch/combine is documented
 in [CANN 8.5](https://www.hiascend.com/document/detail/en/canncommercial/850/API/aolapi/context/ops-transformer/aclnnMoeDistributeDispatchV2.md),
@@ -113,11 +126,24 @@ torchrun --nnodes=2 --nproc-per-node=8 --node-rank="$NODE_RANK" \
 
 Preserve the deployment's HCCL interface configuration. This probe compares
 unequal local inputs and mixed native/captured dispatch/combine sequences with
-identity expert computation, including communication quantization. It does not
-exercise the full SFA attention/cache path or prove server performance.
+identity expert computation, including communication quantization. The
+`decoder-dcp` case adds real query gathering, counted sparse attention and output
+exchange before each MC2 pair on four separate TP4/DCP4 replicas. It compares
+against dense attention, includes empty selections and retains graphs across
+replays. Its printed three-layer pipeline latency includes launch and device
+completion with unequal peer workloads; it is a diagnostic, not a serving
+throughput estimate or an independent-versus-coordinated A/B measurement.
+It does not exercise LMCache ownership, retrieval or the full server schedule.
 
-Then qualify TP4/DP4 serving with identical trace, graph-size list, cache state,
-model and MTP settings. Include unequal/idle DPs, Q1/Q2, native recovery, cold
+To select only the DCP case, replace the pytest path in that command with:
+
+```text
+tests/e2e/multicard/test_sfa_independent_mc2.py::test_unequal_mc2_inputs_with_independent_native_and_graph_routes[decoder-dcp]
+```
+
+Then qualify the production serving topology: TP4/DP4 with DCP=1 or 4, or
+TP8/DCP8/DP2, using identical trace, graph-size list, cache state, model and MTP
+settings. Include unequal/idle DPs, Q1/Q2, native recovery, cold
 loading, two-group C8 KV, local/Mooncake placement, checkpoint preemption/resumption,
 GC disabled and failures during preparation/replay/draft/retirement. Verify all
 participants stop on failure and uncertain ownership remains retained. Compare

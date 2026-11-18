@@ -287,7 +287,6 @@ def test_decoder_dcp_selects_split_backend_before_storage_and_rechecks_live_poli
     ("parallel_config", "tensor_parallel_size", 8, "local DCP=TP"),
     ("parallel_config", "cp_kv_cache_interleave_size", 64, "128-token interleave"),
     ("envs", "VLLM_ASCEND_SFA_ASYNC_MTP_PREP", True, "requires full SFA graphs"),
-    ("envs", "VLLM_ASCEND_SFA_INDEPENDENT_DP", True, "coordinated"),
     ("config", "decoder_storage_mode", "local", "async process storage"),
     ("config", "enable_async_loading", False, "async process storage"),
     ("ops", "npu_sparse_flash_attention_dcp", None, "Rebuild vllm-ascend"),
@@ -303,6 +302,27 @@ def test_decoder_dcp_refuses_incompatible_routes_before_storage(decoder_dcp, own
         ctx.worker._init_device()
     assert "storage" not in ctx.events and "distributed" not in ctx.events
     assert not hasattr(ctx.vllm, "_dsa_decoder_dcp_policy")
+
+
+@pytest.mark.parametrize("dp", [1, 4])
+@pytest.mark.parametrize("independent", [False, True])
+def test_decoder_dcp_allows_independent_opt_in_without_weakening_layout_checks(decoder_dcp, dp, independent):
+    ctx = decoder_dcp
+    ctx.vllm.parallel_config.data_parallel_size = dp
+    ctx.envs.VLLM_ASCEND_SFA_INDEPENDENT_DP = independent
+    ctx.worker._configure_dsa_decoder_dcp()
+    assert ctx.vllm._dsa_decoder_dcp_policy == (2048, 0)
+    assert ctx.events == ["class", "config"]
+
+
+def test_decoder_dcp_still_rejects_external_dp_before_storage(decoder_dcp):
+    ctx = decoder_dcp
+    ctx.vllm.parallel_config.data_parallel_size = 4
+    ctx.vllm.parallel_config.distributed_executor_backend = "external_launcher"
+    ctx.envs.VLLM_ASCEND_SFA_INDEPENDENT_DP = True
+    with pytest.raises(ValueError, match="internal DP"):
+        ctx.worker._init_device()
+    assert "storage" not in ctx.events and "distributed" not in ctx.events
 
 
 def test_decoder_dcp_requires_effective_shared_cpu_strictness(decoder_dcp):

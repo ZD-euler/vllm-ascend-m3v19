@@ -109,8 +109,90 @@ def test_sync_gate_does_not_trust_recompute_flag_alone():
     runner.pcp_size = 2
     assert not gate(runner)
     runner.pcp_size = 1
+    runner.dcp_size = 4
+    assert not gate(runner)
+    runner.dsa_decoder_dcp = True
+    assert gate(runner) and gate(runner, True)
+    cfg.scheduler_config.mc2_recovery_token_budget = None
+    assert not gate(runner)
+    cfg.scheduler_config.mc2_recovery_token_budget = 32
     cfg.scheduler_config.scheduler_cls = "different.Scheduler"
     assert not gate(runner)
+
+
+@pytest.fixture
+def dcp_config(monkeypatch):
+    for name in ("SFA_INDEPENDENT_DP", "SFA_FULL_GRAPH", "DSA_UNBUNDLE", "DSA_TWO_GROUPS"):
+        monkeypatch.setenv("VLLM_ASCEND_" + name, "1")
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "false")
+    cfg = config()
+    cfg.parallel_config.distributed_executor_backend = "mp"
+    cfg.parallel_config.nnodes_within_dp = 1
+    cfg.parallel_config.local_world_size = cfg.parallel_config.decode_context_parallel_size = 4
+    cfg.model_config = NS(use_mla=True, enforce_eager=False, hf_text_config=NS(index_topk=2048))
+    return cfg
+
+
+@pytest.mark.parametrize("world", [2, 4, 8])
+def test_independent_dcp_budget_is_global_query_rows_not_sharded_kv(dcp_config, world, monkeypatch):
+    cfg = dcp_config
+    cfg.parallel_config.tensor_parallel_size = cfg.parallel_config.local_world_size = world
+    cfg.parallel_config.decode_context_parallel_size = world
+    assert API["decoder_recovery_budget"](cfg) == 32
+    assert cfg.scheduler_config.max_num_batched_tokens == 4096
+    monkeypatch.setenv("VLLM_ASCEND_SFA_INDEPENDENT_DP", "0")
+    assert API["decoder_recovery_budget"](cfg) is None  # Coordinated DCP is unchanged.
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "tp",
+        "local",
+        "pcp",
+        "pp",
+        "dbo",
+        "backend",
+        "nodes",
+        "elastic",
+        "producer",
+        "mla",
+        "indexer",
+        "eager",
+        "SFA_FULL_GRAPH",
+        "DSA_UNBUNDLE",
+        "DSA_TWO_GROUPS",
+        "LAYERWISE_PREFILL_P_NODE",
+    ],
+)
+def test_unsupported_dcp_recovery_preserves_original_budget(dcp_config, monkeypatch, case):
+    cfg = dcp_config
+    if case in ("tp", "local", "pcp", "pp", "dbo"):
+        field = dict(
+            tp="tensor_parallel_size",
+            local="local_world_size",
+            pcp="prefill_context_parallel_size",
+            pp="pipeline_parallel_size",
+            dbo="enable_dbo",
+        )[case]
+        setattr(cfg.parallel_config, field, True if case == "dbo" else 2)
+    elif case == "producer":
+        cfg.kv_transfer_config.is_kv_consumer = False
+    elif case == "backend":
+        cfg.parallel_config.distributed_executor_backend = "external_launcher"
+    elif case == "nodes":
+        cfg.parallel_config.nnodes_within_dp = 2
+    elif case == "elastic":
+        cfg.parallel_config.enable_elastic_ep = True
+    elif case == "mla":
+        cfg.model_config.use_mla = False
+    elif case == "indexer":
+        del cfg.model_config.hf_text_config.index_topk
+    elif case == "eager":
+        cfg.model_config.enforce_eager = True
+    else:
+        monkeypatch.setenv("VLLM_ASCEND_" + case, "true" if case == "LAYERWISE_PREFILL_P_NODE" else "0")
+    assert API["decoder_recovery_budget"](cfg) is None
 
 
 @pytest.mark.parametrize("case", ["parallel_drafting", "draft_model", "unpadded", "pipeline"])

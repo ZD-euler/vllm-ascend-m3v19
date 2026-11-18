@@ -510,10 +510,8 @@ class NPUWorker(WorkerBase):
             raise ValueError("Decoder DCP retrieval overlap requires full SFA graphs with shared resident plans")
         if envs_ascend.VLLM_ASCEND_SFA_ASYNC_MTP_PREP and (not full_graph or spec is None):
             raise ValueError("Decoder DCP async MTP preparation requires full SFA graphs and one MTP draft token")
-        if envs_ascend.VLLM_ASCEND_SFA_INDEPENDENT_DP or (
-            parallel.data_parallel_size > 1 and parallel.distributed_executor_backend == "external_launcher"
-        ):
-            raise ValueError("Decoder DCP currently requires coordinated internal DP")
+        if parallel.data_parallel_size > 1 and parallel.distributed_executor_backend == "external_launcher":
+            raise ValueError("Decoder DCP requires internal DP execution")
         if (
             self.cache_config.block_size != 128 or parallel.cp_kv_cache_interleave_size != 128
             or self.cache_dtype not in (torch.float16, torch.bfloat16) or self.cache_dtype != model.dtype

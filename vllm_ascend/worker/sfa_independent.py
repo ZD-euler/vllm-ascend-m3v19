@@ -14,6 +14,9 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
+from vllm_ascend import envs
+from vllm_ascend.core.mc2_recovery import independent_decoder_dcp
+
 
 def _mapped_file_identity(fd: int) -> tuple[int, int, int]:
     """Read the opened file's backing identity without relying on overlay stat IDs."""
@@ -78,13 +81,14 @@ def topology_reason(config: Any) -> str:
             for name in (
                 "pipeline_parallel_size",
                 "prefill_context_parallel_size",
-                "decode_context_parallel_size",
             )
         )
         or parallel.enable_dbo
         or getattr(parallel, "enable_elastic_ep", False)
     ):
-        return "requires fixed PP=PCP=DCP=1 without DBO"
+        return "requires fixed PP=PCP=1 without DBO"
+    if parallel.decode_context_parallel_size != 1 and not independent_decoder_dcp(config):
+        return "requires the local decoder DCP=TP full-SFA layout"
     if spec is not None and (
         spec.num_speculative_tokens != 1
         or spec.method not in ("mtp", "deepseek_mtp")
@@ -142,6 +146,37 @@ def execution_contract(runner: Any) -> dict[str, Any]:
         return dict(reason="device MC2 ABI has not been qualified for this mode")
     capacity = get_mc2_tokens_capacity()
     tp, ep = get_tp_group(), get_ep_group()
+    dcp_layout = None
+    if config.parallel_config.decode_context_parallel_size > 1:
+        from vllm.distributed import get_dcp_group
+
+        dcp = get_dcp_group()
+        if (
+            not getattr(runner, "dsa_decoder_dcp", False)
+            or runner.use_cp
+            or device != AscendDeviceType.A2
+            or dcp.world_size != tp.world_size
+            or list(dcp.ranks) != list(tp.ranks)
+            or dcp.rank_in_group != tp.rank_in_group
+            or dcp.world_size != config.parallel_config.decode_context_parallel_size
+        ):
+            return dict(reason="loaded decoder DCP layout/membership differs from TP")
+        # Absolute TP/DCP ranks differ across replicas; record their common
+        # geometry, after checking the actual rank ordering above.
+        dcp_layout = dict(
+            size=dcp.world_size,
+            interleave=config.parallel_config.cp_kv_cache_interleave_size,
+            block_size=config.cache_config.block_size,
+            policy=config._dsa_decoder_dcp_policy,
+            hccl_mode=os.environ.get("HCCL_OP_EXPANSION_MODE", "").strip().upper(),
+            task_queue=os.environ.get("TASK_QUEUE_ENABLE", ""),
+            host=envs.VLLM_ASCEND_DCP_HCCL_HOST,
+            early_gather=envs.VLLM_ASCEND_SFA_DCP_EARLY_GATHER,
+            query_first=envs.VLLM_ASCEND_SFA_DCP_QUERY_FIRST,
+            prefetch_after_pack=envs.VLLM_ASCEND_SFA_DCP_PREFETCH_AFTER_PACK,
+            shared_plan=envs.VLLM_ASCEND_SFA_SHARED_RESIDENT_PLAN,
+            retrieval_overlap=envs.VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP,
+        )
     dispatcher = getattr(get_moe_comm_method(MoECommType.MC2), "token_dispatcher", None)
     global_bs = math.ceil(capacity / tp.world_size) * ep.world_size
     if (
@@ -194,6 +229,19 @@ def execution_contract(runner: Any) -> dict[str, Any]:
         Path(__file__).parents[1] / "ops/fused_moe/fused_moe.py",
         Path(__file__).parents[1] / "ops/fused_moe/token_dispatcher.py",
         Path(__file__).parents[1] / "ops/fused_moe/prepare_finalize.py",
+        *(
+            [
+                Path(__file__).parents[1] / path
+                for path in (
+                    "core/mc2_recovery.py",
+                    "ops/triton/sfa_dcp.py",
+                    "ops/triton/sfa_query.py",
+                    "compilation/sfa_retrieval_overlap.py",
+                )
+            ]
+            if dcp_layout is not None
+            else []
+        ),
     ):
         sources[file.name] = hashlib.sha256(file.read_bytes()).hexdigest()
     contract = dict(
@@ -225,6 +273,7 @@ def execution_contract(runner: Any) -> dict[str, Any]:
         async_scheduling=config.scheduler_config.async_scheduling,
         additional_config=config.additional_config,
         token_layout=(enable_sp(config), enable_dsa_cp(), shared_expert_dp_enabled(), enable_dsa_cp_decoder()),
+        dcp_layout=dcp_layout,
         hccl_buffer_mb=int(os.environ.get("HCCL_BUFFSIZE", "200")),
         mc2_abi="dispatch/combine_v2;common_global_bs;no_active_mask;default_comm_alg",
     )

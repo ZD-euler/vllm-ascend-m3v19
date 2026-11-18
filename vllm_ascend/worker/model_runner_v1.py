@@ -1298,7 +1298,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             and 0 < recovery_budget <= get_mc2_tokens_capacity()
             and needs_mc2(recovery_budget)
             and self.pcp_size == 1
-            and self.dcp_size == 1
+            and (self.dcp_size == 1 or getattr(self, "dsa_decoder_dcp", False))
             and self.parallel_config.pipeline_parallel_size == 1
             and not self.parallel_config.enable_dbo
             and not getattr(getattr(self, "drafter", None), "needs_extra_input_slots", False)

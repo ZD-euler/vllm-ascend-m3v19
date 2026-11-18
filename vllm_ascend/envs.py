@@ -272,7 +272,8 @@ env_variables: dict[str, Callable[[], Any]] = {
     # 0 (default): existing protocol; 1: qualified MP TP x DP. Non-sensitive; restart required.
     "VLLM_ASCEND_SFA_SINGLE_AGREEMENT": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_SINGLE_AGREEMENT", "0"))),
     # Experimental independent DP graph buckets with CPU guardian supervision.
-    # 0 (default): unchanged path; 1: qualified MC2 full-SFA MP cohorts only.
+    # 0 (default): unchanged path; 1: qualified MC2 full-SFA MP cohorts only,
+    # including validated local decoder DCP=TP on A2. DP must exceed one.
     # Mutually exclusive with SINGLE_AGREEMENT; non-sensitive, restart required.
     "VLLM_ASCEND_SFA_INDEPENDENT_DP": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_INDEPENDENT_DP", "0"))),
     # Guardian liveness lease in seconds, [2, 86400]; default 30. This is

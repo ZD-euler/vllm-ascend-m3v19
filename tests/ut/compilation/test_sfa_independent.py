@@ -239,6 +239,121 @@ def test_startup_contract_checks_every_target_and_draft_extent(contract_runner):
     assert calls == [(n, draft) for draft in (False, True) for n in range(1, 33)]
 
 
+@pytest.fixture
+def dcp_contract_runner(contract_runner, monkeypatch):
+    runner, modules, calls = contract_runner
+    config = runner.vllm_config
+    parallel = config.parallel_config
+    parallel.decode_context_parallel_size = parallel.local_world_size = parallel.tensor_parallel_size
+    parallel.cp_kv_cache_interleave_size = 128
+    config.model_config.use_mla, config.model_config.enforce_eager = True, False
+    config.model_config.hf_text_config.index_topk = 2048
+    config.kv_transfer_config = NS(is_kv_consumer=True)
+    config.cache_config = NS(block_size=128)
+    config._dsa_decoder_dcp_policy = (4096, 0)
+    runner.dsa_decoder_dcp, runner.use_cp = True, False
+    tp = NS(world_size=4, ranks=[0, 1, 2, 3], rank_in_group=0)
+    dcp = NS(**vars(tp))
+    modules["vllm.distributed"].get_tp_group = lambda: tp
+    modules["vllm.distributed"].get_dcp_group = lambda: dcp
+    modules["vllm_ascend.utils"].get_ascend_device_type = lambda: "A2"
+    for name in ("SFA_INDEPENDENT_DP", "SFA_FULL_GRAPH", "DSA_UNBUNDLE", "DSA_TWO_GROUPS"):
+        monkeypatch.setenv("VLLM_ASCEND_" + name, "1")
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "false")
+    for name in ("DCP_HCCL_HOST", "SFA_DCP_EARLY_GATHER", "SFA_DCP_QUERY_FIRST", "SFA_DCP_PREFETCH_AFTER_PACK"):
+        monkeypatch.setenv("VLLM_ASCEND_" + name, "0")
+    return runner, modules, tp, dcp
+
+
+def test_dcp_contract_uses_replica_relative_geometry(dcp_contract_runner):
+    runner, _, tp, dcp = dcp_contract_runner
+    first = independent.execution_contract(runner)
+    assert len(first["digest"]) == 64 and first["capacity"] == 32
+    tp.ranks = dcp.ranks = [4, 5, 6, 7]
+    tp.rank_in_group = dcp.rank_in_group = 3
+    assert independent.execution_contract(runner) == first
+
+
+@pytest.mark.parametrize("case", ["unvalidated", "cp", "device", "order", "rank", "world"])
+def test_dcp_contract_rejects_unvalidated_or_misaligned_layout(dcp_contract_runner, case):
+    runner, modules, tp, dcp = dcp_contract_runner
+    if case == "unvalidated":
+        runner.dsa_decoder_dcp = False
+    elif case == "cp":
+        runner.use_cp = True
+    elif case == "device":
+        modules["vllm_ascend.utils"].get_ascend_device_type = lambda: "A3"
+    elif case == "order":
+        dcp.ranks = list(reversed(tp.ranks))
+    elif case == "rank":
+        dcp.rank_in_group = 1
+    else:
+        dcp.world_size = 2
+    result = independent.execution_contract(runner)
+    assert "DCP layout/membership" in result["reason"] and "digest" not in result
+
+
+@pytest.mark.parametrize(
+    "name", ["DCP_HCCL_HOST", "SFA_DCP_EARLY_GATHER", "SFA_DCP_QUERY_FIRST", "SFA_DCP_PREFETCH_AFTER_PACK"]
+)
+def test_dcp_communication_schedule_changes_contract(dcp_contract_runner, monkeypatch, name):
+    runner, *_ = dcp_contract_runner
+    first = independent.execution_contract(runner)
+    monkeypatch.setenv("VLLM_ASCEND_" + name, "1")
+    assert independent.execution_contract(runner)["digest"] != first["digest"]
+
+
+@pytest.mark.parametrize(
+    "name,before,after", [("HCCL_OP_EXPANSION_MODE", "AIV", "HOST"), ("TASK_QUEUE_ENABLE", "1", "0")]
+)
+def test_dcp_runtime_mode_changes_contract(dcp_contract_runner, monkeypatch, name, before, after):
+    runner, *_ = dcp_contract_runner
+    monkeypatch.setenv(name, before)
+    first = independent.execution_contract(runner)
+    monkeypatch.setenv(name, after)
+    assert independent.execution_contract(runner)["digest"] != first["digest"]
+
+
+def test_independent_dcp_idle_clears_local_kv_and_request_ownership():
+    clear = extract(RUNNER, "_clear_sfa_idle_metadata", {})
+    dcp = NS(local_seq_lens=torch.tensor([128, 256]), row_requests=torch.tensor([0, 0, 1, 1]))
+    metadata = NS(sfa_dcp=dcp, slot_mapping=torch.tensor([129, 257]), indexer_slot_mapping=torch.tensor([384, 512]))
+    clear(metadata)
+    assert dcp.local_seq_lens.tolist() == [0, 0]
+    assert dcp.row_requests.tolist() == [-1] * 4
+    assert metadata.slot_mapping.tolist() == metadata.indexer_slot_mapping.tolist() == [-1, -1]
+
+
+@pytest.mark.parametrize("filename", ["mc2_recovery.py", "sfa_dcp.py", "sfa_query.py", "sfa_retrieval_overlap.py"])
+def test_dcp_source_changes_contract(dcp_contract_runner, monkeypatch, filename):
+    runner, *_ = dcp_contract_runner
+    first = independent.execution_contract(runner)
+    original = Path.read_bytes
+    monkeypatch.setattr(
+        Path, "read_bytes", lambda path: b"different build" if path.name == filename else original(path)
+    )
+    assert independent.execution_contract(runner)["digest"] != first["digest"]
+
+
+@pytest.mark.parametrize("case", ["disabled", "tp", "local", "prefiller", "generic", "pcp", "dbo"])
+def test_dcp_startup_topology_is_restricted_to_decoder_layout(dcp_contract_runner, monkeypatch, case):
+    runner, *_ = dcp_contract_runner
+    config = runner.vllm_config
+    assert independent.topology_reason(config) == ""
+    if case == "disabled":
+        monkeypatch.setenv("VLLM_ASCEND_SFA_INDEPENDENT_DP", "0")
+    elif case == "prefiller":
+        config.kv_transfer_config.is_kv_consumer = False
+    elif case == "generic":
+        del config.model_config.hf_text_config.index_topk
+    else:
+        field = dict(
+            tp="tensor_parallel_size", local="local_world_size", pcp="prefill_context_parallel_size", dbo="enable_dbo"
+        )[case]
+        setattr(config.parallel_config, field, True if case == "dbo" else 2)
+    assert independent.topology_reason(config)
+
+
 @pytest.mark.parametrize(
     "case", ["hierarchy", "missing_combine", "draft_tp", "recovery", "graph_capacity", "middle_extent", "other_runner"]
 )
@@ -431,10 +546,11 @@ def test_backing_identity_tracks_open_file_across_path_replacement(tmp_path):
 
 
 @pytest.mark.parametrize("entry", ["idle", "graph", "native"])
-def test_actual_ascend_draft_entry_reaches_local_policy_once(monkeypatch, entry):
+@pytest.mark.parametrize("dcp_size", [1, 4, 8])
+def test_actual_ascend_draft_entry_reaches_local_policy_once(monkeypatch, entry, dcp_size):
     instance, calls = policy(monkeypatch)
     sync = extract(RUNNER, "_sync_metadata_across_dp", {})
-    runner = NS(dp_size=4, _sfa_independent=instance, input_batch=NS(num_reqs=3))
+    runner = NS(dp_size=4, _sfa_independent=instance, input_batch=NS(num_reqs=3), use_cp=False)
 
     class ReachedDeviceBoundary(Exception):
         pass
@@ -457,7 +573,7 @@ def test_actual_ascend_draft_entry_reaches_local_policy_once(monkeypatch, entry)
             runner=runner,
             method="mtp",
             pcp_size=1,
-            dcp_size=1,
+            dcp_size=dcp_size,
             use_staged_mtp_draft_graph=entry == "graph",
             use_cuda_graph=False,
             set_inputs_first_pass=lambda **kwargs: (3, None, metadata, None),
