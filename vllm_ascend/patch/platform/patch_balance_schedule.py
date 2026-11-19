@@ -365,6 +365,10 @@ class BalanceScheduler(Scheduler):
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
 
+                if num_computed_tokens < getattr(request, "min_kv_prefix_tokens", 0):
+                    self._finish_kv_admission_error(request, num_computed_tokens)
+                    continue
+
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
