@@ -425,7 +425,8 @@ class LMCacheSelectedKVSource:
         self._get_device_ptr_fn = ptr_fn
         self._dva_cache: dict[tuple[int, int], int] = {}
 
-        bases_shape = (self.num_layers, domain, 2)
+        padded_domain = ((domain + 3) // 4) * 4
+        bases_shape = (self.num_layers, padded_domain, 2)
         self._metadata_stream = torch.npu.Stream(device=dev)
         self._host_bases: Tensor | None = torch.zeros(bases_shape, dtype=torch.int64, pin_memory=dev.type != "cpu")
         with torch.npu.stream(self._metadata_stream):
@@ -632,10 +633,13 @@ class LMCacheSelectedKVSource:
             return
 
         def unwrap_event(entry: Any) -> Any:
-            return entry[1] if isinstance(entry, tuple) and len(entry) >= 2 else entry
+            return (entry[1] if len(entry) >= 2 else None) if isinstance(entry, tuple) else entry
 
         state_fn = getattr(self.gpu_connector, "_layerwise_prefill_transfer_state", None)
         state = state_fn() if callable(state_fn) else None
+        generations = (
+            state[1] if isinstance(state, tuple) and len(state) >= 2 and isinstance(state[1], Mapping) else None
+        )
         load_done = state[3] if isinstance(state, tuple) and len(state) >= 4 and isinstance(state[3], Mapping) else {}
         bank_tails = getattr(self.gpu_connector, "_layerwise_prefill_bank_tail_events", None)
 
@@ -643,8 +647,16 @@ class LMCacheSelectedKVSource:
             layer_loads = load_done.get((0, lid))
             events = [unwrap_event(entry) for entry in layer_loads.values()] if isinstance(layer_loads, Mapping) else []
             if isinstance(bank_tails, Mapping):
-                tail_entry = bank_tails.get((0, lid % self.num_banks))
-                if tail_entry is not None:
+                bank_key = (0, lid % self.num_banks)
+                tail_entry = bank_tails.get(bank_key)
+                gen0 = generations.get(bank_key, generations.get(0)) if generations is not None else None
+                if tail_entry is not None and not (
+                    isinstance(tail_entry, tuple)
+                    and (
+                        len(tail_entry) < 2
+                        or (type(gen0) is int and type(tail_entry[0]) is int and tail_entry[0] != gen0)
+                    )
+                ):
                     events.append(unwrap_event(tail_entry))
             with step._lock:
                 if step._failed or step._closed or lid in step._slot_events:
@@ -806,11 +818,14 @@ class LMCacheSelectedKVSource:
         self._unretired_steps.clear()
 
         active_domain = max((max(om | kp, default=0) + 1 for om, kp in zip(omitted_by_bank, kept_by_bank)), default=1)
-        step_shape = (self.num_layers, active_domain, 2)
-        step_elems = self.num_layers * active_domain * 2
+        stride_domain = ((active_domain + 3) // 4) * 4
+        step_shape = (self.num_layers, stride_domain, 2)
+        step_elems = self.num_layers * stride_domain * 2
         self._step_host = cast(Tensor, self._host_bases).view(-1)[:step_elems].view(step_shape).zero_()
         self._step_dev = cast(Tensor, self._dev_bases).view(-1)[:step_elems].view(step_shape)
-        step = LMCacheSelectedLoadStep(self, meta, classified, tbls, omitted_by_bank, self._step_dev.view(torch.uint64))
+        step = LMCacheSelectedLoadStep(
+            self, meta, classified, tbls, omitted_by_bank, self._step_dev.view(torch.uint64)[:, :active_domain]
+        )
         self.step = step
         self._unretired_steps.append(step)
 

@@ -1317,6 +1317,123 @@ class SelectedKVUnitTest(unittest.TestCase):
             )
             step.finish(failed=True)
 
+    def test_domain_padding_alignment_and_tail_generation_filter(self) -> None:
+        nop = lambda *a, **k: None
+        with _fake_npu():
+            o_blk = _mk_obj(0x9000, 16384)
+
+            def _btg(*a, **k):
+                while True:
+                    yield
+
+            gc = SimpleNamespace(
+                _layerwise_prefill_bank_count=2,
+                batched_to_gpu=_btg,
+                release_layerwise_prefill_dma_cache=nop,
+                _layerwise_prefill_transfer_state=lambda: (None, {0: 5}, None, {}),
+                _layerwise_prefill_bank_tail_events={},
+            )
+            eng = SimpleNamespace(
+                gpu_connector=gc,
+                _prepare_shared_prefill_sources=lambda *a: None,
+                release_shared_cpu_sparse_request=nop,
+            )
+            ls = SimpleNamespace(can_load=True, lmcache_cached_tokens=16384, dsa_cold_compact_load=False)
+            cm = SimpleNamespace(
+                requests=[
+                    SimpleNamespace(
+                        req_id="r_cur",
+                        is_decode_window_save=False,
+                        block_allocation_mode="prefill_child",
+                        load_spec=ls,
+                    )
+                ]
+            )
+            impl = SimpleNamespace(
+                lmcache_engine=eng,
+                _submit_initial_layerwise_prefill_load=nop,
+                submit_layerwise_prefill_load=nop,
+                _parent=SimpleNamespace(
+                    _get_connector_metadata=lambda: cm,
+                    _kv_transfer_config=SimpleNamespace(kv_role="kv_producer"),
+                ),
+            )
+
+            def _st(_):
+                g = gc.batched_to_gpu([0], [16384], req_id="r_cur", kv_group=0)
+                next(g)
+                g.send([o_blk])
+                g.send([o_blk])
+
+            impl.start_load_kv = _st
+            mc = {n: (torch.empty((517, 1, 1, 1)),) * 2 for n in ("l0", "l1")}
+            npu_m = SimpleNamespace(bind_incremental_copy_addresses=nop, BoundCopyPrefix=nop)
+            src = lms.LMCacheSelectedKVSource(
+                SimpleNamespace(device="cpu"),
+                impl,
+                ("l0", "l1"),
+                mc,
+                get_device_ptr_fn=lambda p, _: p + 0x100000,
+                npu_connectors_module=npu_m,
+            )
+            self.assertEqual(src._host_bases.shape[1], 520)
+
+            # Use max block id 512 so active_domain == 513 (non-multiple of 4) -> stride_domain == 516
+            tbl0 = np.arange(384, 513, dtype=np.int32)[None, :]  # max id 512 -> active_domain 513
+            tbl1 = np.arange(130, 259, dtype=np.int32)[None, :]
+            src.begin_runner_step(cm, ("r_cur",), (16384,), (0, 16), (tbl0, tbl1))
+            impl.start_load_kv(None)
+            step = src.step
+            self.assertIsNotNone(step)
+            self.assertEqual(src._step_host.shape[1], 516)
+            pb0, pb1 = step.page_bases("l0"), step.page_bases("l1")
+            self.assertEqual((tuple(pb0.shape), tuple(pb1.shape)), ((513, 2), (513, 2)))
+            self.assertTrue(pb0.is_contiguous() and pb1.is_contiguous())
+            diff = pb1.data_ptr() - pb0.data_ptr()
+            self.assertEqual((diff % 64, diff), (0, 516 * 16))
+
+            # (b) Stale generation tail event filtered; matching generation waited; () and (True, ev) do not crash
+            ev_stale, ev_curr, ev_bool = torch.npu.Event(), torch.npu.Event(), torch.npu.Event()
+            gc._layerwise_prefill_bank_tail_events = {
+                (0, 0): (4, ev_stale, 0, "r_old"),
+                (0, 1): (5, ev_curr, 0, "r_cur"),
+            }
+            step._slot_events.clear()
+            src._mark_slots_ready([0, 1])
+            st0, st1 = _mk_stream(20), _mk_stream(21)
+            step.wait_main_slot_ready("l0", st0)
+            step.wait_main_slot_ready("l1", st1)
+            self.assertEqual((st0.waited, st1.waited), ([], [ev_curr]))
+
+            gc._layerwise_prefill_bank_tail_events = {(0, 0): (), (0, 1): (True, ev_bool)}
+            step._slot_events.clear()
+            step._waited_streams.clear()
+            src._mark_slots_ready([0, 1])
+            step.wait_main_slot_ready("l0", st0)
+            step.wait_main_slot_ready("l1", st1)
+            self.assertEqual((st0.waited, step._slot_events[0]), ([], ()))
+            self.assertIn(ev_bool, st1.waited)
+
+            # Per-bank generation priority: (0, 1): 6 overrides fallback 0: 5
+            ev0, ev1, ev2 = torch.npu.Event(), torch.npu.Event(), torch.npu.Event()
+            gc._layerwise_prefill_transfer_state = lambda: (None, {(0, 1): 6, 0: 5}, None, {})
+            gc._layerwise_prefill_bank_tail_events = {(0, 0): (5, ev0), (0, 1): (5, ev1)}
+            step._slot_events.clear()
+            step._waited_streams.clear()
+            st0.waited.clear()
+            st1.waited.clear()
+            src._mark_slots_ready([0, 1])
+            step.wait_main_slot_ready("l0", st0)
+            step.wait_main_slot_ready("l1", st1)
+            self.assertEqual((st0.waited, st1.waited), ([ev0], []))
+            gc._layerwise_prefill_bank_tail_events = {(0, 1): (6, ev2)}
+            step._slot_events.pop(1, None)
+            step._waited_streams.clear()
+            src._mark_slots_ready([1])
+            step.wait_main_slot_ready("l1", st1)
+            self.assertEqual(st1.waited, [ev2])
+            step.finish(failed=True)
+
 
 if __name__ == "__main__":
     unittest.main()

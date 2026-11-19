@@ -10,7 +10,7 @@ extern "C" __global__ __aicore__ void sparse_prefill_partition_finish_fixed(
     AscendC::TPipe pipe;
     {
         SparsePrefillPlan::PartitionUnion op;
-        op.Init(lists, descriptors, membership, counters, history, query, width, pipe, query > SparsePrefillLocal::SHORT_QUERY_ROWS);
+        op.Init(lists, descriptors, membership, counters, history, query, width, pipe);
         op.Process();
     }
     AscendC::SyncAll();
@@ -24,7 +24,7 @@ extern "C" __global__ __aicore__ void sparse_prefill_partition_finish_fixed(
     pipe.Reset();
     {
         SparsePrefillBitmap::FinishSortedBitmap op;
-        op.Init(groups, bitmap, sources, lengths, query, capacity, pipe);
+        op.Init(groups, bitmap, sources, lengths, query, width, capacity, pipe);
         op.Process();
     }
     AscendC::SyncAll();

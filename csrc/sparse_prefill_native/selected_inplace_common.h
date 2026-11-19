@@ -43,6 +43,12 @@ __aicore__ inline void BindGm(GlobalTensor<T>& g, GM_ADDR p) {
     g.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(p));
 }
 
+template <class T>
+__aicore__ inline T LoadGmScalar(GlobalTensor<T>& g, uint64_t idx) {
+    DataCacheCleanAndInvalid<T, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(g[idx]);
+    return g.GetValue(idx);
+}
+
 __aicore__ inline uint32_t HistoryPages(uint32_t history) {
     return (history + PAGE_ROWS - 1U) / PAGE_ROWS;
 }
@@ -142,8 +148,8 @@ __aicore__ inline RowState ResolveCopyRow(
         col = c;
         page = p;
         const uint64_t idx = static_cast<uint64_t>(static_cast<uint32_t>(p)) * 2U;
-        b0 = pages.GetValue(idx);
-        b1 = pages.GetValue(idx + 1U);
+        b0 = LoadGmScalar(pages, idx);
+        b1 = LoadGmScalar(pages, idx + 1U);
     }
     const auto st = DecodeMlaRow(id, static_cast<uint32_t>(h), page, sp, dp, b0, b1, out);
     ASSERT_MSG(st != RowState::Invalid, "Invalid selected row address");
@@ -156,14 +162,17 @@ __aicore__ inline SliceState LoadRequestSlice(
     GlobalTensor<int32_t>& selection, LocalTensor<int32_t>& localTable, LocalTensor<int32_t>& localIds,
     int32_t& hOut, uint32_t& beginOut, uint32_t& endOut
 ) {
-    const int32_t row = meta.GetValue(r * 4U), h = meta.GetValue(r * 4U + 1U);
-    const int32_t qStart = meta.GetValue(r * 4U + 2U), query = meta.GetValue(r * 4U + 3U), cnt = state.GetValue(r * 8U);
+    const int32_t row = LoadGmScalar(meta, r * 4U), h = LoadGmScalar(meta, r * 4U + 1U);
+    const int32_t qStart = LoadGmScalar(meta, r * 4U + 2U), query = LoadGmScalar(meta, r * 4U + 3U);
+    const int32_t cnt = LoadGmScalar(state, r * 8U);
     const bool valid =
         row >= 0 && static_cast<uint32_t>(row) < tRows &&
         h > 0 && h <= MAX_HISTORY && HistoryPages(static_cast<uint32_t>(h)) <= tCols &&
         query > 0 && query <= MAX_BATCHED_TOKENS && qStart >= 0 && qStart <= MAX_BATCHED_TOKENS - query &&
         cnt >= 0 && static_cast<uint32_t>(cnt) <= cap && cnt <= h &&
-        state.GetValue(r * 8U + 1U) == query && state.GetValue(r * 8U + 3U) == 0 && state.GetValue(r * 8U + 4U) == 0;
+        LoadGmScalar(state, r * 8U + 1U) == query &&
+        LoadGmScalar(state, r * 8U + 3U) == 0 &&
+        LoadGmScalar(state, r * 8U + 4U) == 0;
     ASSERT_MSG(valid, "Invalid selected copy metadata or union status");
     if (!valid) {
         return SliceState::Abort;

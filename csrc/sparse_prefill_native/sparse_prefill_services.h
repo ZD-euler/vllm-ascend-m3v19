@@ -39,6 +39,12 @@ __aicore__ inline void BindGm(GlobalTensor<T>& g, GM_ADDR p) {
     g.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(p));
 }
 
+template <class T>
+__aicore__ inline T LoadGmScalar(GlobalTensor<T>& g, uint64_t idx) {
+    DataCacheCleanAndInvalid<T, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(g[idx]);
+    return g.GetValue(idx);
+}
+
 template <class D, class A, class B>
 __aicore__ inline void BitAnd(D d, A a, B b, uint32_t u16s) {
     And(d.template ReinterpretCast<uint16_t>(), a.template ReinterpretCast<uint16_t>(), b.template ReinterpretCast<uint16_t>(), u16s);
@@ -130,7 +136,7 @@ __aicore__ inline void StoreMeta8(GlobalTensor<int32_t> gm, LocalTensor<int32_t>
 struct PartitionUnion {
     __aicore__ inline void Init(
         GM_ADDR lists, GM_ADDR cohorts, GM_ADDR membership, GM_ADDR counters,
-        uint32_t, uint32_t query, uint32_t width, TPipe& pipe, bool adaptive
+        uint32_t, uint32_t query, uint32_t width, TPipe& pipe
     ) {
         BindGm(listsGm, lists);
         BindGm(cohortsGm, cohorts);
@@ -139,7 +145,6 @@ struct PartitionUnion {
         cohorts_ = (query + COHORT_ROWS - 1U) / COHORT_ROWS;
         width_ = width;
         base_ = GetBlockIdx();
-        adaptive_ = adaptive;
         pipe.InitBuffer(bitmapBuf, MAX_PARTITION * 4U);
         pipe.InitBuffer(inputBuf, CHUNK * 4U);
         pipe.InitBuffer(compactBuf, CHUNK * 4U);
@@ -149,22 +154,6 @@ struct PartitionUnion {
     }
 
     __aicore__ inline void Process() {
-        bool runs = !adaptive_;
-        if (adaptive_ && cohorts_ >= CORES && cohorts_ % CORES <= 1U) {
-            auto modes = cohortBuf.Get<int32_t>();
-            DataCopy(modes, cohortsGm, {static_cast<uint16_t>(CORES), 1U, static_cast<uint16_t>(cohorts_ / CORES - 1U), 0U});
-            Fence<HardEvent::MTE2_S>();
-            for (uint32_t c = 0U; c < CORES && !runs; ++c) {
-                runs = modes.GetValue(c * COUNTER_STRIDE + 4U) != 0;
-            }
-            Fence<HardEvent::S_MTE2>();
-        } else if (adaptive_) {
-            for (uint32_t c = 0U; c < CORES && !runs; ++c) {
-                const uint32_t f = cohorts_ * c / CORES, l = cohorts_ * (c + 1U) / CORES;
-                runs = f != l && cohortsGm.GetValue(f * COUNTER_STRIDE + 4U) != 0;
-            }
-        }
-
         auto bitmap = bitmapBuf.Get<float>(), floats = compactBuf.Get<float>();
         auto input = inputBuf.Get<int32_t>(), compact = compactBuf.Get<int32_t>(), cohort = cohortBuf.Get<int32_t>();
         auto mask = maskBuf.Get<uint8_t>(), other = mask[MASK_BYTES];
@@ -186,11 +175,10 @@ struct PartitionUnion {
                 if (listCount == 0U) {
                     continue;
                 }
-                const uint64_t srcBegin = runs ? static_cast<uint32_t>(cohort.GetValue(local * COUNTER_STRIDE + 3U))
-                                               : static_cast<uint64_t>(base + local) * COHORT_SIZE;
+                const uint64_t srcBegin = static_cast<uint32_t>(cohort.GetValue(local * COUNTER_STRIDE + 3U));
                 for (uint32_t chunk = 0U; chunk < listCount; chunk += CHUNK) {
                     const uint32_t rem = listCount - chunk;
-                    const uint32_t count = runs && rem >= CHUNK ? CHUNK : (runs ? rem : listCount);
+                    const uint32_t count = rem >= CHUNK ? CHUNK : rem;
                     const uint32_t aligned = (count + 63U) / 64U * 64U;
                     DataCopyPad(input, listsGm[srcBegin + chunk], {1, count * 4U, 0, 0, 0}, {false, 0, 0, 0});
                     Fence<HardEvent::MTE2_S>();
@@ -211,9 +199,8 @@ struct PartitionUnion {
                     for (uint32_t i = 0U; i < n; ++i) {
                         bitmap.SetValue(static_cast<uint32_t>(compact.GetValue(i)) / CORES, 1.0F);
                     }
-                    if (!runs) {
-                        break;
-                    }
+                    Fence<HardEvent::V_MTE2>();
+                    Fence<HardEvent::S_MTE2>();
                 }
             }
         }
@@ -227,7 +214,6 @@ struct PartitionUnion {
     GlobalTensor<int32_t> listsGm, cohortsGm, membershipGm, countersGm;
     TBuf<QuePosition::VECCALC> bitmapBuf, inputBuf, compactBuf, maskBuf, counterBuf, cohortBuf;
     uint32_t cohorts_, width_, base_;
-    bool adaptive_;
 };
 
 } // namespace SparsePrefillPlan
@@ -312,7 +298,6 @@ struct LocalQueryUnion {
                 accCount_ = count;
                 continue;
             }
-            mergedLayout_ = true;
             MergeSortedRuns(work, acc, inc, accCount_, count);
             accCount_ = Deduplicate(work, acc, inc, accCount_ + count);
         }
@@ -329,15 +314,6 @@ struct LocalQueryUnion {
             DataCopy(descriptorsGm[g * COUNTER_STRIDE], state, COUNTER_STRIDE);
         }
         Fence<HardEvent::MTE3_S>();
-
-        if (adaptive_) {
-            DataCopy(state, descriptorsGm[first_ * COUNTER_STRIDE], COUNTER_STRIDE);
-            Fence<HardEvent::MTE2_S>();
-            state.SetValue(4U, mergedLayout_ ? 1 : 0);
-            Fence<HardEvent::S_MTE3>();
-            DataCopy(descriptorsGm[first_ * COUNTER_STRIDE], state, COUNTER_STRIDE);
-            Fence<HardEvent::MTE3_S>();
-        }
     }
 
     __aicore__ inline uint32_t ReadPair(uint32_t group) {
@@ -346,6 +322,10 @@ struct LocalQueryUnion {
         auto raw = input[count].ReinterpretCast<int32_t>();
         auto live = maskBuf.Get<uint8_t>(), other = live[MASK_BYTES], bad = live[MASK_BYTES * 2U], extra = live[MASK_BYTES * 3U];
 
+        if (group != first_) {
+            Fence<HardEvent::V_MTE2>();
+            Fence<HardEvent::S_MTE2>();
+        }
         DataCopyPad(raw, topkGm[static_cast<uint64_t>(row) * TOPK], {1, count * 4U, 0, 0, 0}, {false, 0, 0, 0});
         Fence<HardEvent::MTE2_V>();
         VCast(input, raw, RoundMode::CAST_NONE, count);
@@ -476,7 +456,7 @@ struct LocalQueryUnion {
     GlobalTensor<int32_t> topkGm, listsGm, descriptorsGm;
     TBuf<QuePosition::VECCALC> accBuf, workBuf, scratchBuf, maskBuf, stateBuf;
     uint32_t history_, query_, first_ = 0U, accCount_ = 0U, runs_ = 0U, packed_ = 0U, lastCount_ = 0U, lastOffset_ = 0U, error_ = 0U;
-    bool adaptive_ = false, mergedLayout_ = false;
+    bool adaptive_ = false;
 };
 
 } // namespace SparsePrefillLocal
@@ -568,7 +548,7 @@ struct BuildMembershipWords {
         Fence<HardEvent::V_S>();
 
         auto stats = countBuf.Get<int32_t>();
-        SetMeta8(stats, static_cast<int32_t>(constant.ReinterpretCast<float>().GetValue(0U)), residueGm.GetValue(GetBlockIdx() * 8U + 2U), static_cast<int32_t>(words_));
+        SetMeta8(stats, static_cast<int32_t>(constant.ReinterpretCast<float>().GetValue(0U)), LoadGmScalar(residueGm, GetBlockIdx() * 8U + 2U), static_cast<int32_t>(words_));
         Fence<HardEvent::S_MTE3>();
         DataCopy(bitmapGm[firstWord], bits, words_);
         DataCopy(groupsGm[GetBlockIdx() * 8U], stats, 8U);
@@ -583,14 +563,14 @@ struct BuildMembershipWords {
 };
 
 struct FinishSortedBitmap {
-    __aicore__ inline void Init(GM_ADDR groups, GM_ADDR bitmap, GM_ADDR sources, GM_ADDR lengths, uint32_t query, uint32_t capacity, TPipe& pipe) {
+    __aicore__ inline void Init(GM_ADDR groups, GM_ADDR bitmap, GM_ADDR sources, GM_ADDR lengths, uint32_t query, uint32_t width, uint32_t capacity, TPipe& pipe) {
         BindGm(groupsGm, groups);
         BindGm(bitmapGm, bitmap);
         BindGm(sourcesGm, sources);
         BindGm(lengthsGm, lengths);
         query_ = query;
         capacity_ = capacity;
-        words_ = static_cast<uint32_t>(groupsGm.GetValue(2U));
+        words_ = ((width + CORES - 1U) / CORES + 63U) / 64U * 64U;
         ASSERT_MSG(words_ >= 64U && words_ <= WORDS_PER_CORE && words_ % 64U == 0U, "Invalid compact bitmap extent");
         pipe.InitBuffer(bitsBuf, words_ * 4U);
         pipe.InitBuffer(inputBuf, 8192U * 4U);
