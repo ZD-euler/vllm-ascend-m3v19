@@ -566,7 +566,7 @@ typedef void (*ReleaseHugeMem)(void *, bool);
       workspace_addr = const_cast<void *>(workspace_tensor.storage().data()); \
     }                                                                         \
     auto acl_call = [converted_params, workspace_addr, workspace_size,        \
-                     workspace_tensor, acl_stream, executor]() -> int {       \
+                     acl_stream, executor]() -> int {                         \
       typedef int (*OpApiFunc)(void *, uint64_t, aclOpExecutor *,             \
                                const aclrtStream);                            \
       OpApiFunc opApiFunc = reinterpret_cast<OpApiFunc>(opApiFuncAddr);       \
