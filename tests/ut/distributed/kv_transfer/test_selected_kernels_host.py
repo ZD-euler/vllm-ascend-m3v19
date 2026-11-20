@@ -875,9 +875,7 @@ class SelectedKernelsHostTest(unittest.TestCase):
         # that side's split must fail the independent MrgSort stub guard.
         for left, right in ((4096, 1), (1, 4096)):
             with self.subTest(left=left, right=right):
-                self.assertEqual(
-                    self.lib.test_merge_sorted_runs(left, right), 0, self.lib.host_last_error().decode()
-                )
+                self.assertEqual(self.lib.test_merge_sorted_runs(left, right), 0, self.lib.host_last_error().decode())
 
     def test_union_pipeline_status_adaptive_bounds_overflow_and_error(self) -> None:
         def run(h: int, q: int, cap: int, rows, aon: int = 1):
