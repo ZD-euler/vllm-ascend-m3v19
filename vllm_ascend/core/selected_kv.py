@@ -95,6 +95,11 @@ class SelectedKVConfig:
         if not self.enabled:
             return
 
+        _check(
+            not bool(envs_ascend.VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD),
+            "Selected KV prefill cannot be combined with DSA latent offload",
+        )
+
         def collect_lmc_roles(spec: Any) -> list[bool]:
             if spec is None:
                 return [False]

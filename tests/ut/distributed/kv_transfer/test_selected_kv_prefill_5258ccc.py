@@ -121,6 +121,19 @@ def _mk_obj(ptr_base: int, tokens: int):
 
 
 class SelectedKVUnitTest(unittest.TestCase):
+    def test_selected_prefill_rejects_latent_offload(self) -> None:
+        with patch.dict(
+            envs_ascend.__dict__,
+            {
+                "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE": True,
+                "VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS": 2,
+                "VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD": True,
+            },
+        ):
+            with self.assertRaisesRegex(ValueError, "cannot be combined with DSA latent offload"):
+                skv.SelectedKVConfig(enabled=True).validate_deployment(_vcfg())
+            skv.SelectedKVConfig(enabled=False).validate_deployment(_vcfg())
+
     def test_config_gates_budget_classify_partition_dma_filter_and_mla_only(self) -> None:
         cfg = skv.SelectedKVConfig.from_dict({"enabled": True})
         kw = {"VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE": True, "VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS": 2}

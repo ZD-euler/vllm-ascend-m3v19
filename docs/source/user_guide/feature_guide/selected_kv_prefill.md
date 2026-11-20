@@ -43,6 +43,8 @@ native loading where needed.
   Target and draft passes share a deferred source lifetime.
 - Pipeline, prefill-context and decode-context parallel sizes must all be one.
   Encoder-decoder models, sleep mode, DBO and the v2 model runner are unsupported.
+- DSA latent offload must be disabled; it bypasses the attention path that
+  performs selected loads, so enabling both is rejected at startup.
 
 This is an opt-in prefill path. It does not enable decode full graph or main-KV
 INT8 storage, and weight quantization is independent of the KV dtype.
