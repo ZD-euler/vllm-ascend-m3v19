@@ -100,6 +100,11 @@ class SelectedKVConfig:
             "Selected KV prefill cannot be combined with DSA latent offload",
         )
 
+        _check(
+            not bool(envs_ascend.VLLM_ASCEND_DSA_USE_ADAPTER_CACHE),
+            "Selected KV prefill cannot be combined with DSA adapter cache",
+        )
+
         def collect_lmc_roles(spec: Any) -> list[bool]:
             if spec is None:
                 return [False]

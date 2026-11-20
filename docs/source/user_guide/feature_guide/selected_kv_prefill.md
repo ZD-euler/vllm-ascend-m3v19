@@ -45,6 +45,10 @@ native loading where needed.
   Encoder-decoder models, sleep mode, DBO and the v2 model runner are unsupported.
 - DSA latent offload must be disabled; it bypasses the attention path that
   performs selected loads, so enabling both is rejected at startup.
+- DSA adapter cache (`VLLM_ASCEND_DSA_USE_ADAPTER_CACHE`) must also be
+  disabled. A one-token cached-prefill tail can use the adapter decode path,
+  bypassing the selected load while still advancing selected prefetch.
+  Enabling both is rejected at startup.
 
 This is an opt-in prefill path. It does not enable decode full graph or main-KV
 INT8 storage, and weight quantization is independent of the KV dtype.
