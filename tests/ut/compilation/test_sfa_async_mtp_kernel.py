@@ -7,6 +7,200 @@ import torch
 from test_sfa_async_mtp import Kernel
 
 
+@pytest.mark.parametrize("n", [0, 1, 14, 31, 32, 33, 64])
+@pytest.mark.parametrize("mixed", ["none", "paired", "table"])
+@pytest.mark.parametrize("pad", [False, True])
+@pytest.mark.parametrize("check", ["table_reads", "output_stores", "ub_layout", "gather_dtype"])
+def test_ascend_mask_lowering_stays_within_allocations(n, mixed, pad, check, monkeypatch):
+    # The reported 28-token .ttadapter reads all table lanes before selecting
+    # masked values, and expands stride-2 stores into unmasked 64-element RMWs.
+    # Model those two observed hazards independently, without NPU dependencies.
+    capacity = 2 * (n + int(pad))
+    bases = torch.arange(n, dtype=torch.int32) * 127 + 126
+    counts = torch.arange(n, dtype=torch.int64) % 2 + 1
+    original_bases = bases.clone()
+    common = torch.full((n,), -77, dtype=torch.int32)
+    target = torch.full((n + 1,), -77, dtype=torch.int32)
+    positions = torch.full((capacity + 7,), -77, dtype=torch.int64)
+    tables = [
+        torch.arange(max(1, n) * stride, dtype=torch.int32).view(max(1, n), stride) for stride in (8192, 8208, 8224)
+    ]
+    slots = [torch.full((capacity + 7,), -77, dtype=torch.int32) for _ in range(2 if mixed == "none" else 3)]
+    table_addresses = {t.data_ptr() for t in tables}
+    output_addresses = {t.data_ptr() for t in (positions, *slots)}
+    kernel = Kernel([])
+    load, store = kernel.tl.load, kernel.tl.store
+    gather = kernel.tl.gather
+
+    def checked_gather(value, indices, axis):
+        if check == "gather_dtype":
+            # Match Triton-Ascend 3.2.0 semantic.gather's actual dtype gate.
+            assert value.dtype in (torch.float16, torch.float32, torch.bfloat16, torch.int8)
+        return gather(value, indices, axis)
+
+    def lowered_load(ptr, mask, other):
+        if check == "table_reads" and ptr.data.data_ptr() in table_addresses:
+            # The installed backend's scalar gather accesses inactive lanes too.
+            unmasked = torch.ones_like(torch.as_tensor(ptr.offset), dtype=torch.bool)
+            load(ptr, unmasked, other)
+        return load(ptr, mask, other)
+
+    def checked_store(ptr, value, mask):
+        if check == "output_stores" and ptr.data.data_ptr() in output_addresses:
+            assert torch.all(torch.diff(ptr.offset) == 1), "masked stride-2 store expands beyond output capacity"
+        store(ptr, value, mask)
+
+    def checked_reshape(value, shape):
+        # CANN 8.5.1 pads a narrow UB row to 32 bytes; collapsing it as if
+        # contiguous is rejected (reported memref<32x2xi32> compile failure).
+        if check == "ub_layout" and value.ndim > 1 and len(shape) == 1:
+            assert value.shape[-1] * value.element_size() % 32 == 0, "cannot collapse padded UB rows"
+        return torch.reshape(value, shape)
+
+    monkeypatch.setattr(kernel.tl, "load", lowered_load)
+    monkeypatch.setattr(kernel.tl, "store", checked_store)
+    monkeypatch.setattr(kernel.tl, "reshape", checked_reshape, raising=False)
+    monkeypatch.setattr(kernel.tl, "gather", checked_gather)
+    mixed_args = {} if mixed == "none" else {"slots_c8": slots[2], "MIXED_C8": True}
+    if mixed == "table":
+        mixed_args.update(table_c8=tables[2], stride_c8=8224)
+    kernel[((n + 1 + 31) // 32,)](
+        bases,
+        counts,
+        positions,
+        common,
+        target,
+        *tables[:2],
+        *slots[:2],
+        n,
+        capacity,
+        n,
+        n + 1,
+        8192,
+        8208,
+        128,
+        128,
+        BLOCK=32,
+        **mixed_args,
+    )
+    expected_base = original_bases + counts.int()
+    expected_pos = (expected_base[:, None].long() + torch.arange(2)).flatten()
+    torch.testing.assert_close(bases, expected_base)
+    torch.testing.assert_close(common, expected_base + 2)
+    torch.testing.assert_close(target[:n], common)
+    assert target[n:].eq(0).all()
+    torch.testing.assert_close(positions[: 2 * n], expected_pos)
+    assert positions[2 * n : capacity].eq(0).all() and positions[capacity:].eq(-77).all()
+    for index, slot in enumerate(slots):
+        table = tables[1] if index == 2 and mixed == "paired" else tables[index]
+        block_ids = table[torch.arange(n).repeat_interleave(2), expected_pos // 128]
+        if index == 2 and mixed == "paired":
+            block_ids = 2 * block_ids
+        expected = block_ids * 128 + expected_pos % 128
+        torch.testing.assert_close(slot[: 2 * n], expected.int())
+        assert slot[2 * n : capacity].eq(-1).all() and slot[capacity:].eq(-77).all()
+
+
+def test_padding_address_selection_does_not_clamp_active_indices():
+    kernel = Kernel([])
+    bases = torch.tensor([127], dtype=torch.int32)
+    counts = torch.ones(1, dtype=torch.int64)
+    positions = torch.empty(2, dtype=torch.int64)
+    lengths = [torch.empty(n, dtype=torch.int32) for n in (1, 2)]
+    tables = [torch.zeros((1, 1), dtype=torch.int32) for _ in range(2)]
+    slots = [torch.empty(2, dtype=torch.int32) for _ in range(2)]
+    with pytest.raises(IndexError):
+        kernel[(1,)](bases, counts, positions, *lengths, *tables, *slots, 1, 2, 1, 2, 1, 1, 128, 128, BLOCK=32)
+
+
+def test_metadata_gather_preserves_integer_bits(monkeypatch):
+    # Include FP32 subnormal/NaN bit patterns and integers beyond exact FP32
+    # numeric precision. Gather is data movement, never float arithmetic.
+    current = torch.tensor([1, 1048575, 2**24 + 3, 2**30 + 3, 0x7FC01234], dtype=torch.int32)
+    n = len(current)
+    bases = current - 1
+    counts = torch.ones(n, dtype=torch.int64)
+    positions = torch.empty(2 * n, dtype=torch.int64)
+    lengths = [torch.empty(size, dtype=torch.int32) for size in (n, n + 1)]
+    tables = [torch.zeros((n, 2), dtype=torch.int32) for _ in range(2)]
+    slots = [torch.empty(2 * n, dtype=torch.int32) for _ in range(2)]
+    kernel = Kernel([])
+    gather = kernel.tl.gather
+
+    def check_words(value, indices, axis):
+        assert value.dtype == torch.float32
+        torch.testing.assert_close(value.view(torch.int32)[:n], current, rtol=0, atol=0)
+        return gather(value, indices, axis)
+
+    monkeypatch.setattr(kernel.tl, "gather", check_words)
+    kernel[(1,)](bases, counts, positions, *lengths, *tables, *slots, n, 2 * n, n, n + 1, 2, 2, 2**30, 2**30, BLOCK=32)
+    expected = (current[:, None].long() + torch.arange(2)).flatten()
+    torch.testing.assert_close(positions, expected, rtol=0, atol=0)
+    torch.testing.assert_close(bases, current, rtol=0, atol=0)
+    torch.testing.assert_close(lengths[0], current + 2, rtol=0, atol=0)
+    assert lengths[1][-1] == 0
+    for slot in slots:
+        torch.testing.assert_close(slot, (expected % 2**30).int(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("world,rank", [(2, 0), (2, 1), (4, 1), (4, 3), (8, 0), (8, 7)])
+@pytest.mark.parametrize("n", [0, 3, 33])
+def test_dcp_accepted_positions_keep_replicated_indexer_slots(world, rank, n, monkeypatch):
+    capacity = 2 * (n + 3)
+    rows = torch.arange(n, dtype=torch.int32)
+    bases = 1048576 - 128 * (rows + 1) - 2
+    counts = rows.long() % 2 + 1
+    current = bases + counts.int()
+    origins = torch.where(rows % 2 == 0, 4096, 0)
+    positions = torch.full((capacity + 1,), -77, dtype=torch.int64)
+    local = torch.full((n + 4,), -77, dtype=torch.int32)
+    lengths = [torch.empty(size, dtype=torch.int32) for size in (n, n + 1)]
+    slots = [torch.full((capacity + 1,), -77, dtype=torch.int64) for _ in range(3)]
+    tables = [
+        torch.arange(max(n, 1) * stride, dtype=torch.int32).view(-1, stride) + 1
+        for stride in (8192 // world + 32, 8192, 8200)
+    ]
+    kernel = Kernel([])
+    load = kernel.tl.load
+    indexed = {table.data_ptr() for table in tables} | {origins.data_ptr()}
+
+    def checked_load(ptr, mask, other):
+        if ptr.data.numel() and ptr.data.data_ptr() in indexed:
+            load(ptr, True, other)  # Ascend gathers can read before applying the mask.
+        return load(ptr, mask, other)
+
+    monkeypatch.setattr(kernel.tl, "load", checked_load)
+    # Even an idle graph has preallocated origin and table storage.
+    origin_storage = origins if n else torch.zeros(1, dtype=torch.int32)
+    kernel[((n + 3 + 31) // 32,)](
+        bases, counts, positions, *lengths, *tables[:2], *slots[:2],
+        n, capacity, n, n + 1, tables[0].stride(0), tables[1].stride(0),
+        128, 128, BLOCK=32, slots_c8=slots[2], MIXED_C8=True, table_c8=tables[2],
+        stride_c8=tables[2].stride(0), live_origins=origin_storage, seq_local=local,
+        local_capacity=n + 3, DCP_WORLD=world, DCP_RANK=rank,
+    )
+    end = current + 2
+    torch.testing.assert_close(bases, current)
+    torch.testing.assert_close(lengths[0], end)
+    assert lengths[1].tolist() == [*end, 0]
+    assert local.tolist() == [
+        *(int(o) + (int(t) // (128 * world)) * 128 + min(128, max(0, int(t) % (128 * world) - rank * 128))
+          for t, o in zip(end, origins)),
+        0, 0, 0, -77,
+    ]
+    expected = [[], [], []]
+    for row, (base, origin) in enumerate(zip(current.tolist(), origins.tolist())):
+        for position in (base, base + 1):
+            stripe, offset = divmod(position, 128)
+            slot = int(tables[0][row, origin // 128 + stripe // world]) * 128 + offset
+            expected[0].append(slot if stripe % world == rank else -1)
+            for group in (1, 2):
+                expected[group].append(int(tables[group][row, stripe]) * 128 + offset)
+    assert positions.tolist() == [*(int(base) + j for base in current for j in (0, 1)), *([0] * 6), -77]
+    for actual, wanted in zip(slots, expected):
+        assert actual.tolist() == [*wanted, *([-1] * 6), -77]
+
+
 @pytest.mark.parametrize("n,capacity", [(1, 8), (3, 8), (16, 32), (32, 64), (33, 80), (63, 128)])
 @pytest.mark.parametrize("alias_lengths", [False, True])
 def test_separate_group_strides_and_padding(n, capacity, alias_lengths):

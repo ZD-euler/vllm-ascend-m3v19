@@ -92,6 +92,7 @@ def handoff():
         register=Mock(),
     )
     impl = SimpleNamespace(
+        dsa_cp_decoder=False,
         _staged_sfa_capture_state=state,
         _staged_sfa_bridge_buffers=bridge,
         _staged_graph_content_diagnostic_enabled=Mock(return_value=False),
@@ -100,7 +101,7 @@ def handoff():
         _cross_layer_kv_cache=Mock(return_value=(state.runtime[1], None, False)),
         _cross_layer_ineligible_reason=Mock(return_value=None),
         _cross_layer_pre_compute=Mock(return_value=bridge),
-        _copy_to_staged_sfa_bridge=lambda *args: bridge,
+        _copy_to_staged_sfa_bridge=lambda *args, **kwargs: bridge,
         index_topk=4,
         diagnostic_num_cache_layers=2,
         has_indexer=True,

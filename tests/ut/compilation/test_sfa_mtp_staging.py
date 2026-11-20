@@ -21,7 +21,7 @@ def staging(request, monkeypatch):
         synchronize=lambda: events.append("staging_wait"), record=lambda: events.append("staging_record")
     )
     source = ROOT.parent / "vllm/vllm/v1/worker/gpu_model_runner.py"
-    guard = extract(source, "synchronize_input_prep", {})
+    guard = extract(source, "synchronize_input_prep", {"record_function_or_nullcontext": nullcontext})
     monkeypatch.setattr(ns["NPUModelRunner"], "synchronize_input_prep", contextmanager(guard), raising=False)
     padding = extract(
         ROOT / "vllm_ascend/worker/model_runner_v1.py",
@@ -170,6 +170,10 @@ def real_dummy(staging, request, monkeypatch):
     )
     method = extract(ROOT / "vllm_ascend/worker/model_runner_v1.py", "_dummy_run", namespace)
     monkeypatch.setattr(ns["NPUModelRunner"], "_dummy_run", method, raising=False)
+    clear_idle = extract(ROOT / "vllm_ascend/worker/model_runner_v1.py", "_clear_sfa_idle_metadata", namespace)
+    monkeypatch.setattr(ns["NPUModelRunner"], "_clear_sfa_idle_metadata", staticmethod(clear_idle), raising=False)
+    forward_context = extract(ROOT / "vllm_ascend/worker/model_runner_v1.py", "_sfa_forward_context", namespace)
+    monkeypatch.setattr(ns["NPUModelRunner"], "_sfa_forward_context", forward_context, raising=False)
     r.vllm_config = route_runner.vllm_config
     r.vllm_config.model_config.use_mla = True
     r.speculative_config = SimpleNamespace(method="mtp")

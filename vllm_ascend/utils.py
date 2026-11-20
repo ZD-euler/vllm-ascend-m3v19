@@ -63,6 +63,7 @@ _SHARED_EXPERTS_CALCULATION_STREAM = None
 _CP_CHUNKEDPREFILL_COMM_STREAM = None
 _ASCEND_CUSTOMOP_IS_REIGISTERED = False
 _DEFAULT_BUFFER_SIZE = 200
+_HCCL_OP_EXPANSION_MODE_HOST = 1
 _MIN_DP_BUFFER_SIZE = 50
 _MAX_ACL_GRAPH_ENTRIES = 1800
 _ACL_COMMUNICATION_STREAM_RESERVE = 40
@@ -132,6 +133,8 @@ class StagedSFARouteDecision:
     cold_compact_resumes: tuple[bool, ...] = ()
     # CPU scheduler verdict; 0 means not the configured uniform query width.
     uniform_query_len: int = 0
+    # Failed host-side checks, populated only on rejection (no device reads).
+    failed_checks: tuple[str, ...] = ()
 
 
 _DYNAMIC_EPLB_BUFFER_SIZE = 100
@@ -584,8 +587,21 @@ def staged_sfa_graph_configuration_reasons(
         reasons.append(StagedSFAConfigReason.PIPELINE_PARALLEL)
     prefill_context_parallel_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
     decode_context_parallel_size = getattr(parallel_config, "decode_context_parallel_size", 1)
-    if any(
-        isinstance(size, int) and size != 1 for size in (prefill_context_parallel_size, decode_context_parallel_size)
+    transfer = getattr(vllm_config, "kv_transfer_config", None)
+    # The platform selects graph sizes before the worker proves the cache
+    # layout and operator availability. Other CP backends keep their guard.
+    decoder_dcp_graph = (
+        decode_context_parallel_size in (2, 4, 8)
+        and decode_context_parallel_size == getattr(parallel_config, "tensor_parallel_size", 1)
+        and getattr(transfer, "kv_connector", None) == "LMCacheAscendConnectorV1Dynamic"
+        and getattr(transfer, "is_kv_consumer", False)
+        and not envs_ascend.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
+        and envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH
+    )
+    if (
+        (isinstance(prefill_context_parallel_size, int) and prefill_context_parallel_size != 1)
+        or (isinstance(decode_context_parallel_size, int) and decode_context_parallel_size != 1
+            and not decoder_dcp_graph)
     ):
         reasons.append(StagedSFAConfigReason.CONTEXT_PARALLEL)
     if envs_ascend.VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD:
@@ -708,6 +724,11 @@ def _max_aclgraph_keys(
             + int(parallel_config.enable_expert_parallel)
             + int(vllm_config.additional_config.get("multistream_overlap_shared_expert", False))
         )
+        if envs_ascend.VLLM_ASCEND_DCP_HCCL_HOST and parallel_config.decode_context_parallel_size > 1:
+            # DCP is included in num_comm_groups. Replace its one AIV stream
+            # unit with two HOST units, retaining the existing HOST reserves.
+            parallel_factor += 1
+            max_capture_size -= _ACL_CONTEXT_PARALLEL_STREAM_RESERVE + _ACL_COMMUNICATION_STREAM_RESERVE
         if is_moe_model(vllm_config):
             parallel_factor += parallel_config.data_parallel_size > 1
         else:
@@ -777,6 +798,11 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
             parallel_config.tensor_parallel_size,
         ]
     )
+    if getattr(parallel_config, "decode_context_parallel_size", 1) > 1 and (
+        full_sfa_graph_active
+        or (envs_ascend.VLLM_ASCEND_DCP_HCCL_HOST and os.getenv("HCCL_OP_EXPANSION_MODE") == "AIV")
+    ):
+        num_comm_groups += 1
     max_num_batch_sizes = _max_aclgraph_keys(
         vllm_config,
         resources_per_graph,
@@ -1087,12 +1113,14 @@ def enable_sp(vllm_config=None, enable_shared_expert_dp: bool = False) -> bool:
             from vllm.config import get_current_vllm_config
 
             vllm_config = get_current_vllm_config()
-        _ENABLE_SP = (
-            envs_ascend.VLLM_ASCEND_ENABLE_FLASHCOMM1
-            # Flash comm 1 should be enabled by env VLLM_ASCEND_ENABLE_FLASHCOMM1
-            # We retain the env VLLM_ASCEND_ENABLE_FLASHCOMM here for backward compatibility.
-            or bool(int(os.getenv("VLLM_ASCEND_ENABLE_FLASHCOMM", "0")))
-        )
+        additional_config = vllm_config.additional_config or {}
+        if "enable_flashcomm1" in additional_config:
+            _ENABLE_SP = bool(additional_config["enable_flashcomm1"])
+        else:
+            _ENABLE_SP = (
+                envs_ascend.VLLM_ASCEND_ENABLE_FLASHCOMM1
+                or bool(int(os.getenv("VLLM_ASCEND_ENABLE_FLASHCOMM", "0")))
+            )
 
         if not _ENABLE_SP and enable_shared_expert_dp:
             _ENABLE_SP = True
@@ -1103,7 +1131,7 @@ def enable_sp(vllm_config=None, enable_shared_expert_dp: bool = False) -> bool:
 
 # TODO remove it after vllm has this func
 def shared_expert_dp_enabled() -> bool:
-    return get_ascend_config().enable_shared_expert_dp or enable_sp() or enable_sp_by_pass()
+    return get_ascend_config().enable_shared_expert_dp or enable_sp_by_pass()
 
 
 def prefill_context_parallel_enable() -> bool:
@@ -1274,11 +1302,20 @@ def get_hccl_config_for_pg_options(group_name: str) -> dict | None:
     # result in memory misalignment problems.
     if group_name and "mc2" in group_name:
         return None
-    hccl_config_map = {
-        "dp": {"hccl_buffer_size": calculate_dp_buffer_size()},
-        "dynamic_eplb": {"hccl_buffer_size": _DYNAMIC_EPLB_BUFFER_SIZE},
-    }
-    return hccl_config_map.get(group_name, get_default_buffer_config())
+    # Only DP sizing needs a model config. Standalone DCP/TP callers have none.
+    if group_name == "dp":
+        config = {"hccl_buffer_size": calculate_dp_buffer_size()}
+    elif group_name == "dynamic_eplb":
+        config = {"hccl_buffer_size": _DYNAMIC_EPLB_BUFFER_SIZE}
+    else:
+        config = get_default_buffer_config()
+    if group_name == "dcp" and envs_ascend.VLLM_ASCEND_DCP_HCCL_HOST:
+        config["hccl_op_expansion_mode"] = _HCCL_OP_EXPANSION_MODE_HOST
+        logger.info(
+            "DCP HCCL expansion mode override: HOST (global=%s, buffer=%d MiB)",
+            os.getenv("HCCL_OP_EXPANSION_MODE", "unset"), config["hccl_buffer_size"],
+        )
+    return config
 
 
 def get_default_buffer_config() -> dict:
@@ -1471,8 +1508,6 @@ def singleton(cls):
     return get_instance
 
 
-# TODO: Temporarily use enable_sp to enable the dsa_cp feature of ds32.
-# and subsequent updates will introduce new interfaces. --zzhx1
 @lru_cache(maxsize=1)
 def enable_dsa_cp() -> bool:
     from vllm.config import get_current_vllm_config
@@ -1481,12 +1516,36 @@ def enable_dsa_cp() -> bool:
     is_ds_v32 = hasattr(vllm_config.model_config, "hf_text_config") and hasattr(
         vllm_config.model_config.hf_text_config, "index_topk"
     )
-    return bool(is_ds_v32 and enable_sp())
+    if not is_ds_v32:
+        return False
+    # Preserve existing P deployments; explicit false opts into FC1-only.
+    enabled = bool((vllm_config.additional_config or {}).get("enable_dsa_cp", enable_sp()))
+    if enabled and not enable_sp():
+        raise ValueError("DSA CP requires FlashComm1 to be enabled")
+    return enabled
+
+
+@lru_cache(maxsize=1)
+def enable_dsa_cp_decoder() -> bool:
+    """Explicit consumer opt-in; kv_both alone does not identify a P node."""
+    from vllm.config import get_current_vllm_config
+
+    return dsa_cp_decoder_configured(get_current_vllm_config()) and enable_dsa_cp()
+
+
+def dsa_cp_decoder_configured(config) -> bool:
+    """Role selection also used before the platform installs the config context."""
+    return bool(
+        (config.additional_config or {}).get("enable_dsa_cp", False)
+        and config.kv_transfer_config is not None
+        and config.kv_transfer_config.is_kv_consumer
+        and not envs_ascend.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
+    )
 
 
 @lru_cache(maxsize=1)
 def enable_dsa_cp_with_layer_shard() -> bool:
-    if not enable_dsa_cp():
+    if not enable_dsa_cp() or enable_dsa_cp_decoder():
         return False
     from vllm.config import get_current_vllm_config
 
@@ -1506,7 +1565,7 @@ def enable_dsa_cp_with_o_proj_tp() -> bool:
     vllm_config = get_current_vllm_config()
     # if is PD mix stage, using original TP o_proj weight, and also need to
     # full gather for o_proj weight for prefill stage.
-    return vllm_config.kv_transfer_config is None
+    return vllm_config.kv_transfer_config is None or enable_dsa_cp_decoder()
 
 
 def check_gdn_layer(vllm_config) -> bool:

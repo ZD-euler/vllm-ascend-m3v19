@@ -31,7 +31,7 @@ from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.distributed import ensure_model_parallel_initialized, init_distributed_environment
 from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
 from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized, get_kv_transfer_group, has_kv_transfer_group
-from vllm.distributed.parallel_state import Handle, get_ep_group, get_pp_group, get_tp_group
+from vllm.distributed.parallel_state import Handle, get_dcp_group, get_ep_group, get_pp_group, get_tp_group
 from vllm.logger import logger
 from vllm.lora.request import LoRARequest
 from vllm.sequence import IntermediateTensors
@@ -52,10 +52,15 @@ from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
+from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache import (
+    INDEX_TOPK,
+    RESIDENT_COUNT_CACHELINE_INTS,
+)
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.utils import (
     AscendDeviceType,
     check_ascend_device_type,
+    enable_custom_op,
     enable_sp,
     get_ascend_device_type,
     register_ascend_customop,
@@ -260,6 +265,87 @@ class NPUWorker(WorkerBase):
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
+    def _configure_dsa_decoder_dcp(self) -> None:
+        """Select the split-cache backend before loading the model or opening storage."""
+        config = self.vllm_config
+        parallel = self.parallel_config
+        model = self.model_config
+        hf = model.hf_text_config
+        transfer = config.kv_transfer_config
+        dcp = parallel.decode_context_parallel_size
+        if (
+            dcp == 1 or not transfer.is_kv_consumer or not model.use_mla
+            or not hasattr(hf, "index_topk")
+            or not envs_ascend.VLLM_ASCEND_DSA_UNBUNDLE
+            or not envs_ascend.VLLM_ASCEND_DSA_TWO_GROUPS
+            or envs_ascend.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
+        ):
+            return
+        if (
+            self.use_v2_model_runner or get_ascend_device_type() != AscendDeviceType.A2
+            or dcp not in (2, 4, 8) or dcp != parallel.tensor_parallel_size
+            or dcp != parallel.local_world_size or parallel.pipeline_parallel_size != 1
+            or parallel.prefill_context_parallel_size != 1
+            or parallel.enable_dbo or parallel.enable_elastic_ep
+        ):
+            raise ValueError("Decoder DCP requires V1 on A2, local DCP=TP and PP=PCP=1 without DBO or elastic EP")
+        spec = self.speculative_config
+        if spec is not None and (
+            spec.method not in ("mtp", "deepseek_mtp") or spec.num_speculative_tokens != 1
+            or spec.draft_tensor_parallel_size != dcp
+            or spec.parallel_drafting or spec.disable_padded_drafter_batch
+            or model.uses_mrope or model.uses_xdrope_dim
+            or spec.draft_model_config.uses_mrope or spec.draft_model_config.uses_xdrope_dim
+        ):
+            raise ValueError("Decoder DCP supports one padded MTP draft token with matching TP and ordinary RoPE")
+        eager = model.enforce_eager and self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+        full_graph = (
+            not model.enforce_eager and envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH
+            and staged_sfa_graph_configured(config)
+        )
+        if not (eager or full_graph):
+            raise ValueError("Decoder DCP requires eager execution or a full SFA graph")
+        if envs_ascend.VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP and (
+            not full_graph or not envs_ascend.VLLM_ASCEND_SFA_SHARED_RESIDENT_PLAN
+        ):
+            raise ValueError("Decoder DCP retrieval overlap requires full SFA graphs with shared resident plans")
+        if envs_ascend.VLLM_ASCEND_SFA_ASYNC_MTP_PREP and (not full_graph or spec is None):
+            raise ValueError("Decoder DCP async MTP preparation requires full SFA graphs and one MTP draft token")
+        if parallel.data_parallel_size > 1 and parallel.distributed_executor_backend == "external_launcher":
+            raise ValueError("Decoder DCP requires internal DP execution")
+        if (
+            self.cache_config.block_size != 128 or parallel.cp_kv_cache_interleave_size != 128
+            or self.cache_dtype not in (torch.float16, torch.bfloat16) or self.cache_dtype != model.dtype
+            or (hf.kv_lora_rank, hf.qk_rope_head_dim, hf.index_head_dim, hf.index_topk) != (512, 64, 128, INDEX_TOPK)
+            or not envs_ascend.VLLM_ASCEND_DSA_SHARED_POOL
+            or envs_ascend.VLLM_ASCEND_DSA_SHRINK_LATENT != 2
+            or not envs_ascend.VLLM_ASCEND_DSA_RESIDENT_CACHE
+            or envs_ascend.VLLM_ASCEND_DSA_DISABLE_INDEX_LMCACHE
+            or envs_ascend.VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD
+            or envs_ascend.VLLM_ASCEND_DSA_USE_ADAPTER_CACHE
+            or (config.additional_config or {}).get("enable_dsa_cp", False) or enable_sp(config)
+        ):
+            raise ValueError("Decoder DCP requires the two-group resident SFA layout with 128-token interleave")
+        if not enable_custom_op() or not all(
+            hasattr(torch.ops._C_ascend, name) for name in (
+                "npu_sparse_flash_attention_dcp", "npu_dsa_resident_dcp_union_", "npu_dsa_resident_dcp_plan_"
+            )
+        ):
+            raise ValueError("Rebuild vllm-ascend with the decoder DCP custom operators")
+
+        from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+
+        connector = KVConnectorFactory.get_connector_class(transfer)
+        probe = getattr(connector, "get_dsa_compact_startup_policy", None)
+        policy = probe(config) if callable(probe) else None
+        if (
+            not isinstance(policy, tuple) or len(policy) != 2
+            or any(type(value) is not int for value in policy)
+            or policy[0] != INDEX_TOPK * (1 + config.num_speculative_tokens) or policy[1] < 0
+        ):
+            raise ValueError("Decoder DCP requires an LMCache receiver with a valid compact startup policy")
+        config._dsa_decoder_dcp_policy = policy
+
     def _init_device(self):
         device = torch.device(f"npu:{self.local_rank}")
         torch.npu.set_device(device)
@@ -275,6 +361,13 @@ class NPUWorker(WorkerBase):
 
         gc.collect()
         torch.npu.empty_cache()
+
+        transfer = self.vllm_config.kv_transfer_config
+        if transfer is not None and transfer.kv_connector == "LMCacheAscendConnectorV1Dynamic":
+            self._configure_dsa_decoder_dcp()
+            from lmcache.v1.rpc.storage_bootstrap import early_bootstrap_decoder_storage
+
+            self._decoder_storage_bootstrap = early_bootstrap_decoder_storage(self)
 
         # take current memory snapshot
         self.init_snapshot = MemorySnapshot()
@@ -315,7 +408,13 @@ class NPUWorker(WorkerBase):
         # binding cpu
         if get_ascend_config().enable_cpu_binding:
             try:
-                bind_cpus(self.local_rank)
+                # Early storage bootstrap has already mapped/registered the
+                # shared slab. Its NUMA placement belongs to the storage owner;
+                # migratepages on an ACL TID would target the worker's whole mm.
+                bind_cpus(
+                    self.local_rank,
+                    migrate_memory=getattr(self, "_decoder_storage_bootstrap", None) is None,
+                )
             except Exception as e:
                 logger.warning(f"Bind cpus failed in rank{self.local_rank}: {e} Skip binding cpu.")
         return device
@@ -343,6 +442,26 @@ class NPUWorker(WorkerBase):
 
                 runner_cls = AsyncSFAModelRunner
             self.model_runner = runner_cls(self.vllm_config, self.device)
+
+    def _profile_dsa_decoder_dcp(self) -> None:
+        from vllm_ascend.ops.triton.sfa_dcp import execute_sfa_dcp
+
+        rows = self.scheduler_config.max_num_batched_tokens
+        heads = self.model_config.get_num_attention_heads(self.parallel_config)
+        block = self.cache_config.block_size
+        options = dict(dtype=self.cache_dtype, device=self.device)
+        query = torch.empty((rows, heads, 512), **options)
+        rope = torch.empty((rows, heads, 64), **options)
+        cache = (torch.empty((1, block, 1, 512), **options), torch.empty((1, block, 1, 64), **options))
+        indices = torch.full((rows, 1, INDEX_TOPK), -1, dtype=torch.int32, device=self.device)
+        counts = indices.new_zeros((rows, RESIDENT_COUNT_CACHELINE_INTS))
+        # Empty selections still exercise both collectives and the native
+        # workspace at maximum query capacity without live KV allocations.
+        execute_sfa_dcp(
+            query, rope, cache, indices, counts, indices.new_zeros((1, 1)),
+            indices.new_full((1,), rows), indices.new_zeros((1,)), 1.0, get_dcp_group(),
+        )
+        torch.npu.synchronize()
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
@@ -397,6 +516,16 @@ class NPUWorker(WorkerBase):
             )
 
         free_gpu_memory = profile_result.after_profile.free_memory
+        dcp_memory_reservation = 0
+        if isinstance(getattr(self.vllm_config, "_dsa_decoder_dcp_policy", None), tuple):
+            # The normal model profile has no attention metadata or KV cache.
+            # Warm and charge the actual counted SFA workspace and collectives
+            # in addition to its model activation peak.
+            with memory_profiling(profile_result.after_profile) as dcp_profile:
+                self._profile_dsa_decoder_dcp()
+            dcp_memory_reservation = max(0, dcp_profile.torch_peak_increase) + max(0, dcp_profile.non_torch_increase)
+            free_gpu_memory = dcp_profile.after_profile.free_memory
+            logger.info("Reserved %.2f GiB for decoder DCP attention and collectives", GiB(dcp_memory_reservation))
         assert self.init_snapshot.free_memory > free_gpu_memory, (
             "Error in memory profiling. "
             f"Initial free memory {GiB(self.init_snapshot.free_memory)} GiB, "
@@ -410,6 +539,7 @@ class NPUWorker(WorkerBase):
             self.requested_memory
             - profile_result.non_kv_cache_memory
             - graph_memory_reservation
+            - dcp_memory_reservation
         )
 
         # DSA latent KV offload (GLM5.1): reserve fixed scratch + decode-latent
@@ -603,7 +733,9 @@ class NPUWorker(WorkerBase):
         ):
             return
         ep_group = get_ep_group()
-        ep_group.barrier()
+        from vllm_ascend.worker.sfa_agreement import initialize_single_agreement
+
+        initialize_single_agreement(self.model_runner, ep_group)
 
     def compile_or_warm_up_model(self) -> float:
         self._wait_for_decoder_ep_startup()
@@ -634,10 +766,61 @@ class NPUWorker(WorkerBase):
         # may cause performance degradation at runtime.
         if get_ascend_device_type() != AscendDeviceType.A5:
             self._warm_up_atb()
+        if not getattr(self, "use_v2_model_runner", False):
+            from vllm_ascend.ops.triton.decode_warmup import warmup_decode_kernels
+
+            warmup_decode_kernels(self.model_runner)
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
+        single = getattr(self.model_runner, "_sfa_single_agreement", None)
+        # A supervised cohort selects independent mode or this fallback after
+        # capture qualification. Never activate both live protocols.
+        if single is not None and getattr(self, "dp_guardian", None) is None:
+            single.activate(self.model_runner._sfa_full_graph.entries)
         return self.vllm_config.compilation_config.compilation_time
+
+    def independent_dp_contract(self) -> dict:
+        """Validate the loaded/captured path before the supervisor activates it."""
+        from vllm_ascend.worker.sfa_independent import execution_contract
+
+        self._independent_dp_contract = execution_contract(self.model_runner)
+        return self._independent_dp_contract
+
+    def activate_independent_dp(self, enabled: bool) -> None:
+        """Select a startup-agreed mode; no live switch back to DP votes is allowed."""
+        from vllm.distributed import get_tp_group
+
+        from vllm_ascend.worker.sfa_independent import IndependentDP
+
+        if getattr(self.model_runner, "_sfa_independent", None) is not None:
+            raise RuntimeError("Independent DP execution is already active")
+        if enabled:
+            contract = self._independent_dp_contract
+            if not contract.get("digest") or getattr(self, "dp_guardian", None) is None:
+                raise RuntimeError("Independent DP has no qualified supervised contract")
+            self.model_runner._sfa_independent = IndependentDP(
+                get_tp_group(),
+                self.parallel_config.data_parallel_size,
+                contract["capacity"],
+            )
+            self.model_runner._sfa_single_agreement = None
+        else:
+            single = getattr(self.model_runner, "_sfa_single_agreement", None)
+            if single is not None:
+                single.activate(self.model_runner._sfa_full_graph.entries)
+            self.dp_guardian.close()
+            self.dp_guardian = None
+
+    def drain_independent_dp(self) -> None:
+        """Drain existing resource owners only after group-wide model quiescence."""
+        from vllm.distributed.kv_transfer import ensure_kv_transfer_shutdown
+
+        self.release_sfa_graph_resources()
+        ensure_kv_transfer_shutdown()
+        storage = getattr(self, "_decoder_storage_bootstrap", None)
+        if storage is not None:
+            storage.close()
 
     def _warm_up_atb(self):
         x = torch.rand((2, 4), dtype=torch.float16).npu()
@@ -865,6 +1048,9 @@ class NPUWorker(WorkerBase):
     def shutdown(self) -> None:
         self.release_sfa_graph_resources()
         super().shutdown()
+        storage = getattr(self, "_decoder_storage_bootstrap", None)
+        if storage is not None:
+            storage.close()
 
     def check_health(self) -> None:
         self._raise_if_remote_fill_restart_required()

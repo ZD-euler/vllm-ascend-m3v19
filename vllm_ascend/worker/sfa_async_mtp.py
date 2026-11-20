@@ -14,14 +14,17 @@ from typing import Any
 import numpy as np
 import torch
 from vllm.forward_context import get_forward_context
+from vllm.logger import logger
 from vllm.triton_utils import HAS_TRITON, triton
+from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.sfa_graph_layout import cp_sequence_lengths, cp_slice
 from vllm_ascend.attention.sfa_v1 import _decode_window_save_window_size
 from vllm_ascend.attention.utils import staged_sfa_metadata_sparse_route
 from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla
 from vllm_ascend.ops.triton.spec_decode.async_mtp import prepare_async_mtp_kernel, prepare_async_mtp_tokens_kernel
-from vllm_ascend.utils import StagedSFARouteReason, lmhead_tp_enable, sfa_full_graph_enabled
+from vllm_ascend.utils import StagedSFARouteReason, enable_dsa_cp_decoder, lmhead_tp_enable, sfa_full_graph_enabled
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
@@ -67,12 +70,14 @@ class AsyncSFAModelRunner(NPUModelRunner):
             and self.parallel_config.pipeline_parallel_size == 1
             and not self.use_cp
         ):
-            raise ValueError("SFA async MTP preparation requires full SFA graphs, async MTP=1 and PP=PCP=DCP=1")
+            raise ValueError("SFA async MTP preparation requires full SFA graphs, async MTP=1, PP=PCP=1 and a supported KV layout")
         self._async_bases = torch.empty(self.max_num_reqs, dtype=torch.int32, device=self.device)
         self._async_snapshot = self._async_pending = self._async_built = None
+        self._async_validated_route = None
         self._async_counts = None
         self._async_epoch, self._async_counts_epoch = 0, -1
         self.async_mtp_replays = 0
+        logger.info("[SFA async MTP] enabled: source=%s", __file__)
 
     @torch.inference_mode()
     def capture_model(self, *args, **kwargs):
@@ -84,12 +89,25 @@ class AsyncSFAModelRunner(NPUModelRunner):
         if len(groups) == 2 and self._sfa_full_graph is not None:
             tables = [group.block_table.gpu for group in groups]
             counts = torch.ones(self.max_num_reqs, dtype=torch.int64, device=self.device)
+            dcp = getattr(self, "dsa_decoder_dcp", False)
+            origins = self._async_bases.new_zeros(self.max_num_reqs) if dcp else None
             for key in self._sfa_full_graph.entries:
                 n, capacity = key.request_capacity, key.token_capacity
                 self._async_bases.zero_()
                 positions = self.positions.gpu.new_empty(capacity)
                 lengths = [self.seq_lens.gpu.new_empty(n + extra) for extra in (0, 1)]
                 slots = [group.slot_mapping.gpu.new_empty(capacity) for group in groups]
+                layout = {}
+                if dcp:
+                    layout.update(
+                        live_origins=origins, seq_local=lengths[1].new_empty(n + 1),
+                        local_capacity=n + 1, DCP_WORLD=self.dcp_size, DCP_RANK=self.dcp_rank,
+                    )
+                if getattr(self.ascend_config, "indexer_c8_shared_block_factor", 1) == 2:
+                    layout.update(
+                        slots_c8=slots[1].new_empty(capacity, dtype=torch.long), MIXED_C8=True,
+                        table_c8=tables[1], stride_c8=tables[1].stride(0),
+                    )
                 prepare_async_mtp_kernel[(triton.cdiv(max(capacity // 2, n + 1), 32),)](
                     self._async_bases,
                     counts,
@@ -106,6 +124,7 @@ class AsyncSFAModelRunner(NPUModelRunner):
                     groups[0].block_size,
                     groups[1].block_size,
                     BLOCK=32,
+                    **layout,
                 )
             # Private token buffers: compile both supported proposal dtypes.
             tokens = self.input_ids.gpu.new_zeros(2 * self.max_num_reqs)
@@ -128,6 +147,9 @@ class AsyncSFAModelRunner(NPUModelRunner):
             raise
         finally:
             self._async_live_execute = False
+            single = getattr(self, "_sfa_single_agreement", None)
+            if single is not None:
+                single.discard()
 
     @contextmanager
     def synchronize_input_prep(self):
@@ -150,11 +172,17 @@ class AsyncSFAModelRunner(NPUModelRunner):
         # host-source protection. Every ordinary writer enters through here.
         if self._async_host_write is False:
             if self.prepare_inputs_event is not None:
-                self.prepare_inputs_event.synchronize()
+                with record_function_or_nullcontext("decode_wait::input_staging"):
+                    self.prepare_inputs_event.synchronize()
             self._async_host_write = True
 
     def _dummy_run(self, *args, **kwargs):
         live, self._async_live_execute = self._async_live_execute, False
+        self._sfa_dp_idle = bool(
+            kwargs.get("uniform_decode", False)
+            and kwargs.get("cudagraph_runtime_mode") is None
+            and getattr(self, "dp_size", 1) > 1
+        )
         self._async_snapshot = self._async_query_layout = None
         try:
             with ExitStack() as input_prep:
@@ -163,6 +191,47 @@ class AsyncSFAModelRunner(NPUModelRunner):
         finally:
             self._async_live_execute = live
             self._async_snapshot = self._async_query_layout = None
+            self._sfa_dp_idle = False
+            single = getattr(self, "_sfa_single_agreement", None)
+            if single is not None:
+                single.discard()
+
+    def _prepare_single_agreement(self, idle):
+        if idle:
+            return super()._prepare_single_agreement(True)
+        single, snapshot = self._sfa_single_agreement, self._async_snapshot
+        if (
+            self._async_pending is None
+            or snapshot is None
+            or single.previous is None
+            or single.previous[0] != snapshot.key
+            or not single.can_prepare(self, False)
+        ):
+            return None
+        from vllm.distributed.kv_transfer import get_kv_transfer_group
+
+        prepare = getattr(get_kv_transfer_group(), "prepare_warm_sparse_graph_step", None)
+        if prepare is None:
+            return None
+        step = prepare(
+            self._async_pending.kv_connector_metadata, self._staged_sfa_layer_names, snapshot.ids, snapshot.frontiers
+        )
+        if step is None:
+            return None
+        prepared = None
+        try:
+            if not self._sfa_full_graph.sources_match(snapshot.key.request_capacity, snapshot.ids, step.sources):
+                return None
+            fields = ("num_tokens", "num_tokens_padded", "num_reqs", "num_reqs_padded", "max_query_len", "full_graph")
+            result = self._build_attention_metadata(**dict(zip(fields, snapshot.shape)))
+            prepared = single.prepare(self, result[0], step, snapshot.frontiers, idle=False)
+            if prepared is None:
+                raise RuntimeError("Warm SFA preparation changed after its eligibility check")
+            prepared.metadata = result
+            return prepared
+        finally:
+            if prepared is None:
+                step.close()
 
     def _pad_query_start_loc_for_fia(
         self, num_tokens_padded, num_reqs_padded, num_reqs,
@@ -263,17 +332,34 @@ class AsyncSFAModelRunner(NPUModelRunner):
         high = s.bases + 2
         if np.any(high + 2 > self.max_model_len):
             return False
-        for group in batch.block_table.block_tables:
+        dcp = getattr(s.metadata[s.target_name], "sfa_dcp", None)
+        if dcp is not None:
+            origins = self._dsa_dcp_live_origins[:len(ids)]
+            compact = scheduled.dsa_dcp_compact_req_ids
+            if compact is None or any((req in compact) != bool(origin) for req, origin in zip(ids, origins)):
+                return False
+        for index, group in enumerate(batch.block_table.block_tables):
+            last_column = (high + 1) // group.block_size
+            if dcp is not None and index == 0:
+                # Check the full possible stripe extent identically on all TP ranks.
+                last_column = last_column // dcp.layout.world_size + origins // group.block_size
             if (
                 group._block_table_dirty
                 or not group.kernel_sizes
                 or group.block_size != group.kernel_sizes[0]
-                or np.any((high + 1) // group.block_size >= group.num_blocks_per_row[: len(ids)])
+                or np.any(last_column >= group.num_blocks_per_row[:len(ids)])
             ):
                 return False
-        reason, frontiers, cold = staged_sfa_metadata_sparse_route(scheduled.kv_connector_metadata, ids)
+        route = staged_sfa_metadata_sparse_route(scheduled.kv_connector_metadata, ids)
+        reason, frontiers, cold = route
         if (
-            reason != StagedSFARouteReason.ELIGIBLE
+            # Full graphs also support resident rows (zero remap frontier),
+            # including batches mixing resident and retrieved prefixes.
+            reason not in (
+                StagedSFARouteReason.ELIGIBLE,
+                StagedSFARouteReason.DENSE_PREFIX_HIT,
+                StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
+            )
             or cold
             or frontiers != s.frontiers
             or any(getattr(r, "is_decode_window_save", False) for r in scheduled.kv_connector_metadata.requests)
@@ -281,12 +367,16 @@ class AsyncSFAModelRunner(NPUModelRunner):
             return False
         # Without window saving the remap boundary is independent of acceptance.
         if s.window == 0:
-            return frontiers == s.boundary
-        # Both possible acceptance counts must leave the existing boundary exact.
-        return (
-            _boundary(s.bases + 1, frontiers, s.window) == s.boundary
-            and _boundary(high, frontiers, s.window) == s.boundary
-        )
+            unchanged = frontiers == s.boundary
+        else:
+            # Both possible acceptance counts must leave the existing boundary exact.
+            unchanged = (
+                _boundary(s.bases + 1, frontiers, s.window) == s.boundary
+                and _boundary(high, frontiers, s.window) == s.boundary
+            )
+        if unchanged:
+            self._async_validated_route = route
+        return unchanged
 
     def _update_states(self, scheduler_output):
         self._async_pending = scheduler_output if self._eligible(scheduler_output) else None
@@ -301,7 +391,7 @@ class AsyncSFAModelRunner(NPUModelRunner):
             # _eligible validated this step; no CPU request mutation has run.
             kwargs["_validated_sparse_route"] = (
                 pending.kv_connector_metadata,
-                (StagedSFARouteReason.ELIGIBLE, snapshot.frontiers, ()),
+                self._async_validated_route,
             )
         return super()._staged_sfa_local_route(**kwargs)
 
@@ -341,13 +431,23 @@ class AsyncSFAModelRunner(NPUModelRunner):
     def _apply_staged_sfa_route(self, route):
         key = super()._apply_staged_sfa_route(route)
         if self._async_pending is not None and key != self._async_snapshot.key:
+            self._cancel_single_preparation()
+        return key
+
+    def _cancel_single_preparation(self):
+        """Rebuild from accepted CPU counts, never advance the async kernel twice."""
+        if self._async_pending is not None:
             self._ensure_host_staging_ready()
             scheduled = self._reconcile()
             self._async_snapshot = None
             self._prepare_inputs(scheduled, np.full(self.input_batch.num_reqs, 2, dtype=np.int32))
-        return key
 
     def _build_attention_metadata(self, *args, **kwargs):
+        single = getattr(self, "_sfa_single_agreement", None)
+        if single is not None and single.prepared is not None and single.prepared.metadata is not None:
+            # A peer can need the second vote without changing our graph key.
+            # Reusing this result is essential: the async kernel advances bases.
+            return single.prepared.metadata
         s = self._async_snapshot
         if self._async_pending is None:
             result = super()._build_attention_metadata(*args, **kwargs)
@@ -363,7 +463,22 @@ class AsyncSFAModelRunner(NPUModelRunner):
             common.cold_compact_resumes = ()
             n, capacity = len(s.ids), s.key.token_capacity
             groups = self.input_batch.block_table.block_tables
-            prepare_async_mtp_kernel[(triton.cdiv(max(capacity // 2, item.seq_lens.numel()), 32),)](
+            dcp = getattr(item, "sfa_dcp", None)
+            local_capacity = 0
+            layout = {}
+            if getattr(item, "indexer_c8_slot_mapping", None) is not None:
+                layout.update(
+                    slots_c8=item.indexer_c8_slot_mapping, MIXED_C8=True,
+                    table_c8=item.indexer_c8_block_table, stride_c8=item.indexer_c8_block_table.stride(0),
+                )
+            if dcp is not None:
+                local_capacity = dcp.local_seq_lens.numel()
+                layout.update(
+                    live_origins=dcp.layout.live_origins, seq_local=dcp.local_seq_lens,
+                    local_capacity=local_capacity, DCP_WORLD=dcp.layout.world_size, DCP_RANK=dcp.layout.rank,
+                )
+            rows = max(capacity // 2, item.seq_lens.numel(), local_capacity)
+            prepare_async_mtp_kernel[(triton.cdiv(rows, 32),)](
                 self._async_bases,
                 self._async_counts,
                 self.positions.gpu,
@@ -382,22 +497,27 @@ class AsyncSFAModelRunner(NPUModelRunner):
                 groups[0].block_size,
                 groups[1].block_size,
                 BLOCK=32,
-                **(
-                    {
-                        "slots_c8": item.indexer_c8_slot_mapping,
-                        "MIXED_C8": True,
-                        "table_c8": item.indexer_c8_block_table,
-                        "stride_c8": item.indexer_c8_block_table.stride(0),
-                    }
-                    if getattr(item, "indexer_c8_slot_mapping", None) is not None
-                    else {}
-                ),
+                **layout,
             )
             common.seq_lens_cpu = common.num_computed_tokens_cpu = None
             item.seq_lens_cpu = None
             # The boundary is proven unchanged, so no host read/upload is needed.
             item.decode_remap_boundary_ready = True
             item.cos, item.sin = get_cos_and_sin_mla(self.positions.gpu[:capacity].long(), True)
+            if item.dsa_cp_context is not None:
+                cp = item.dsa_cp_context
+                width = cp.local_end_with_pad - cp.local_start
+                cp_sequence_lengths(
+                    item.cum_query_lens,
+                    item.seq_lens,
+                    cp.local_start,
+                    width,
+                    cp.actual_seq_lengths_query,
+                    cp.actual_seq_lengths_key,
+                )
+                cp.slot_mapping_cp.copy_(
+                    cp_slice(item.slot_mapping, cp.local_start // width, cp.num_tokens_pad // width, -1)
+                )
             result = metadata, common
         self._async_built = (result, _shape(kwargs))
         return result
@@ -420,6 +540,11 @@ class AsyncSFAModelRunner(NPUModelRunner):
                 common.num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu_tensor[: common.num_reqs]
                 common.max_seq_len = int(self.seq_lens.np[: len(s.ids)].max())
                 self.async_mtp_replays += 1
+                if self.async_mtp_replays == 1:
+                    logger.info(
+                        "[SFA async MTP] first launch-before-reconcile batch: requests=%d connector_route=%s",
+                        len(s.ids), self._async_validated_route[0],
+                    )
             self._remember(seed=not deferred)
             return output
         except BaseException:
@@ -443,7 +568,7 @@ class AsyncSFAModelRunner(NPUModelRunner):
         groups = self.input_batch.block_table.block_tables
         if (
             shape[0] != 2 * len(ids)
-            or item.dsa_cp_context is not None
+            or (item.dsa_cp_context is not None and not enable_dsa_cp_decoder())
             or len(groups) != 2
             or item.indexer_slot_mapping is None
             or item.decode_remap_boundary_buffer is None

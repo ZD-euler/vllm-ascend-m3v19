@@ -17,6 +17,8 @@
 #
 import copy
 import functools
+import hashlib
+import traceback
 from collections.abc import Callable
 from typing import Any
 
@@ -32,7 +34,9 @@ from vllm.config.utils import Range
 from vllm.logger import logger
 
 from vllm_ascend.ascend_config import AscendCompilationConfig, get_ascend_config
-from vllm_ascend.utils import COMPILATION_PASS_KEY
+from vllm_ascend.utils import COMPILATION_PASS_KEY, sfa_full_graph_enabled, staged_sfa_graph_configured
+
+_SFA_NPUGRAPH_EX_REVISION = "sfa_npugraph_ex_v2"
 
 
 def compile_fx(graph: GraphModule, example_inputs: list, inner_compile: Callable, decompositions: dict) -> Callable:
@@ -41,6 +45,27 @@ def compile_fx(graph: GraphModule, example_inputs: list, inner_compile: Callable
     if not graph_returns_tuple(graph):
         return make_graph_return_tuple(graph, example_inputs, recursive_compile_fx)
     return aot_autograd(fw_compiler=inner_compile)(graph, example_inputs)
+
+
+def _shared_resident_clone_policy(node, op):
+    """Share one copy policy between the ordinary and npugraph_ex compilers."""
+    full = getattr(torch.ops.vllm, "sfa_forward_full", None)
+    if not node.args or node.args[0] not in (op.default, full.default if full is not None else None):
+        return None
+    if node.target == torch.ops.higher_order.auto_functionalized and node.kwargs.get("resident_writes"):
+        names = node.kwargs.get("_only_clone_these_tensors")
+        return "_only_clone_these_tensors", ("output",) if names is None else tuple(
+            n for n in names if n != "resident_writes"
+        )
+    if node.target == torch.ops.higher_order.auto_functionalized_v2 and node.kwargs.get("_resident_writes_length"):
+        resident_bases = {
+            node.kwargs[f"_resident_writes_{i}_base_index"] for i in range(node.kwargs["_resident_writes_length"])
+        }
+        resident_bases.discard(node.kwargs["_output_base_index"])
+        bases = node.kwargs.get("_only_clone_these_bases")
+        bases = range(len(node.kwargs["_all_bases"])) if bases is None else bases
+        return "_only_clone_these_bases", tuple(i for i in bases if i not in resident_bases)
+    return None
 
 
 def _reuse_shared_resident_buffers(graph: fx.GraphModule) -> bool:
@@ -55,25 +80,57 @@ def _reuse_shared_resident_buffers(graph: fx.GraphModule) -> bool:
         return False
     changed = False
     for node in graph.graph.nodes:
-        if not node.args or node.args[0] != op.default:
-            continue
-        if node.target == torch.ops.higher_order.auto_functionalized and node.kwargs.get("resident_writes"):
-            names = node.kwargs.get("_only_clone_these_tensors")
-            names = ("output",) if names is None else tuple(n for n in names if n != "resident_writes")
-            node.kwargs = dict(node.kwargs, _only_clone_these_tensors=names)
-            changed = True
-        elif node.target == torch.ops.higher_order.auto_functionalized_v2 and node.kwargs.get(
-            "_resident_writes_length"
-        ):
-            resident_bases = {
-                node.kwargs[f"_resident_writes_{i}_base_index"] for i in range(node.kwargs["_resident_writes_length"])
-            }
-            resident_bases.discard(node.kwargs["_output_base_index"])
-            bases = node.kwargs.get("_only_clone_these_bases")
-            bases = range(len(node.kwargs["_all_bases"])) if bases is None else bases
-            node.kwargs = dict(node.kwargs, _only_clone_these_bases=tuple(i for i in bases if i not in resident_bases))
+        policy = _shared_resident_clone_policy(node, op)
+        if policy is not None:
+            node.kwargs = dict(node.kwargs, **{policy[0]: policy[1]})
             changed = True
     return changed
+
+
+def _lower_shared_resident_mutations(graph: fx.GraphModule) -> None:
+    """Resolve our copy policy before TorchAir's later generic HOP lowering.
+
+    Leave unrelated mutations to the backend. Do not edit HOP arguments before
+    matching: PyTorch's eager_input_vals records their original tree structure.
+    """
+    from torch._higher_order_ops.auto_functionalize import auto_functionalized_dense, auto_functionalized_v2_dense
+    from torch._inductor.pattern_matcher import CallFunctionVarArgs, PatternMatcherPass, register_graph_pattern
+    from torch.utils import _pytree as pytree
+
+    op = getattr(torch.ops.vllm, "sfa_forward_pre_shared", None)
+    if op is None:
+        return
+    patterns = PatternMatcherPass()
+
+    def register(hop, dense):
+        @register_graph_pattern(
+            CallFunctionVarArgs(hop),
+            extra_check=lambda match: _shared_resident_clone_policy(match.nodes[0], op) is not None,
+            pass_dict=patterns,
+        )
+        def lower(match, *args, **kwargs):
+            name, policy = _shared_resident_clone_policy(match.nodes[0], op)
+            flat, spec = pytree.tree_flatten((args, kwargs))
+
+            def decompose(*values):
+                args, kwargs = pytree.tree_unflatten(values, spec)
+                kwargs[name] = policy
+                return dense(args[0], **kwargs)
+
+            match.replace_by_example(decompose, flat, run_functional_passes=False)
+
+    register(torch.ops.higher_order.auto_functionalized, auto_functionalized_dense)
+    register(torch.ops.higher_order.auto_functionalized_v2, auto_functionalized_v2_dense)
+    if patterns.apply(graph.graph):
+        # Inference AOT keeps mutation epilogues. Reusing resident inputs turns
+        # those copies into identities; TorchAir's reinplacer assumes their
+        # sources have operands and crashes when a source is a placeholder.
+        for node in graph.graph.nodes:
+            if node.target == torch.ops.aten.copy_.default and node.args[0] is node.args[1]:
+                node.replace_all_uses_with(node.args[0])
+                graph.graph.erase_node(node)
+        graph.graph.lint()
+        graph.recompile()
 
 
 def fusion_pass_compile(
@@ -123,6 +180,20 @@ def npugraph_ex_compile(
     # Avoid to change torch.ops.aten.gelu.default to torch.ops.aten.gelu_.default which will fallback to CPU
     # and cause copy_between_host_and_device error.
     config.debug.aclgraph.disable_reinplace_inplaceable_ops_pass = True
+    if staged_sfa_graph_configured(vllm_config) and sfa_full_graph_enabled(vllm_config):
+        from vllm.compilation.passes.inductor_pass import pass_context
+
+        if not hasattr(config, "post_grad_custom_pre_pass"):
+            raise RuntimeError("Full SFA npugraph_ex requires TorchAir post_grad_custom_pre_pass support")
+        pass_manager = compiler_config[COMPILATION_PASS_KEY]
+
+        def prepare_sfa(gm, example_inputs, compiler_options):
+            with pass_context(compile_range):
+                gm = pass_manager(gm)
+            _lower_shared_resident_mutations(gm)
+            return gm
+
+        config.post_grad_custom_pre_pass = prepare_sfa
     if ascend_compilation_config.enable_static_kernel:
         logger.info(
             "enable_static_kernel is enabled, static shape kernel will be used to accelerate aclgraph execution."
@@ -163,7 +234,10 @@ class AscendCompiler(CompilerInterface):
         npugraph_ex_enabled = get_ascend_config().ascend_compilation_config.enable_npugraph_ex
         if npugraph_ex_enabled:
             self.vllm_config = vllm_config
-        return vllm_config.compute_hash()
+        base_hash = vllm_config.compute_hash()
+        if npugraph_ex_enabled and staged_sfa_graph_configured(vllm_config) and sfa_full_graph_enabled(vllm_config):
+            return hashlib.sha256(f"{base_hash}:{_SFA_NPUGRAPH_EX_REVISION}".encode()).hexdigest()
+        return base_hash
 
     def compile(
         self,
@@ -175,6 +249,7 @@ class AscendCompiler(CompilerInterface):
     ) -> tuple[Callable | None, Any | None]:
         # inductor can inplace modify the graph, so we need to copy it
         # see https://github.com/pytorch/pytorch/issues/138980
+        original_graph = graph
         graph = copy.deepcopy(graph)
 
         from torch._guards import detect_fake_mode
@@ -196,8 +271,36 @@ class AscendCompiler(CompilerInterface):
         if ascend_compilation_config.enable_npugraph_ex:
             logger.info("enable_npugraph_ex is enabled, which will bring graph compilation optimization.")
             assert hasattr(self, "vllm_config")
-            return npugraph_ex_compile(
-                graph, example_inputs, compiler_config, self.vllm_config, ascend_compilation_config, compile_range, key
-            )
-        else:
-            return fusion_pass_compile(graph, example_inputs, compiler_config, compile_range, key)
+            try:
+                return npugraph_ex_compile(
+                    graph,
+                    example_inputs,
+                    compiler_config,
+                    self.vllm_config,
+                    ascend_compilation_config,
+                    compile_range,
+                    key,
+                )
+            except IndexError as error:
+                if not (
+                    staged_sfa_graph_configured(self.vllm_config)
+                    and sfa_full_graph_enabled(self.vllm_config)
+                    and any(
+                        frame.f_code.co_name == "_set_inputs_custom_attr"
+                        and frame.f_globals.get("__name__", "").endswith("torchair.npu_fx_compiler")
+                        for frame, _ in list(traceback.walk_tb(error.__traceback__))[-1:]
+                    )
+                ):
+                    raise
+                # AOT can merge mutable aliases; affected TorchAir versions
+                # restore attributes using stale pre-AOT indices. Retry only
+                # this fragment with the established alias-aware SFA compiler.
+                logger.warning(
+                    "TorchAir input-attribute indices do not match AOT inputs; "
+                    "using regular SFA fusion for subgraph %s (range %s). "
+                    "Full SFA graphs remain enabled; TorchAir-only fusions may be lost for this subgraph.",
+                    key,
+                    compile_range,
+                )
+                graph = copy.deepcopy(original_graph)
+        return fusion_pass_compile(graph, example_inputs, compiler_config, compile_range, key)

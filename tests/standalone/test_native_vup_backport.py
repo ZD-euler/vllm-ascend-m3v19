@@ -112,11 +112,9 @@ def test_actual_runner_startup_imports_sfa_constants_before_capture(monkeypatch,
 
     source = ROOT / "vllm_ascend/worker/model_runner_v1.py"
     tree = ast.parse(source.read_text(encoding="utf-8"))
-    method = next(
-        node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "_model_forward"
-    )
+    methods = {"_model_forward", "_prepare_sfa_full_graph_call"}
     module = ast.parse("from __future__ import annotations")
-    module.body.append(method)
+    module.body.extend(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name in methods)
     key = NS(request_capacity=2, token_capacity=tokens)
     context = NS(staged_sfa_graph_key=key, staged_sfa_graph_dummy_run=True, cudagraph_runtime_mode="FULL")
     namespace = {
@@ -150,6 +148,7 @@ def test_actual_runner_startup_imports_sfa_constants_before_capture(monkeypatch,
         _coordinate_sfa_full_graph_preparation=Mock(side_effect=coordinate),
         _run_sfa_full_graph_target=object(),
     )
+    runner._prepare_sfa_full_graph_call = namespace["_prepare_sfa_full_graph_call"].__get__(runner)
     assert namespace["_model_forward"](runner, tokens) == "captured"
     runner._coordinate_sfa_full_graph_preparation.assert_called_once_with(None, True)
     if overlap_enabled:

@@ -33,6 +33,54 @@ registry = load_source(
 )
 
 
+@pytest.mark.parametrize("mode", ["baseline", "membership", "dcp"])
+def test_resident_dispatch_keeps_selected_counts_separate_from_misses(monkeypatch, mode):
+    union_name = {
+        "baseline": "npu_dsa_resident_sharded_union_",
+        "membership": "npu_dsa_resident_membership_union_",
+        "dcp": "npu_dsa_resident_dcp_union_",
+    }[mode]
+    plan_name = {
+        "baseline": "npu_dsa_resident_sorted_plan_",
+        "membership": "npu_dsa_resident_membership_plan_",
+        "dcp": "npu_dsa_resident_dcp_plan_",
+    }[mode]
+    union, plan = Mock(), Mock()
+    monkeypatch.setattr(torch.ops._C_ascend, union_name, union, raising=False)
+    monkeypatch.setattr(torch.ops._C_ascend, plan_name, plan, raising=False)
+    topk = torch.zeros((2, 1, 2048), dtype=torch.int32)
+    table = torch.ones((1, 33), dtype=torch.int32)
+    indices = torch.zeros(1, dtype=torch.int32)
+    generations = torch.ones(1, dtype=torch.int64)
+    state = resident.allocate_sorted_resident_state(1, 1, 2, device=topk.device)
+    workspace = resident.allocate_sorted_resident_workspace(1, 2, device=topk.device)
+    counts = torch.empty((2, 16), dtype=torch.int32)
+    origins = torch.tensor([4096], dtype=torch.int32)
+    dcp = resident.ResidentDcpLayout(4, 2, origins, counts) if mode == "dcp" else None
+    resident.prepare_resident_sharded_union_(
+        topk, topk[:, 0, 0], topk[:, 0, 0], indices, generations, state, workspace,
+        mtp=2, query_membership=mode == "membership", dcp=dcp,
+    )
+    tokens, misses, slots = resident.prepare_sorted_resident_cache_fused_(
+        topk, table, indices, generations, state, workspace,
+        block_size=128, query_membership=mode == "membership", dcp=dcp,
+    )
+    assert tokens is workspace.miss_tokens and slots is workspace.target_slots
+    assert misses.data_ptr() == workspace.miss_counts.data_ptr()
+    union.assert_called_once()
+    plan.assert_called_once()
+    assert union.call_args.args[-2:] == (2, state.dummy_state_base)
+    assert plan.call_args.args[-2:] == (128, state.dummy_state_base)
+    assert union.call_args.kwargs == ({"dcp_size": 4, "dcp_rank": 2} if dcp is not None else {})
+    if dcp is None:
+        assert not plan.call_args.kwargs
+    else:
+        options = plan.call_args.kwargs
+        assert options["fused_remap"] is True
+        assert options["live_origins"] is origins and options["selected_counts"] is counts
+        assert (options["dcp_size"], options["dcp_rank"]) == (4, 2)
+
+
 def methods(path, names, namespace):
     tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
     nodes = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name in names]
@@ -45,7 +93,7 @@ def methods(path, names, namespace):
 
 @pytest.fixture
 def api():
-    ns = dict(vars(resident), np=np, envs=NS(VLLM_ASCEND_MTP_DRAFT_DEBUG=False))
+    ns = dict(vars(resident), np=np, HAS_TRITON=False, envs=NS(VLLM_ASCEND_MTP_DRAFT_DEBUG=False))
     ns["_configured_resident_shards"] = lambda mtp: (4, 4 * mtp)
     ns["prepare_sparse_indices"] = Mock(return_value="legacy")
     ns["prepare_resident_sharded_union_"] = Mock()
@@ -85,6 +133,7 @@ def impl(api, index, raw, *, shared=False, mtp=1):
         shared_resident_candidate=True,
         shared_resident_plan=None,
         dsa_resident_cache=True,
+        _resident_query_membership=False,
         decode_threshold=mtp,
         index_topk=2048,
         block_size=128,
@@ -140,6 +189,7 @@ def runner_api(implementations, kinds):
         parallel_config=NS(enable_dbo=False),
     )
     runner.dsa_resident_cache = True
+    runner.dsa_decoder_dcp = False
     runner.max_num_reqs = 2
     runner._shared_resident_groups = []
     runner._shared_resident_failed = False
@@ -182,8 +232,10 @@ def plan(layer, raw, *, requests=1, writes=None, reads=None, packed=True):
 
 
 @pytest.mark.parametrize("mtp", [1, 2])
-def test_one_plan_raw_publication_and_capacity_views(api, mtp):
+@pytest.mark.parametrize("query_membership", [False, True])
+def test_one_plan_raw_publication_and_capacity_views(api, mtp, query_membership):
     _, (producer, consumer), group, _ = grouped(api, mtp)
+    producer._resident_query_membership = query_membership
     state = group.state
     for requests in (1, 2, 1):
         raw = torch.full((requests * mtp, 1, 2048), requests, dtype=torch.int32)
@@ -200,6 +252,8 @@ def test_one_plan_raw_publication_and_capacity_views(api, mtp):
         assert group.state is state
     assert api[1]["prepare_resident_sharded_union_"].call_count == 3
     assert api[1]["prepare_sorted_resident_cache_fused_"].call_count == 3
+    for stage in ("prepare_resident_sharded_union_", "prepare_sorted_resident_cache_fused_"):
+        assert all(call.kwargs["query_membership"] is query_membership for call in api[1][stage].call_args_list)
     api[1]["prepare_sparse_indices"].assert_not_called()
 
 
@@ -355,6 +409,23 @@ def test_preflight_rejects_separate_metadata_before_model_execution(api):
         runner._prepare_shared_resident_plans(1)
 
 
+def test_dcp_mixed_forward_preserves_shared_resident_generation(api):
+    runner, _, group, ns = grouped(api)
+    common = metadata(group)
+    common.attn_state = 3  # One dense row alongside a compact decode row.
+    common.req_ids = ["r", "dense"]
+    common.sfa_dcp = NS(row_requests=torch.tensor([0, -1]))
+    ns["get_forward_context"] = lambda: NS(attn_metadata=dict.fromkeys(group.members, common))
+    registry = runner._resident_state_registry
+    _, before = registry.bind(["r"], [(2, 1)])
+    runner._prepare_shared_resident_plans(2)
+    _, after = registry.bind(["r"], [(2, 1)])
+    np.testing.assert_array_equal(after, before)
+    common.resident_state_generations = None
+    with pytest.raises(RuntimeError, match="request state"):
+        runner._prepare_shared_resident_plans(2)
+
+
 @pytest.mark.parametrize("fault", [None, "builder", "block_size", "stride", "dtype"])
 def test_destination_slot_layout_qualification(api, fault):
     runner, _, group, _ = grouped(api)
@@ -465,6 +536,7 @@ def test_preemption_with_recycled_block_ids_changes_shared_generation(enabled):
 def test_shared_operator_schema_preserves_old_api_and_declares_writes():
     ns = dict(
         torch=torch,
+        enable_dsa_cp_decoder=lambda: False,
         StagedSFABridge=tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     )
     methods(
@@ -490,10 +562,13 @@ def test_shared_operator_schema_preserves_old_api_and_declares_writes():
 
 
 @pytest.mark.parametrize("mtp", [1, 2])
-def test_compiled_producer_consumer_observe_explicit_mutation(api, mtp):
+@pytest.mark.parametrize("query_membership", [False, True])
+def test_compiled_producer_consumer_observe_explicit_mutation(api, mtp, query_membership):
     _, (producer, consumer), group, _ = grouped(api, mtp)
+    producer._resident_query_membership = query_membership
     ns = dict(
         torch=torch,
+        enable_dsa_cp_decoder=lambda: False,
         StagedSFABridge=tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     )
     methods(
@@ -518,7 +593,7 @@ def test_compiled_producer_consumer_observe_explicit_mutation(api, mtp):
     ns["_mla_runtime_state"] = lambda name: (producer if name == "producer" else consumer, name, (), None)
     # Dynamo retains operator handles after the local library is destroyed.
     # Keep parameterized cases in separate namespaces, as separate workers are.
-    namespace = f"shared_resident_compile_test_{mtp}"
+    namespace = f"shared_resident_compile_test_{mtp}_{int(query_membership)}"
     lib = torch.library.Library(namespace, "DEF")
     lib.define(
         "pre" + torch.library.infer_schema(ns["sfa_forward_pre_shared"], mutates_args=["output", "resident_writes"])

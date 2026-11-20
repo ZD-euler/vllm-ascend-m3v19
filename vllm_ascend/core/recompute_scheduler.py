@@ -163,6 +163,10 @@ class RecomputeScheduler(Scheduler):
             return super()._update_waiting_for_remote_kv(request)
         if retry[0] != request.num_preemptions:
             raise RuntimeError("Stale checkpoint retry reached scheduler promotion")
+        self._log_request_transition(
+            "resume_retry", request, cause="checkpoint_restore_miss",
+            retry_generation=retry[0], retry_load_generation=retry[1],
+        )
         self.failed_recving_kv_req_ids.add(request.request_id)
         request.num_computed_tokens = 0
         request.num_cached_tokens = 0
@@ -331,6 +335,11 @@ class RecomputeScheduler(Scheduler):
                     transfer_config = self.vllm_config.kv_transfer_config
                     if transfer_config is not None and not transfer_config.is_kv_producer:
                         recomputed_req = self.running.pop()
+                        self._log_request_transition(
+                            "recompute_redirect", recomputed_req,
+                            cause="kv_allocation_failed", trigger_request_id=request.request_id,
+                            requested_tokens=num_new_tokens, lookahead_tokens=self.num_lookahead_tokens,
+                        )
                         self.kv_cache_manager.free(recomputed_req)
                         recomputed_reqs.append(
                             RecomputeReqInfo(
@@ -373,6 +382,12 @@ class RecomputeScheduler(Scheduler):
                                 ).get_block_ids()),
                                 preempted_req.num_computed_tokens,
                             ))
+                        self._log_request_transition(
+                            "preemption_trigger", preempted_req,
+                            cause="kv_allocation_failed", trigger_request_id=request.request_id,
+                            requested_tokens=num_new_tokens, lookahead_tokens=self.num_lookahead_tokens,
+                            next_preemption_count=preempted_req.num_preemptions + 1,
+                        )
                         self._preempt_request(preempted_req, scheduled_timestamp)
                         preempted_reqs.append(preempted_req)
                         if preempted_req == request:
@@ -503,11 +518,23 @@ class RecomputeScheduler(Scheduler):
 
                         request.num_external_computed_tokens = ext_tokens
                         num_external_computed_tokens = ext_tokens
-                        dsa_compact_external_load = load_kv_async and bool(
-                            getattr(
-                                self.connector,
-                                "supports_dsa_compact_external_load",
-                                False,
+                        compact_load_query = (
+                            getattr(self.connector, "is_dsa_cold_compact_load", None)
+                            if load_kv_async else None
+                        )
+                        request_compact_load = (
+                            compact_load_query(request.request_id)
+                            if callable(compact_load_query) else None
+                        )
+                        dsa_compact_external_load = load_kv_async and (
+                            bool(request_compact_load)
+                            if request_compact_load is not None
+                            else bool(
+                                getattr(
+                                    self.connector,
+                                    "supports_dsa_compact_external_load",
+                                    False,
+                                )
                             )
                         )
 
@@ -523,6 +550,10 @@ class RecomputeScheduler(Scheduler):
                     new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
+
+                if num_computed_tokens < getattr(request, "min_kv_prefix_tokens", 0):
+                    self._finish_kv_admission_error(request, num_computed_tokens)
+                    continue
 
                 if self._reject_impossible_initial_dsa_request(
                     request, compact_external_load=dsa_compact_external_load,
@@ -606,6 +637,21 @@ class RecomputeScheduler(Scheduler):
                 # of local and remote blocks.
                 effective_lookahead_tokens = 0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
 
+                if load_kv_async:
+                    restore_extent_query = getattr(
+                        self.connector, "get_dsa_cold_load_num_tokens", None
+                    )
+                    if callable(restore_extent_query):
+                        # Restore storage may extend beyond the reusable prefix.
+                        # Reserving it must not schedule any model computation.
+                        restore_tokens = int(restore_extent_query(request.request_id))
+                        effective_lookahead_tokens = max(
+                            effective_lookahead_tokens,
+                            restore_tokens
+                            - num_new_local_computed_tokens
+                            - num_external_computed_tokens,
+                        )
+
                 if (
                     dsa_compact_external_load
                     and load_kv_async
@@ -683,6 +729,11 @@ class RecomputeScheduler(Scheduler):
                     # _update_waiting_for_remote_kv will then cache
                     # only the successfully loaded tokens.
                     request.num_computed_tokens = num_computed_tokens
+                    if request.num_preemptions:
+                        self._log_request_transition(
+                            "resume_load_started", request,
+                            external_tokens_this_admission=num_external_computed_tokens,
+                        )
                     continue
 
                 # For spec_token_ids, the waiting queue has the same processing
@@ -726,6 +777,13 @@ class RecomputeScheduler(Scheduler):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                if scheduled_resumed_reqs and scheduled_resumed_reqs[-1] is request:
+                    self._log_request_transition(
+                        "request_resumed", request,
+                        scheduled_tokens=num_new_tokens,
+                        scheduled_draft_tokens=len(scheduled_spec_decode_tokens.get(request_id, ())),
+                        external_tokens_this_admission=num_external_computed_tokens,
+                    )
                 # Count the number of prefix cached tokens.
                 if request.num_cached_tokens < 0:
                     request.num_cached_tokens = num_computed_tokens

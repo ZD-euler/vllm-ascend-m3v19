@@ -9,8 +9,8 @@ LMCache imports. Do not use this benchmark to claim a serving TPOT/TTFT gain.
 
 ## What changes
 
-The union/intersection algorithm is identical in all variants. Select variants
-with `--variants`; `baseline` is always included for comparison.
+Select variants with `--variants` and a reference with `--compare-to`. The full
+build defaults to the original baseline comparison.
 
 | Variant | Finalize | Update/remap |
 |---|---|---|
@@ -23,6 +23,63 @@ with `--variants`; `baseline` is always included for comparison.
 | `vector_intersection` | Original | Original sorting/dedup; exact vector resident intersection only |
 | `vector_state_update` | Original | Exact vector state merge; original union/finalize/remap |
 | `exact_combined` | Original | Vector intersection and vector state merge; original finalize/remap |
+| `query_membership` | Original | Exact intersection/state merge; vector union tags and row assembly |
+
+## Fast query membership comparison
+
+On the 910B3 host, activate the deployment's Torch/Torch-NPU environment and
+source its CANN `set_env.sh`. Use the same SoC value as the serving build.
+
+```bash
+EXP=benchmarks/ops/resident_kernel_experiment
+BUILD="$EXP/build-membership"
+bash "$EXP/build.sh" ascend910b3 "$BUILD" membership
+python3 "$EXP/benchmark.py" --build-dir "$BUILD" --requests 1 8 16 \
+  --mtp 2 --hit-rates 0.9 1 --live-tokens 64 --json "$BUILD/results.json"
+```
+
+The `membership` profile builds five AIV entry points (two unions, two updates,
+and one shared finalize) and the small Torch-NPU binding. It does not build or
+install vLLM-Ascend, LMCache, or the model's attention kernels. Rerun the same
+build command for an incremental rebuild. The optional last argument `full`
+builds the older experimental variants as well.
+
+The fast profile defaults to `exact_combined` vs. `query_membership`. It checks
+both against the CPU oracle before timing. The default `--stage full --mode
+profile` reports individual Union/Finalize/Update device times, their sum, and
+the span across the three launches. Use `--stage update` for an isolated Update
+comparison; each variant's workspace is prepared by its own Union and Finalize.
+Try `--overlap 0`, `--overlap 2048`, and `--scenario skewed` to test disjoint
+rows, high overlap, and one heavily loaded shard. The hit fraction in the JSON
+is computed from the historical union; live entries are not cache requests.
+
+```bash
+python3 -m pytest --confcutdir="$EXP/tests" -o addopts= -q \
+  "$EXP/tests/test_query_membership.py" "$EXP/tests/test_kernels.py" \
+  --resident-build-dir "$BUILD" -k membership
+```
+
+The new path sorts the same shard-local candidates, carrying a one-hot query tag
+instead of the original column. Adjacent comparisons compact the union and the
+OR of each pair's tags. The active prefix of the existing int16 mapping
+allocation now holds one tag per unique token. Finalize does not read that
+allocation. Union also publishes row validity and split boundaries in unused
+fields of shard zero's count record. Update retains one state task per shard
+and adds one task per query row in the same launch. Row tasks read finalized slots, compact aligned UB
+segments, and write a single fixed-width row. They do not read the state that
+sibling tasks are updating. No scan over original Top-K positions or extra
+kernel launch is needed.
+
+The experiment accepts the existing unique-row contract for one or two query
+rows: valid indices occupy a contiguous nonnegative prefix, followed by `-1`;
+invalid graph rows are zeroed separately. It returns shard-ordered historical
+slots followed by the original live indices. A stage-only caller must pair
+matching workspace producers and consumers; the new tags are not position
+ranks. Legacy remap/state probes are unavailable for the membership variant.
+
+These timings cover the planner, not H2D retrieval, sparse attention, or TPOT.
+Before serving integration, compare actual attention outputs and timings for
+the reordered indices, and check model output and MTP acceptance on NPU.
 
 `vector_union` changes only the union kernel. Sorting, the subsequent scalar
 resident intersection, allocation policy, finalize and update remain baseline.
@@ -355,28 +412,40 @@ The new variants target partial hits but can lose performance from extra index
 arithmetic or duplicated reads. No speedup is claimed until these measurements
 pass correctness and run on the target hardware.
 
-## Serving selection (this feature branch)
+## Serving selection
 
-The normal serving extension now compiles baseline and `exact_combined` together.
-`VLLM_ASCEND_DSA_RESIDENT_EXACT_KERNELS=1` (the default) selects exact vector
-intersection and vector state update; `0` selects the original kernels.
-Set it before starting **every worker**, and restart to change it. Selection is
-cached before graph capture and cannot change within a worker. Graph replay has
-no environment lookup or device-side selection branch. Eager enqueue reads the
-frozen launcher table; retrieval, operator schemas, allocation and remap semantics
-are unchanged. Unsupported vector geometries retain their existing scalar fallback.
+The serving extension builds the baseline, exact, and query membership planners.
+`VLLM_ASCEND_DSA_RESIDENT_QUERY_MEMBERSHIP=0` (default) keeps the existing
+`VLLM_ASCEND_DSA_RESIDENT_EXACT_KERNELS` selection: `1` for exact, `0` for baseline.
+Set `VLLM_ASCEND_DSA_RESIDENT_QUERY_MEMBERSHIP=1` on the decoder workers to use
+the bitmap planner on the existing fused sorted-resident decode route. The
+bitmap variant uses exact resident matching and state update regardless of
+the legacy selector. Split remap and diagnostic operators still use position
+ranks. Nonresident execution retains its existing path.
+
+The worker selects the matching Union and Finalize/Update operators before
+capture. Shared planner consumers still reuse the producer's plan. There is no
+extra tensor, kernel launch, environment read on replay, or change to LMCache
+miss transfers. Output indices for a valid row may be reordered.
 
 Rebuild the **serving** extension once (the standalone experiment build is insufficient):
 
 ```bash
 SOC_VERSION=ascend910b3 COMPILE_CUSTOM_KERNELS=1 python -m pip install -e . --no-build-isolation --no-deps
-export VLLM_ASCEND_DSA_RESIDENT_EXACT_KERNELS=1  # or 0 for the baseline A/B run
-# Launch the existing deployment, propagating this variable to all workers.
+export VLLM_ASCEND_DSA_RESIDENT_QUERY_MEMBERSHIP=1
+# Launch the existing decoder deployment with the flag on all workers.
 ```
 
-Use your deployment's actual SOC_VERSION. No LMCache YAML or graph-size change
-is needed. Missing rebuilt operators fail at initialization, before capture.
-The feature branch descends from production `sparse` commit `58cbdbbc` and now
-includes production through `6fc30da6` (GLM compatibility, recovery/capacity fixes
-and staged event handoff). Serving qualification must include both settings,
-graph replay and preemption/reuse correctness on NPU.
+Use your deployment's actual `SOC_VERSION`. Restart the decoder workers and
+recapture their graphs after changing the flag. Missing bitmap operators fail
+at initialization when enabled. No LMCache YAML or graph-size change is needed.
+
+For a device check of the rebuilt extension:
+
+```bash
+python -m pytest -q tests/e2e/nightly/single_node/ops/singlecard_ops/test_resident_sorted_cache.py \
+  -k 'query_membership or full_path_supports_graph_replay or zeroes_staged_graph_padding'
+```
+
+For a serving A/B, keep the exact selector at `1` and toggle only membership.
+The standalone planner speedup does not measure attention, TPOT, or throughput.

@@ -73,6 +73,8 @@ def routing():
         "_determine_batch_execution_and_padding",
         "_coordinate_sfa_full_graph_preparation",
         "_model_forward",
+        "_prepare_sfa_full_graph_call",
+        "_clear_sfa_idle_metadata",
         "_staged_sfa_dummy_seq_len",
         "_prepare_staged_sfa_dummy_block_tables",
         "_staged_sfa_capture_keys",
@@ -874,10 +876,22 @@ def test_dummy_dispatch_passes_idle_status_to_layout_agreement():
     assert isinstance(vote, ast.Name) and vote.id == "dp_idle"
 
 
+@pytest.mark.parametrize("method,key", [("execute_model", "staged_sfa_graph_key"), ("_dummy_run", "staged_dummy_key")])
+def test_dcp_graph_key_is_passed_to_metadata_construction(method, key):
+    path = Path(__file__).resolve().parents[3] / "vllm_ascend/worker/model_runner_v1.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    forward = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == method)
+    calls = [node for node in ast.walk(forward) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)]
+    [(target, keyword)] = [
+        (call.func.attr, kw) for call in calls for kw in call.keywords if kw.arg == "dsa_dcp_graph_key"
+    ]
+    assert target == "_build_attention_metadata" and isinstance(keyword.value, ast.Name) and keyword.value.id == key
+
+
 @pytest.mark.parametrize("metadata_groups", [1, 2])
 @pytest.mark.parametrize("c8", [False, True])
 @pytest.mark.parametrize("idle", [False, True])
-def test_idle_clears_shared_metadata_once(metadata_groups, c8, idle):
+def test_idle_clears_shared_metadata_once(routing, metadata_groups, c8, idle):
     path = Path(__file__).resolve().parents[3] / "vllm_ascend/worker/model_runner_v1.py"
     tree = ast.parse(path.read_text(encoding="utf8"))
     dummy = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_dummy_run")
@@ -902,7 +916,7 @@ def test_idle_clears_shared_metadata_once(metadata_groups, c8, idle):
         dp_idle=idle,
         staged_sfa_graph_dummy_run=True,
         sfa_full_graph_enabled=lambda cfg: True,
-        self=SimpleNamespace(vllm_config=None),
+        self=routing[0],
         attn_metadata={str(i): items[i % metadata_groups] for i in range(78)},
     )
     exec(compile(ast.Module(body=[branch], type_ignores=[]), str(path), "exec"), scope)
@@ -1360,7 +1374,8 @@ def test_target_names_follow_collection_reset_and_recollection(failed_reset):
 @pytest.mark.parametrize(
     "change", ["none", "replacement", "wrapper", "order", "missing", "fallback", "cascade", "width"]
 )
-def test_async_route_reuses_only_current_validated_metadata(routing, request, monkeypatch, change):
+@pytest.mark.parametrize("residency", ["sparse", "resident", "mixed"])
+def test_async_route_reuses_only_current_validated_metadata(routing, request, monkeypatch, change, residency):
     base, ns, _, _, states = routing
     runner, scheduled, _, _, async_ns = request.getfixturevalue("setup")
     root = Path(__file__).resolve().parents[3] / "vllm_ascend"
@@ -1383,16 +1398,26 @@ def test_async_route_reuses_only_current_validated_metadata(routing, request, mo
     runner.attn_state = states.SpecDecoding
     runner._staged_sfa_graph_capture_sizes = (8, 16)
     runner.decode_threshold = 2
+    frontiers = tuple(
+        4096 if residency == "sparse" or (residency == "mixed" and i == 0) else 0
+        for i in range(runner.input_batch.num_reqs)
+    )
+    runner._async_snapshot.frontiers = runner._async_snapshot.boundary = frontiers
+    boundary = tuple(value for value in frontiers for _ in range(2)) + (0, 0)
+    runner.item.decode_remap_boundary_buffer._values = runner._async_snapshot.boundary_values = boundary
     scheduled.kv_connector_metadata = SimpleNamespace(
         requests=[
             SimpleNamespace(
                 req_id=rid,
-                is_sparse_decode=True,
-                dsa_current_released_frontier=4096,
-                dsa_nonresident_frontier=4096,
-                load_spec=SimpleNamespace(can_load=True, lmcache_cached_tokens=4096, dsa_committed_end=4096),
+                is_sparse_decode=frontier > 0,
+                dsa_current_released_frontier=frontier,
+                dsa_nonresident_frontier=frontier,
+                load_spec=(
+                    SimpleNamespace(can_load=True, lmcache_cached_tokens=frontier, dsa_committed_end=frontier)
+                    if frontier else None
+                ),
             )
-            for rid in runner.input_batch.req_ids
+            for rid, frontier in zip(runner.input_batch.req_ids, frontiers)
         ]
     )
     runner._update_states(scheduled)
@@ -1428,6 +1453,9 @@ def test_async_route_reuses_only_current_validated_metadata(routing, request, mo
     assert len(calls) == (1 if reused else 2)
     expected = ns["_staged_sfa_local_route"](runner, **kwargs)
     assert actual == expected
+    if change == "none":
+        assert actual.action == ns["StagedSFARouteAction"].STAGED
+        assert actual.frontiers == frontiers
     if change in ("cascade", "width"):
         assert actual.action == ns["StagedSFARouteAction"].SAFE_NATIVE
     # A new step must validate fresh metadata; no route result lives across steps.

@@ -79,6 +79,42 @@ Synthetic warmup/capture sequence lengths are bounded by `max_model_len` and
 both KV groups' logical block-table capacities. The 6144-token workspace
 heuristic is not a minimum context length; live request lengths are unchanged.
 
+V1 startup compiles the applicable decode kernels after graph capture and before
+readiness (`decode_kernel_warmup`). This also runs with eager execution, without
+DCP, and with async MTP preparation disabled. The plan is:
+
+- Keep changing row counts, history lengths and the BMM query head stride out
+  of Triton specialization keys. Retain fixed geometry, vector tiles and layout
+  constants. Kernel arithmetic, masking, packet formats and launch grids stay
+  unchanged.
+- Compile DCP global/dense/mixed Top-K, exchange and draft-metadata variants;
+  SFA query copies and indexer RoPE; active paired-bank C8 metadata layouts;
+  rejection sampling, sampling-parameter expansion, penalties and padded draft
+  preparation. Cover optional pointers and the live integer/float dtypes.
+- Use Triton's dtype-only JIT warmup: no model forward, live KV reads/writes,
+  RNG consumption, new communicator, temporary graph or per-step synchronization.
+  Compilation errors fail startup. Existing async metadata warmup still covers
+  its configured graph capacities, including mixed C8 with DCP disabled.
+
+This prevents the identified first-use/batch-specialization gaps; it is not a
+claim that every operator in every model has no other lazy initialization.
+Startup is longer on a cold compiler cache. No new configuration or native
+rebuild is required. On an idle NPU, these regressions forbid further JIT
+compilation while varying batches, padding, query strides, metadata and sampling:
+
+```bash
+python -m pytest --noconftest -o addopts= -q \
+  tests/e2e/singlecard/test_sfa_dcp_mask_warmup.py \
+  tests/e2e/singlecard/test_decode_kernel_warmup.py
+```
+
+For performance qualification, compare the same workload before/after this
+change using `benchmarks/ops/benchmark_sfa_copy_reduction.py` (including native
+attention, H2D and collectives), with request counts `1 2 3 4 8` and otherwise
+identical settings. The `3` case checks a size between usual capture buckets.
+Also sweep production batches and sampling modes after a fresh worker startup;
+the NPU tests cannot substitute for multi-host serving throughput measurements.
+
 The startup stream-budget estimate counts two target root layouts per request
 bucket, plus a captured retrieval stream per layout when shared retrieval overlap
 is enabled. It retains the conservative draft-layer-plus-one allowance, including
@@ -95,6 +131,55 @@ and 16 target root graphs. Validate 5, 6 and then 8 buckets on the deployment's
 CANN stack, including every bucket's replay, mixed/idle DP ranks, output parity
 and graph memory. A worker restart is required; this accounting change needs no
 native-extension rebuild.
+
+## Optional npugraph_ex compilation
+
+Full SFA can explicitly opt in to TorchAir FX optimization while retaining the
+existing root capture/replay and `PIECEWISE` compilation setting:
+
+```json
+{"ascend_compilation_config":{"enable_npugraph_ex":true,"enable_static_kernel":false}}
+```
+
+Merge this into `--additional-config`; the setting is nested, not a top-level
+`enable_npugraph_ex` key. It is off by default for full SFA. Ordinary staged,
+eager and native `FULL_DECODE_ONLY` behavior is unchanged. Restart workers when
+changing it. No native-extension rebuild is needed for this integration.
+
+The new path runs the existing configured fusion/SP passes after AOT, lowers
+only the shared-resident SFA mutation wrapper with its existing copy policy,
+then lets TorchAir finish optimization. The target graph manager, transfer
+events, source ownership and replay paths remain unchanged. An enabled runtime
+must provide `CompilerConfig.post_grad_custom_pre_pass`; missing support fails
+compilation explicitly. A distinct compiler hash separates the new route from
+older compiled artifacts. Static kernels are a separate qualification step;
+start with the setting above.
+
+Some TorchAir versions restore tensor attributes by their pre-AOT input indices.
+AOT can merge duplicate or overlapping mutable inputs, making those indices
+invalid. If `_set_inputs_custom_attr` raises `IndexError`, full SFA retries only
+that subgraph through the existing regular fusion compiler, starting from the
+original graph. Other compiler failures still propagate. A warning identifies
+the subgraph and compile range; DCP, resident-buffer reuse and full-SFA capture
+remain enabled. This adds startup compilation work and can lose TorchAir-only
+fusions in the affected fragment, so remeasure serving performance. No runtime
+retry, new per-step collective, configuration change or native rebuild is added.
+
+Before serving, run the installed-backend probe in an NPU container:
+
+```bash
+python -m pytest --noconftest -q tests/e2e/singlecard/compile/test_sfa_npugraph_ex_npu.py
+```
+
+This uses synthetic operators with the SFA mutation schema, the real compiler,
+root capture and `RetrievalEdge`. It checks persistent/aliased buffers and late
+prefetch binding; it is not a GLM accuracy or sparse CPU-to-NPU DMA test. A skipped
+probe is not qualification. Then compare full-SFA off/on on the same server
+branch with identical capture sizes, including uniform/bounded profiles,
+idle/mixed TP/DP/EP ranks, source rebinding, cold loads, checkpoint resumption
+and native prefill/recovery. Check outputs, MTP acceptance, graph memory,
+target-forward time, TTFT, TPOT and throughput. CPU tests do not establish a
+hardware speedup or distributed correctness.
 
 ## Execution contract
 
@@ -131,6 +216,24 @@ Per-layer target host tensor probes cannot run during a replay. The startup
 log explicitly reports their omission. Connector/window boundary diagnostics
 and the existing `MTP_DW_DIAG` / `MTP_DW_DEEP_DIAG` settings remain available.
 The separate `VLLM_ASCEND_MTP_DRAFT_DEBUG=1` mode is rejected for this path.
+
+### First-decode stall timing
+
+Set `PD_SERVING_PERF=1` before starting the server for host timing. Up to two
+early decode sampling calls get a fresh trace budget after chunked prefill.
+Fast calls emit no additional logs. A sample taking at least 500 ms emits
+`decoder_sample_invocation_slow`, with total wall/CPU time, top-level phase
+timings and at most three longest sub-stages in `slow_substages_ms`.
+Sub-stages collect wall time only; they do not log individually. Host mode
+keeps the normal rejection-sampler forward and reports its total sampling
+time; rejection sub-stage instrumentation requires explicit `device` mode.
+
+The existing `decoder_async_output_slow` threshold is 100 ms. Its
+`queue_wait_ms` and `get_output_ms` distinguish output queue time from the
+existing copy-completion wait and CPU parsing. No extra waits, device queries,
+events or readbacks are introduced in host mode, and operation/exception order
+is preserved. `PD_SERVING_PERF=0` disables this timing; `detail` uses the same
+bounded summaries. Explicit `device` mode retains its separate event timing.
 
 ## Server validation
 
@@ -992,3 +1095,143 @@ result. If the original mismatch disappears only with these probes, investigate
 fusion/timing effects; the original `test_sfa_full_graph_parity.py` must still
 pass separately. CPU regressions test hook ordering, in-place alias isolation,
 fullgraph traceability, failure localization and the unchanged tolerance gate.
+
+## Experimental single agreement for steady decoding
+
+On matching `perf/sfa-dp-sync` branches of vLLM-Ascend, LMCache and
+LMCache-Ascend, enable on **every decoder worker in the EP group**:
+
+```bash
+export VLLM_ASCEND_SFA_SINGLE_AGREEMENT=1
+```
+
+The default is `0`. Restart the workers after updating these Python packages;
+this change does not require rebuilding native extensions. It uses the existing
+full-SFA and async-MTP configuration. Initial eligibility requires the async SFA
+runner and a fixed MP TP-by-DP EP topology with PP=PCP=DCP=1 and no DBO or elastic
+EP. Unqualified configurations retain the existing protocol.
+vLLM batch-size timing also retains the original forward-context scope.
+
+Warm unchanged Q2 steps and repeated idle participation can prepare against the
+previous graph key, then combine batch/layout and preparation-error agreement
+into one EP CPU collective. The current vote still selects the common capacity,
+profile and native fallback. A changed key or an unprepared peer retains a second
+preparation agreement. A TP group falls back together if any member needs ordinary
+source preparation; this preserves TP loader collective participation. Other
+ready TP groups can reuse their preparation when the final key is unchanged.
+
+If any rank must discard early preparation or reconcile a pending async step,
+all EP ranks agree on the rollback outcome **before** ordinary TP source setup.
+This also covers ranks without a prepared graph. Such transitions can use three
+host agreements: batch decision, rollback outcome, then preparation outcome.
+Steady ready steps still use one; slow steps without rollback retain the original
+preparation agreement. A rollback failure rejects further execution on the group
+until worker restart, rather than retrying with partially rebuilt state.
+
+This does not bypass expert dispatch/combine or change MTP's separate metadata
+agreement. Admission/recovery can discard speculative preparation; a transition
+to native execution can require an additional error agreement. Consequently,
+one fewer steady-step collective is not a measured throughput improvement.
+
+Profiler scopes `sfa_single_agreement::prepare`, `sfa_single_agreement::vote`
+and `sfa_single_agreement::rollback_vote` distinguish preparation and agreements.
+The benchmark timing report includes `single_agreement_since_startup` decision
+counters and `rollback_agreements`. Detailed diagnostics add overhead; compare
+throughput in separate clean runs with identical traces, cache state, output
+lengths and MTP acceptance.
+
+CPU regression tests include real subprocess/IPC execution with an emulated
+reduction. The native Gloo case is available on Linux. Distributed NPU TP4/DP4
+qualification remains required, including active/idle transitions, mixed C8,
+preemption/restore misses and injected preparation failures. Keep this option
+off until that qualification and the throughput comparison pass.
+
+## Native-route and preemption diagnostics
+
+On `perf/decoder-tpot-optimization`, `[SFA_ROUTE]` and
+`[REQUEST_LIFECYCLE]` are INFO logs independent of `PD_SERVING_PERF`.
+Keep the normal logger at INFO (`VLLM_LOGGING_LEVEL=INFO`); no new diagnostic
+switch is needed. Update both vLLM and vLLM-Ascend Python sources and restart
+the workers. No native rebuild or LMCache change is required.
+
+`[SFA_ROUTE] action=... reason=...` is followed by JSON. Every worker reports
+its own decision; retain all DP/TP logs. The fields include host, PID, DP rank,
+wall time, request IDs, local action/reason, DP-agreed action, failed checks,
+attention state, dispatched graph mode, token capacities and per-request CPU
+operands. Rows show scheduled target/draft widths, computed/prompt/history
+lengths, new/resumed membership, retained connector cold-resume markers and
+raw connector load/frontier fields. A retained marker does not mean the runner
+accepted its layout: inspect `failed_checks`, especially `cold_compact_layout`.
+A null retained frontier does not prove
+that KV is missing. No token contents, KV payloads or device tensors are logged.
+
+Events distinguish `native_route_selected`, `route_rejected` (execution raises)
+and `graph_route_restored`. Selection is not proof of successful execution or
+graph replay. Each worker numbers consecutive non-staged episodes, logs changed
+reasons/batches immediately, and summarizes unchanged decisions at most once
+per five seconds. Summaries and recovery include elapsed host time, total
+non-staged decisions and suppressed repeats. A later recurrence of the same
+reason starts a new episode; it is no longer suppressed for the worker's entire
+lifetime. Dummy/idle decisions have `origin=dummy_run` and no real request rows.
+
+The runner's rejection sites are:
+
+| Reason | Distinguishing evidence |
+| --- | --- |
+| `not_decode` | `computed_before_prompt_without_validated_cold_resume` identifies an unfinished prompt/recovery row, even if attention state says decode. `attention_state_not_decode` identifies the separate attention-state guard. |
+| `cold_compact_layout` | Exact failed marker invariants, including row indices; compare computed/history lengths and retained resume frontier. |
+| `runtime_mode` | `calculate_kv_scales` versus `dispatcher_mode_not_piecewise`. |
+| `lora`, `speculative_decode`, `cascade` | LoRA configured, unsupported query width, or cascade attention. |
+| `unsupported_batch`, `non_q1` | Local token/request capacity or scheduled query shape/width; compare capture **token** sizes and row widths. |
+| `dense_prefix_hit`, `mixed_connector_load` | Staged-only mode rejects these metadata combinations; full SFA keeps its existing eligibility rules. |
+| `runtime_parallelism` | A DP-agreed non-staged action overrode local eligibility, or a dummy batch could not use a staged key. When an existing DP agreement selected this route, `dp_peer_votes` records the per-DP actions, graph modes and counts before padding. Find the local rejecting check in the contributing DP rank's log. No collective or wire field is added. |
+| `ubatch`, `padded_batch`, `batch_descriptor` | Microbatching, padding/query-width/capture-capacity incompatibility, or descriptor/key mismatch (including exact mismatched descriptor fields). |
+| Connector/frontier errors | Missing/duplicate request metadata, invalid or unavailable sparse ranges, inconsistent frontiers, or a frontier smaller than scratch capacity cause fatal rejection when reached. Raw row operands are included. If the earlier `not_decode` guard wins, a failed connector validation is also retained in `failed_checks`. |
+
+With full SFA, many native candidates are rejected by the existing fail-closed
+guard instead of executing outside the graph. Layer-level authorization,
+source preparation and replay errors still raise; they are not silent native
+fallbacks. Explicitly unconfigured SFA (`not_configured`) does not create an
+episode. These diagnostics do not force eligibility or remove recovery work.
+
+`[REQUEST_LIFECYCLE]` uses request ID, DP rank and `preemption_count` to link
+`preemption_trigger` (allocation failure or forced cache reset),
+`request_preempted`, `resume_load_started`, `resume_load_completed`, and
+`request_resumed`. Asynchronous load admission/completion is **not** RUNNING
+admission. `resume_retry` records an Ascend checkpoint restore miss and its preemption/load generations;
+`recompute_redirect` records the pure KV consumer's proxy handoff rather than
+an in-process resume. Request resumption is logged only after allocation and
+admission succeed, before optimistic async counters advance. A streaming-input
+continuation with an old preemption count is not reannounced as a new resume. Queue time can be
+derived from the timestamps. The scheduler's counters and compact flag are
+host metadata, not a measurement of physically reclaimed memory.
+
+To diagnose a specific episode, locate its request row with
+`computed_before_prompt_without_retained_marker=true`, then join that request's
+lifecycle events and connector frontiers. For `runtime_parallelism`, compare
+local versus agreed action and `dp_peer_votes` across peers. Vote arrays are
+indexed by DP rank; `staged_or_neutral` denotes the existing zero vote, which
+does not distinguish a staged participant from a neutral/bootstrap participant.
+The votes name contributing DP ranks, but do not contain their local reasons;
+use those workers' records to complete the chain. Independent DP performs no DP
+agreement and leaves this field null. Saved votes are detached CPU scalars and
+are cleared before every agreement, including independent/disabled paths. Keep host clocks
+synchronized for cross-host comparison. A preemption alone does not prove the
+cause of a later fallback.
+
+Healthy graph selection performs no diagnostic serialization, metadata scan,
+clock call, device readback or extra collective. Transition logging has a host
+formatting/I/O cost; unchanged native episodes are throttled. CPU tests cover
+the real route methods and scheduler hooks with device imports isolated, plus
+INFO output at `PD_SERVING_PERF=0`. Distributed NPU qualification remains
+required for production timing and replay behavior.
+
+These records prove the route decision and its host operands, not every possible
+upstream storage or hardware failure. For example, a preempted request admitted
+with `computed_tokens < prompt_tokens` and no retained cold marker explains why
+`not_decode` selected native execution. Its lifecycle and connector fields show
+whether this followed reload/retry; explaining *why* a remote payload or
+checkpoint was unavailable can still require the connector/storage logs. Do not
+infer data loss, a backend fault, or an NPU fault from `not_decode` alone.
+Malformed scalar fields are printed as type placeholders, and malformed CPU
+row shapes print null instead of masking the original route rejection.

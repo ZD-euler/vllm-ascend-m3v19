@@ -13,12 +13,12 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-
 from sfa_test_support import extract, load_module
 from test_sfa_full_graph import graph_module as graph_fixture
 
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE = ROOT / "vllm_ascend/attention/sfa_v1.py"
+PROBE_SOURCE = ROOT / "tests/sfa_capture_probe.py"
 
 
 def test_runner_constructor_reads_module_environment_without_local_shadowing():
@@ -30,6 +30,145 @@ def test_runner_constructor_reads_module_environment_without_local_shadowing():
     # Inspect the ENTIRE function: a later import makes even earlier reads local.
     assert environment.is_global() and not environment.is_local()
     assert table.lookup("envs_ascend").is_imported()
+
+
+@pytest.mark.parametrize("readback_failure", [False, True])
+def test_dcp_probe_parity_failure_does_not_abandon_peer_replays(monkeypatch, readback_failure):
+    source = PROBE_SOURCE
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    cls = next(n for n in tree.body if getattr(n, "name", "") == "CaptureProbe")
+    method = next(n for n in cls.body if getattr(n, "name", "") == "verify")
+    ns = {"torch": torch}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"), ns)
+    replays = []
+    probe = NS(source=torch.zeros(64), selected=torch.zeros(64), mask=torch.arange(64) < 1,
+               dest=torch.empty(64), observed=torch.empty(64), exchange=torch.empty(128),
+               matrix=torch.ones(16, 16), product=torch.empty(16, 16),
+               edge=NS(launch=lambda *args: None, join=lambda: None),
+               dcp_group=NS(rank_in_group=0, world_size=2, device_group=object(),
+                            all_gather=lambda tensor, dim: tensor.repeat(2)))
+    def replay():
+        replays.append(float(probe.source[0]))
+        probe.observed.zero_()
+        # Only this rank sees a numerical mismatch on the first replay. Peers
+        # still enter all three captured HCCL sequences before outer agreement.
+        probe.observed[0] = -1 if len(replays) == 1 else 2*probe.source[0]+1
+        probe.exchange.fill_(float(probe.source[0]))
+    probe.graph = NS(replay=replay)
+    if readback_failure:
+        original_cpu = torch.Tensor.cpu
+
+        def cpu(tensor, *args, **kwargs):
+            if tensor is probe.dest:
+                raise RuntimeError("injected readback failure")
+            return original_cpu(tensor, *args, **kwargs)
+
+        monkeypatch.setattr(torch.Tensor, "cpu", cpu)
+    monkeypatch.setattr(torch, "npu", NS(synchronize=lambda: None, graph=lambda _: nullcontext()), raising=False)
+    monkeypatch.setattr(torch.distributed, "all_to_all_single", lambda *args, **kwargs: None)
+    with pytest.raises(RuntimeError, match="capture probe failed") as error:
+        ns["verify"](probe)
+    assert replays == [1, 7, 2]
+    message = str(error.value)
+    assert "rank=0 world_size=2" in message
+    assert "replay=1" in message
+    assert "observed" in message and "expected" in message
+    assert "gathered" in message and "selected" in message and "destination" in message
+    # Preserve the original failed value, not the later successful replay.
+    assert "actual=[-1.0]" in message
+    if readback_failure:
+        assert "destination: diagnostic readback failed: RuntimeError: injected readback failure" in message
+
+
+@pytest.mark.parametrize("world,rank", [(1, 0), (2, 1), (4, 3), (8, 7)])
+def test_capture_probe_success_reads_only_required_results(monkeypatch, world, rank):
+    source = PROBE_SOURCE
+    verify = extract(source, "verify", {"torch": torch})
+    observed = torch.empty(64)
+    observed_cpu = Mock(side_effect=lambda: observed)
+    exchange = torch.empty(64 * world)
+    exchange_cpu = Mock(side_effect=lambda: exchange)
+    probe = NS(source=torch.zeros(64), selected=torch.zeros(64), mask=torch.arange(64) < rank + 1,
+               dest=torch.empty(64), observed=NS(copy_=observed.copy_, cpu=observed_cpu),
+               exchange=NS(cpu=exchange_cpu, fill_=exchange.fill_),
+               matrix=torch.ones(16, 16), product=torch.empty(16, 16),
+               edge=NS(launch=lambda *args: None, join=lambda: None), dcp_group=None)
+    if world > 1:
+        probe.dcp_group = NS(rank_in_group=rank, world_size=world, device_group=object(),
+                             all_gather=lambda tensor, dim: tensor.repeat(world))
+    replays = []
+
+    def replay():
+        value = float(probe.source[0]) - rank
+        replays.append(value)
+        observed.fill_(value if world == 1 else world * value + world * (world - 1) / 2)
+        if world > 1:
+            observed[rank + 1:] = 0
+            probe.exchange.fill_(float(probe.source[0]))
+
+    probe.graph = NS(replay=replay)
+    monkeypatch.setattr(torch, "npu", NS(synchronize=lambda: None, graph=lambda _: nullcontext()), raising=False)
+    monkeypatch.setattr(torch.distributed, "all_to_all_single", lambda *args, **kwargs: None)
+    verify(probe)
+    assert replays == [1, 7, 2]
+    assert observed_cpu.call_count == 3
+    assert exchange_cpu.call_count == (3 if world > 1 else 0)
+
+
+def test_dcp_capture_probe_rejects_bad_exchange_with_correct_prefetch(monkeypatch):
+    source = PROBE_SOURCE
+    verify = extract(source, "verify", {"torch": torch})
+    probe = NS(source=torch.zeros(64), selected=torch.zeros(64), mask=torch.arange(64) < 1,
+               dest=torch.zeros(64), observed=torch.zeros(64), exchange=torch.zeros(128),
+               matrix=torch.ones(16, 16), product=torch.empty(16, 16),
+               edge=NS(launch=lambda *args: None, join=lambda: None),
+               dcp_group=NS(rank_in_group=0, world_size=2, device_group=object(),
+                            all_gather=lambda tensor, dim: tensor.repeat(2)))
+    replays = []
+
+    def replay():
+        value = float(probe.source[0])
+        replays.append(value)
+        probe.observed.zero_()
+        probe.observed[0] = 2 * value + 1  # Local prefetch is correct.
+        probe.exchange.fill_(value)
+        if len(replays) == 2:
+            probe.exchange[64:] = 1  # A peer's old packet survived replay.
+
+    probe.graph = NS(replay=replay)
+    monkeypatch.setattr(torch, "npu", NS(synchronize=lambda: None, graph=lambda _: nullcontext()), raising=False)
+    monkeypatch.setattr(torch.distributed, "all_to_all_single", lambda *args, **kwargs: None)
+    with pytest.raises(RuntimeError, match="capture probe failed") as error:
+        verify(probe)
+    assert replays == [1, 7, 2]  # Do not strand peers after the local mismatch.
+    assert "exchange: mismatches=64" in str(error.value)
+    assert "replay=7" in str(error.value)
+
+
+@pytest.mark.parametrize("local_failed,peer_failed", [(False, False), (False, True), (True, False), (True, True)])
+def test_multicard_probe_agrees_before_next_attention_collective(local_failed, peer_failed):
+    events = []
+    failure = RuntimeError("shared retrieval multi-stream capture probe failed: local evidence")
+
+    def verify():
+        events.append("probe")
+        if local_failed:
+            raise failure
+
+    def all_reduce(value):
+        events.append("agreement")
+        value.add_(int(peer_failed))
+
+    torch_cpu = NS(tensor=lambda values, **kw: torch.tensor(values), int32=torch.int32)
+    run = extract(ROOT / "tests/e2e/multicard/test_sfa_dcp.py", "_verify_dcp_probe",
+                  {"torch": torch_cpu, "dist": NS(all_reduce=all_reduce)})
+    if local_failed or peer_failed:
+        with pytest.raises(RuntimeError, match="capture probe failed") as error:
+            run(NS(verify=verify))
+        assert (error.value is failure) == local_failed
+    else:
+        run(NS(verify=verify))
+    assert events == ["probe", "agreement"]
 
 
 @pytest.fixture
@@ -71,10 +210,11 @@ def runtime(monkeypatch):
             current[0] = previous
 
     monkeypatch.setattr(torch, "npu", NS(Event=Event, Stream=Stream, stream=switch,
-                                        current_stream=lambda: current[0]), raising=False)
+                                        current_stream=lambda: current[0],
+                                        NPUGraph=Mock(side_effect=AssertionError("synthetic startup graph"))),
+                        raising=False)
     monkeypatch.setitem(sys.modules, "torch_npu", NS(npu_transpose_batchmatmul=Mock()))
     module = load_module(ROOT / "vllm_ascend/compilation/sfa_retrieval_overlap.py", "overlap_test", monkeypatch)
-    monkeypatch.setattr(module, "CaptureProbe", Mock(return_value=NS(verify=Mock())))
     return module, log
 
 
@@ -100,11 +240,14 @@ def topology(lengths=(4,), dtype=torch.bfloat16):
 
 
 @pytest.mark.parametrize("lengths", [(1,), (2,), (4,), (2, 3)])
-def test_edges_never_cross_groups_and_keep_one_stream(runtime, lengths):
+@pytest.mark.parametrize("dcp", [False, True])
+def test_edges_never_cross_groups_and_keep_one_stream(runtime, lengths, dcp):
     module, log = runtime
     groups, impls, caches = topology(lengths)
     owner = module.SharedRetrievalOverlap()
-    owner.configure(tuple(impls.items()), groups, caches)
+    dcp_group = (NS(world_size=8, all_gather=Mock(side_effect=AssertionError("synthetic startup collective")))
+                 if dcp else None)
+    owner.configure(tuple(impls.items()), groups, caches, dcp_group=dcp_group)
     assert owner.stream is None
     for key in (Key(), Key(query_profile="fixed")):
         owner.prepare(key, tuple(impls.items()), groups, 1024)
@@ -116,14 +259,16 @@ def test_edges_never_cross_groups_and_keep_one_stream(runtime, lengths):
             for before, after in zip(group.members, group.members[1:]):
                 assert outgoing[before] is incoming[after]
                 assert incoming[after].stream is owner.stream
-    module.CaptureProbe.assert_called_once() if owner.pairs else module.CaptureProbe.assert_not_called()
+    torch.npu.NPUGraph.assert_not_called()
+    if dcp_group is not None:
+        dcp_group.all_gather.assert_not_called()
     previous = list(log)
     owner.prepare(Key(), tuple(impls.items()), groups, 1024)
     assert log == previous  # No per-key reinitialization.
 
 
 @pytest.mark.parametrize("dtype,tokens", [(torch.float32, 4), (torch.bfloat16, 2048)])
-def test_ineligible_paths_have_no_stream_or_probe(runtime, dtype, tokens):
+def test_ineligible_paths_have_no_stream_or_graph(runtime, dtype, tokens):
     module, log = runtime
     groups, impls, caches = topology(dtype=dtype)
     owner = module.SharedRetrievalOverlap()
@@ -132,7 +277,7 @@ def test_ineligible_paths_have_no_stream_or_probe(runtime, dtype, tokens):
     owner.prepare(key, tuple(impls.items()), groups, 1024)
     assert owner.edges(key) == ({}, {})
     assert owner.stream is None and not log
-    module.CaptureProbe.assert_not_called()
+    torch.npu.NPUGraph.assert_not_called()
 
 
 def test_layout_accepts_disjoint_views_and_rejects_real_alias(runtime):
@@ -148,8 +293,8 @@ def test_layout_accepts_disjoint_views_and_rejects_real_alias(runtime):
         module.validate_destinations(caches, {"consumer"})
 
 
-@pytest.mark.parametrize("fault", ["missing", "destination", "probe"])
-def test_setup_failure_cannot_be_reused(runtime, fault):
+@pytest.mark.parametrize("fault", ["missing", "destination", "event"])
+def test_setup_failure_cannot_be_reused(runtime, monkeypatch, fault):
     module, _ = runtime
     groups, impls, caches = topology()
     owner = module.SharedRetrievalOverlap()
@@ -159,12 +304,12 @@ def test_setup_failure_cannot_be_reused(runtime, fault):
     elif fault == "destination":
         impls["g0l1"]._staged_sfa_capture_state.runtime = (None, tuple(t.clone() for t in caches["g0l1"]))
     else:
-        module.CaptureProbe.return_value.verify.side_effect = RuntimeError("native capture failed")
+        monkeypatch.setattr(torch.npu.Event, "record", Mock(side_effect=RuntimeError("event initialization failed")))
     with pytest.raises(RuntimeError):
         owner.prepare(Key(), tuple(impls.items()), groups, 1024)
     assert owner.failed
-    if fault == "probe":
-        assert owner.probe is module.CaptureProbe.return_value
+    if fault == "event":
+        assert owner.stream is not None  # Retain partial setup until synchronized cleanup.
     with pytest.raises(RuntimeError, match="restart"):
         owner.prepare(Key(), tuple(impls.items()), groups, 1024)
 
@@ -253,6 +398,7 @@ def test_actual_post_starts_prefetch_between_attention_and_value_projection():
     post = extract(SOURCE, "_cross_layer_post_compute", ns)
     proj = Mock(side_effect=lambda x: (log.append("output") or x,))
     impl = NS(_execute_sparse_flash_attention_process=lambda *a, **kw: log.append("sfa") or value,
+              dsa_cp_decoder=False,
               _v_up_proj=lambda x: log.append("cube") or x, o_proj=proj)
     edge = NS(launch=lambda *args: log.append("prefetch"))
     post(impl, value, value, value, value, value, value, value, value, torch.empty_like(value),
@@ -404,8 +550,9 @@ def test_each_layer_copies_once_with_layer_specific_values(runtime, active):
 
 @pytest.mark.parametrize("v2", [False, True])
 @pytest.mark.parametrize("shared_storage", [False, True])
-def test_aot_resolves_late_destinations_inside_prefetch_operator(v2, shared_storage):
+def test_aot_resolves_late_destinations_inside_prefetch_operator(v2, shared_storage, namespace_suffix=""):
     import functools
+
     from torch._dynamo.backends.common import aot_autograd
     from torch._inductor import config
     from torch._inductor.compile_fx import graph_returns_tuple, make_graph_return_tuple
@@ -432,7 +579,7 @@ def test_aot_resolves_late_destinations_inside_prefetch_operator(v2, shared_stor
     ns = {"torch": torch, "_mla_runtime_state": lambda name: (impl, "producer", (), NS())}
     op_fn = extract(ROOT / "vllm_ascend/ops/mla.py", "sfa_forward_post_prefetch", ns)
     fake = extract(ROOT / "vllm_ascend/ops/mla.py", "sfa_forward_post_prefetch_fake", {})
-    namespace = f"prefetch_island_{int(v2)}_{int(shared_storage)}"
+    namespace = f"prefetch_island_{int(v2)}_{int(shared_storage)}{namespace_suffix}"
     lib = torch.library.Library(namespace, "DEF")
     lib.define("post" + torch.library.infer_schema(op_fn, mutates_args=["output"]))
     lib.impl("post", op_fn, "CPU")
@@ -443,7 +590,8 @@ def test_aot_resolves_late_destinations_inside_prefetch_operator(v2, shared_stor
                     select_decomp_table=select_decomp_table, COMPILATION_PASS_KEY="passes",
                     torch=NS(ops=NS(vllm=NS(sfa_forward_post_prefetch=op), higher_order=torch.ops.higher_order)))
     source = ROOT / "vllm_ascend/compilation/compiler_interface.py"
-    for name in ("compile_fx", "_reuse_shared_resident_buffers", "fusion_pass_compile"):
+    for name in ("compile_fx", "_shared_resident_clone_policy",
+                 "_reuse_shared_resident_buffers", "fusion_pass_compile"):
         compiler[name] = extract(source, name, compiler)
     def backend(graph, inputs):
         return compiler["fusion_pass_compile"](graph, inputs, {"passes": lambda g: g}, None)[0]
@@ -492,7 +640,8 @@ def test_disabled_mla_keeps_original_operator_sequence():
     exec(compile(ast.fix_missing_locations(module), str(source), "exec"), ns)
     impl = NS(shared_resident_plan=None, local_num_heads=1, kv_lora_rank=4, qk_rope_head_dim=2,
               index_topk=2048, _staged_sfa_graph_capture_sizes=(4,), decode_threshold=2)
-    layer = NS(use_cross_layer_sfa=True, use_retrieval_overlap=False, target_sfa_debug=False, mla_attn=NS(impl=impl),
+    layer = NS(use_full_graph_sfa=False, use_cross_layer_sfa=True,
+               use_retrieval_overlap=False, target_sfa_debug=False, mla_attn=NS(impl=impl),
                prefix="layer", next_layer_name="next")
     ns["forward"](layer, x, x)
     assert events == ["pre", "retrieve", "post"]
@@ -576,7 +725,8 @@ def test_graph_reset_retains_real_layout_but_profile_release_requires_clear(runt
     assert owner.pairs["g0l0"][1][0] is fresh["g0l1"][0]
 
 
-def test_compile_before_kv_initialization_keeps_prefetch_dispatch():
+@pytest.mark.parametrize("full_graph", [False, True])
+def test_compile_before_kv_initialization_keeps_prefetch_dispatch(full_graph):
     """Model profiling compiles without KV; later execution bypasses guards."""
     from torch.fx.experimental.proxy_tensor import make_fx
 
@@ -590,6 +740,7 @@ def test_compile_before_kv_initialization_keeps_prefetch_dispatch():
         args[6].copy_(args[0] + 2)
 
     ops = NS(sfa_forward_pre=pre, sfa_forward_pre_shared=pre,
+             sfa_forward_full=lambda *args: args[2].copy_(args[0] + 2),
              sfa_lmcache_retrieve=lambda *args: None,
              sfa_forward_post=serial_post, sfa_forward_post_prefetch=overlap_post)
     source = ROOT / "vllm_ascend/ops/mla.py"
@@ -602,7 +753,8 @@ def test_compile_before_kv_initialization_keeps_prefetch_dispatch():
     exec(compile(ast.fix_missing_locations(mod), str(source), "exec"), ns)
     impl = NS(shared_resident_plan=None, local_num_heads=1, kv_lora_rank=4, qk_rope_head_dim=2,
               index_topk=2048, _staged_sfa_graph_capture_sizes=(4,), decode_threshold=2)
-    layer = NS(use_cross_layer_sfa=True, use_retrieval_overlap=True, target_sfa_debug=False,
+    layer = NS(use_full_graph_sfa=full_graph, use_cross_layer_sfa=True,
+               use_retrieval_overlap=True, target_sfa_debug=False,
                mla_attn=NS(impl=impl), prefix="layer", next_layer_name="next")
     x = torch.ones(2, 4)
     compiled = make_fx(lambda value: ns["forward"](layer, value, value))(x)

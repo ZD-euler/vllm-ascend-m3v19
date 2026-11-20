@@ -193,6 +193,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSA_RESIDENT_EXACT_KERNELS": lambda: bool(
         int(os.getenv("VLLM_ASCEND_DSA_RESIDENT_EXACT_KERNELS", "1"))
     ),
+    # Fused sorted-resident serving planner. 0 (default) keeps the existing
+    # exact/baseline selection; 1 uses query membership and exact state matching
+    # on eligible resident decode. Non-sensitive; read before capture. Restart
+    # workers to change it.
+    "VLLM_ASCEND_DSA_RESIDENT_QUERY_MEMBERSHIP": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_RESIDENT_QUERY_MEMBERSHIP", "0"))
+    ),
     # Value shards assigned to each MTP row by the sorted resident planner.
     # The request-wide shard count is MTP * shards_per_row. The value must be
     # a power of two in [1, 4]. Read once during model initialization so graph
@@ -212,6 +219,41 @@ env_variables: dict[str, Callable[[], Any]] = {
     # SFA and bounded Q1/Q2 requests, including internal TP/DP/EP. Explicit
     # enforce_eager takes precedence (P nodes). Non-sensitive; restart required.
     "VLLM_ASCEND_SFA_FULL_GRAPH": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_FULL_GRAPH", "0"))),
+    # DCP communicator workaround for captured AIV exchange corruption.
+    # 0 (default): inherit HCCL_OP_EXPANSION_MODE; 1: force HOST for DCP only.
+    # TP/EP/DP/MC2 keep their existing settings. Non-sensitive; startup-only,
+    # requires worker restart and reserves HOST communication graph streams.
+    "VLLM_ASCEND_DCP_HCCL_HOST": lambda: bool(int(os.getenv("VLLM_ASCEND_DCP_HCCL_HOST", "0"))),
+    # 0 (default) late query gather; 1 overlap the same gather with independent
+    # target preparation in full SFA graphs with shared resident plans.
+    # Prefetched shared-index consumers retain late gathering; consumers with
+    # a serial H2D load can overlap that load even without an indexer.
+    # Staged/eager/MTP paths keep late submission. Non-sensitive; restart required.
+    "VLLM_ASCEND_SFA_DCP_EARLY_GATHER": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_DCP_EARLY_GATHER", "0"))),
+    # 0 (default): KV before Q; 1: project Q/start gathering before current-KV
+    # writes on shared-index consumers, deferring incoming H2D waits to cache
+    # access. Requires EARLY_GATHER and full target DCP graphs. Non-sensitive;
+    # restart required. Experimental: qualify AIV contention on the target NPU.
+    "VLLM_ASCEND_SFA_DCP_QUERY_FIRST": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_DCP_QUERY_FIRST", "0"))),
+    # 0 (default): prefetch after SFA; 1: release next-layer H2D after output
+    # packing, alongside async all-to-all. Requires full target DCP graphs and
+    # SHARED_RETRIEVAL_OVERLAP. Non-sensitive; restart required. Benchmark AIV
+    # contention and the shorter prefetch window before enabling in production.
+    "VLLM_ASCEND_SFA_DCP_PREFETCH_AFTER_PACK": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_SFA_DCP_PREFETCH_AFTER_PACK", "0"))
+    ),
+    # Experimental: combine stable target batch and preparation agreements.
+    # 0 (default): existing protocol; 1: qualified MP TP x DP. Non-sensitive; restart required.
+    "VLLM_ASCEND_SFA_SINGLE_AGREEMENT": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_SINGLE_AGREEMENT", "0"))),
+    # Experimental independent DP graph buckets with CPU guardian supervision.
+    # 0 (default): unchanged path; 1: qualified MC2 full-SFA MP cohorts only,
+    # including validated local decoder DCP=TP on A2. DP must exceed one.
+    # Takes precedence over SINGLE_AGREEMENT when qualified; otherwise that
+    # flag controls the coordinated fallback. Non-sensitive, restart required.
+    "VLLM_ASCEND_SFA_INDEPENDENT_DP": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_INDEPENDENT_DP", "0"))),
+    # Guardian liveness lease in seconds, [2, 86400]; default 30. This is
+    # independent of forward and startup timeouts. Non-sensitive; restart required.
+    "VLLM_ASCEND_SFA_GUARD_TIMEOUT_S": lambda: float(os.getenv("VLLM_ASCEND_SFA_GUARD_TIMEOUT_S", "30")),
     # Experimental device MTP preparation for unchanged full-SFA decode batches.
     # 0 (default): original runner; 1: launch before CPU count reconciliation.
     # Non-sensitive, requires async MTP=1, PP=PCP=DCP=1 and a worker restart.
