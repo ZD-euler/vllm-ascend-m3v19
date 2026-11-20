@@ -2,8 +2,10 @@
 
 This compares the previous causal-mask path with target mask elision on one NPU.
 Both execute the same serving resident planner and bridge, then the real
-LMCache-Ascend `sfa_copy_i32_s64` registered-CPU transfer. It requires the existing
-vLLM-Ascend and LMCache-Ascend native extensions; this change needs no native rebuild.
+LMCache-Ascend `sfa_copy_i32_s64` registered-CPU transfer. Both native extensions
+must be installed. To compare DCP slot policies, rebuild the vLLM-Ascend serving
+extension and run the same benchmark in separate processes with
+`VLLM_ASCEND_DSA_DCP_FREE_SLOT_FIRST=0` and `=1`. Compare the same arm across runs.
 
 The timed interval contains raw IndexCache publication, mask/copy where required,
 bounded lane packing/restoration, the shared-plan copy when enabled, union,

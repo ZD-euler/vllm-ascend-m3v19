@@ -17,6 +17,34 @@ def benchmark(monkeypatch):
     return load_module(ROOT / "benchmarks/ops/benchmark_sfa_target_preparation.py", "target_prep_bench", monkeypatch)
 
 
+@pytest.mark.parametrize("free_first", [False, True])
+def test_benchmark_selects_serving_policy_before_replay(benchmark, monkeypatch, free_first):
+    resident = "vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache"
+    load_module(ROOT / (resident.replace(".", "/") + ".py"), resident, monkeypatch)
+    for module in ("vllm_ascend.attention.sfa_v1", "lmcache_ascend.v1.npu_connector.sparse_graph"):
+        monkeypatch.setitem(sys.modules, module, Mock())
+    monkeypatch.setenv("VLLM_ASCEND_DSA_DCP_FREE_SLOT_FIRST", str(int(free_first)))
+    monkeypatch.setenv("VLLM_ASCEND_DSA_RESIDENT_QUERY_MEMBERSHIP", "0")
+    configure = Mock()
+    monkeypatch.setattr(torch.ops._C_ascend, "configure_dsa_resident_dcp_free_slots", configure, raising=False)
+    monkeypatch.setattr(torch.ops._C_ascend, "configure_dsa_resident_exact_kernels", Mock(), raising=False)
+    args = NS(
+        layout="uniform",
+        requests=1,
+        history=4096,
+        live_tokens=2,
+        dcp_size=8,
+        rank=0,
+        heads=1,
+        resident=False,
+        shared_plan=False,
+    )
+    inputs = benchmark.make_inputs(1, 1, args.history, args.live_tokens, 0.9, args.layout)
+    for optimized in (False, True):
+        benchmark.Pipeline(args, inputs, NS(chunk=1024, sources=[]), optimized)
+    configure.assert_called_once_with(free_first)
+
+
 @pytest.mark.parametrize("overlap", [0, 0.5, 0.9, 1])
 @pytest.mark.parametrize("layout,padding", [("uniform", 0), ("bounded", 1), ("mixed", 2)])
 def test_benchmark_sequences_have_exact_overlap_and_causal_ids(benchmark, overlap, layout, padding):

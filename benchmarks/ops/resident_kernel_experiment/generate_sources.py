@@ -19,7 +19,7 @@ MEMBERSHIP_KERNELS = {
     "union": KERNELS["union"],
     "update": "dsa_resident_sorted_membership_update_kernel",
 }
-BUILD_PROFILES = ("full", "membership")
+BUILD_PROFILES = ("full", "membership", "dcp")
 POINTERS = dict(zip((
     "topkIndices", "splitBoundary", "rowReqIndices", "shardPacked", "shardMapping",
     "shardCounts", "requestStateIndices", "requestStateGenerations", "stateTokens",
@@ -28,6 +28,7 @@ POINTERS = dict(zip((
     "targetSlots", "requestBlockTable",
 ), range(20), strict=True))
 POINTERS["debugInfo"] = POINTERS["missCounts"]  # unused with debugStage=0
+POINTERS.update(liveOrigins=20, selectedCounts=21)
 SCALARS = {
     "requestCount": "a.requests", "stateRowCount": "a.stateRows", "dummyStateBase": "a.dummyBase",
     "rowsPerRequest": "a.mtp", "rowWidth": "2048", "shardCount": "a.shards",
@@ -35,12 +36,15 @@ SCALARS = {
     "shardCountRequestStride": "a.shards * 16", "generationStride": "8",
     "missCountStride": "16", "blockTableWidth": "a.blockTableWidth",
     "blockSize": "a.blockSize", "debugStage": "0",
+    "dcpBits": "a.dcpBits", "dcpRank": "a.dcpRank",
 }
 
 
 def generate(source: str, header: Path, *, variants=(("baseline", 0), ("optimized", 1)), kernels=None,
              compact=False, sharded=False, vector_union=False, union_stop=0, vector_intersection=False,
-             vector_state=False, query_membership=False) -> dict[str, str]:
+             vector_state=False, query_membership=False, dcp=False, free_first=False) -> dict[str, str]:
+    if free_first and not dcp:
+        raise ValueError("free-slot-first requires the DCP variant")
     marker = 'extern "C" __global__ __aicore__ void\n'
     classes, separator, _ = source.partition(marker)
     if not separator:
@@ -53,9 +57,8 @@ def generate(source: str, header: Path, *, variants=(("baseline", 0), ("optimize
             raise ValueError(f"Expected exactly one definition of {name}")
         match = matches[0]
         arguments = []
-        # These standalone variants compile with DCP disabled. Parse only
-        # their active parameters and keep the copied device source verbatim.
-        parameters = re.sub(r"(?ms)^#ifdef RESIDENT_DCP_SHARDING\n.*?^#endif\n", "", match[1])
+        parameters = re.sub(r"(?ms)^#ifdef RESIDENT_DCP_SHARDING\n(.*?)^#endif\n",
+                            r"\1" if dcp else "", match[1])
         for parameter in parameters.split(","):
             pointer = re.fullmatch(r"\s*__gm__\s+(int(?:16|32|64)_t)\*\s+(\w+)\s*", parameter)
             if pointer:
@@ -82,6 +85,7 @@ def generate(source: str, header: Path, *, variants=(("baseline", 0), ("optimize
             )
             output[f"{variant}_{stage}.cpp"] = (
                 "// Generated; do not edit. Kernel algorithm is copied verbatim.\n"
+                f"#define RESIDENT_FREE_SLOT_FIRST {int(free_first)}\n"
                 f"#define RESIDENT_EXPERIMENT_SKIP_UNCHANGED {enabled}\n"
                 f"#define RESIDENT_EXPERIMENT_COMPACT_REMAP {int(compact)}\n"
                 f"#define RESIDENT_EXPERIMENT_VECTOR_UNION {int(vector_union)}\n"
@@ -89,6 +93,7 @@ def generate(source: str, header: Path, *, variants=(("baseline", 0), ("optimize
                 f"#define RESIDENT_EXPERIMENT_VECTOR_STATE {int(vector_state)}\n"
                 f"#define RESIDENT_EXPERIMENT_UNION_STOP {union_stop}\n"
                 f"#define RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP {int(query_membership)}\n"
+                + ("#define RESIDENT_DCP_SHARDING 1\n" if dcp else "")
                 + classes + entry + launch
             )
     return output
@@ -99,6 +104,13 @@ def build_sources(profile: str) -> dict[str, str]:
         raise ValueError(f"Unsupported resident build profile: {profile}")
     source = SOURCE.read_text(encoding="utf-8")
     header = HERE / "launch.h"
+    if profile == "dcp":
+        flags = dict(dcp=True, query_membership=True, vector_intersection=True, vector_state=True)
+        output = generate(source, header, variants=(("dcp", 0),), kernels=MEMBERSHIP_KERNELS, **flags)
+        for variant, free_first in (("dcp_old", False), ("dcp_new", True)):
+            output.update(generate(source, header, variants=((variant, 0),),
+                                   kernels={"finalize": KERNELS["finalize"]}, free_first=free_first, **flags))
+        return output
     output = generate(source, header, variants=(("baseline", 0),),
                       kernels={"finalize": KERNELS["finalize"]})
     output.update(generate(source, header, variants=(("intersection", 0),),
