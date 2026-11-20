@@ -944,9 +944,11 @@ class SelectedKernelsHostTest(unittest.TestCase):
         # must handle capacity before merging; helper input (4096,4096) is
         # intentionally outside its reachable production precondition.
         rows_full = [np.arange(i * 2048, (i + 1) * 2048, dtype=np.int32) for i in range(4)]
-        rows_full += [[0] for _ in range(126)]
-        ln, out = run(16384, 130, 8320, rows_full)
-        self.assertEqual(ln, [8192, 130, 8322, 0, 0, 0, 0, 0])
+        # Q=128 disables adaptive direct writes, so the second cohort must
+        # flush the accumulator before the 4096+4096 merge would be attempted.
+        rows_full += [[0] for _ in range(124)]
+        ln, out = run(16384, 128, 8320, rows_full)
+        self.assertEqual(ln, [8192, 128, 8320, 0, 0, 0, 0, 0])
         self.assertEqual(out[:8192].tolist(), list(range(8192)))
         self.assertTrue(np.all(out[8192:] == 0x5A5A5A5A))
 
