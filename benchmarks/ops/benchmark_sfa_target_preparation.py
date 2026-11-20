@@ -119,8 +119,10 @@ class Pipeline:
             SharedResidentPlan,
             allocate_sorted_resident_state,
             allocate_sorted_resident_workspace,
+            configure_resident_kernels,
         )
 
+        configure_resident_kernels()
         frames, self.rows, self.ends = inputs
         self.frames, self.optimized, self.args = frames, optimized, args
         self.capacity = len(self.ends)
