@@ -199,10 +199,12 @@ class VLLMTokenCounter:
         return result['prompt_tokens']
     
     def count_prompt_tokens(self, prompt: str | list) -> int:
-        """Count tokens for completion-style prompt (string or list of strings)."""
+        """Count completion prompt text or an already tokenized prompt."""
         if isinstance(prompt, str):
             return len(self.tokenizer.encode(prompt, add_special_tokens=False))
         elif isinstance(prompt, list):
+            if all(type(token) is int for token in prompt):
+                return len(prompt)
             return sum(len(self.tokenizer.encode(p, add_special_tokens=False)) for p in prompt if isinstance(p, str))
         else:
             logger.warning(f"Unknown prompt type for count_prompt_tokens: {type(prompt)}")
