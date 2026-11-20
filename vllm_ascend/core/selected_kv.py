@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Configuration, HBM budget reservation, and runner hooks for selected-KV prefill."""
+"""Configuration, HBM budget reservation, and runner hooks for ondemand-selected."""
 
 from __future__ import annotations
 

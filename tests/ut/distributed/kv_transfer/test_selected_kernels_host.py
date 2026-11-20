@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Host C++17 compilation and semantic tests for selected-KV MLA AscendC kernels."""
+"""Host C++17 compilation and semantic tests for ondemand-selected MLA kernels."""
 
 import ctypes
 import shutil

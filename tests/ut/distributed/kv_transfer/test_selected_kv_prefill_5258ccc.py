@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for M3v19 MLA-only selected-KV prefill on 5258ccc."""
+"""Unit tests for ondemand-selected MLA prefill."""
 
 import ast
 import ctypes

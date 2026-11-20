@@ -1,8 +1,8 @@
-# Selected main-KV prefill
+# ondemand-selected prefill
 
-Selected prefill reduces main-KV history transfers for DSA requests with long
+ondemand-selected reduces main-KV history transfers for DSA requests with long
 cached histories and short new queries. The indexer still loads its full history;
-the selected path builds a union of TopK rows on the NPU and gathers only those
+the ondemand-selected path builds a union of TopK rows on the NPU and gathers only those
 main-KV rows from registered CPU memory into the existing P-node bank layout.
 Other requests keep the native layerwise load path, including mixed batches.
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Device-count union planner and owner/follower selected-KV prefill runtime."""
+"""Device-count union planner and owner/follower ondemand-selected runtime."""
 
 from __future__ import annotations
 

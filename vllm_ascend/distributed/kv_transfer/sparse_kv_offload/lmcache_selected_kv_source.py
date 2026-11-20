@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Selected main-KV reads over LMCache P-node layerwise banks on 5258ccc."""
+"""ondemand-selected main-KV reads over LMCache P-node layerwise banks."""
 
 from __future__ import annotations
 
