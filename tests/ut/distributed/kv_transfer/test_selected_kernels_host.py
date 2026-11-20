@@ -459,6 +459,11 @@ template <class T> void MrgSort(LocalTensor<T> d, MrgSortSrcList<T> s, MrgSort4I
     std::vector<std::pair<float, U32>> v;
     for (int k = 0; k < 4; ++k) {
         if (p.validBit & (1U << k)) {
+            // AscendC MrgSort permits at most 4095 pairs per valid source.
+            // Enforce this API bound independently of MergeSortedRuns splitting.
+            if (p.elementLengths[k] > 4095U) {
+                throw std::runtime_error("mrgsort_source_length");
+            }
             for (U32 i = 0; i < p.elementLengths[k]; ++i) {
                 v.emplace_back(src[k].GetValue(i * 2U), src[k].template ReinterpretCast<U32>().GetValue(i * 2U + 1U));
             }
@@ -734,6 +739,42 @@ int test_dcache_guard() {
     });
 }
 
+int test_merge_sorted_runs(uint32_t lc, uint32_t rc) {
+    return Guard(true, [&] {
+        TPipe pipe;
+        Buf lb, rb, db;
+        const U32 total = lc + rc;
+        lb.v.assign((total + 8U) * 8U, 0);
+        rb.v.assign((total + 8U) * 8U, 0);
+        db.v.assign((total + 8U) * 8U, 0x5A);
+        auto left = lb.Get<float>(), right = rb.Get<float>(), dst = db.Get<float>();
+        std::vector<U32> expected;
+        for (U32 side = 0; side < 2U; ++side) {
+            auto src = side == 0U ? left : right;
+            const U32 count = side == 0U ? lc : rc;
+            for (U32 i = 0; i < count; ++i) {
+                const U32 id = i * 2U + side;
+                src.SetValue(i * 2U, -static_cast<float>(id));
+                src.ReinterpretCast<U32>().SetValue(i * 2U + 1U, id);
+                expected.push_back(id);
+            }
+        }
+        std::sort(expected.begin(), expected.end());
+        MergeSortedRuns(dst, left, right, lc, rc);
+        for (U32 i = 0; i < total; ++i) {
+            if (dst.GetValue(i * 2U) != -static_cast<float>(expected[i]) ||
+                dst.ReinterpretCast<U32>().GetValue(i * 2U + 1U) != expected[i]) {
+                throw std::runtime_error("merge_pair_mismatch");
+            }
+        }
+        for (U32 i = total * 2U; i < (total + 8U) * 2U; ++i) {
+            if (dst.ReinterpretCast<U32>().GetValue(i) != 0x5A5A5A5AU) {
+                throw std::runtime_error("merge_tail_overwrite");
+            }
+        }
+    });
+}
+
 int test_union_pipeline(int32_t* topk, int32_t* out, int32_t* lens, uint32_t h, uint32_t q, uint32_t cap, int aon) {
     return Guard(aon != 0, [&] {
         U32 ch = (q + 1U) / 2U, w = std::max<U32>(128U, ((h + 4095U) / 4096U) * 128U);
@@ -795,6 +836,7 @@ def _compile(tmp: Path) -> ctypes.CDLL:
     lib = ctypes.CDLL(str(so))
     lib.host_last_error.restype = ctypes.c_char_p
     lib.test_dcache_guard.argtypes = []
+    lib.test_merge_sorted_runs.argtypes = [ctypes.c_uint32] * 2
     lib.test_mla_decode_and_copy.argtypes = [ctypes.c_int32] * 3
     lib.test_union_pipeline.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_uint32] * 3 + [ctypes.c_int32]
     lib.test_union_pipeline_reuse.argtypes = [ctypes.c_void_p] * 6 + [ctypes.c_uint32] * 3 + [ctypes.c_int32]
@@ -827,6 +869,15 @@ class SelectedKernelsHostTest(unittest.TestCase):
         self.assertEqual(self.lib.test_mla_decode_and_copy(1, 2, 0), 0, err())
         # (e) GlobalTensor scalar D$ invalidation guard
         self.assertEqual(self.lib.test_dcache_guard(), 0, err())
+
+    def test_merge_source_length_split_on_either_side(self) -> None:
+        # Each case exceeds the API source bound on one side only. Removing
+        # that side's split must fail the independent MrgSort stub guard.
+        for left, right in ((4096, 1), (1, 4096)):
+            with self.subTest(left=left, right=right):
+                self.assertEqual(
+                    self.lib.test_merge_sorted_runs(left, right), 0, self.lib.host_last_error().decode()
+                )
 
     def test_union_pipeline_status_adaptive_bounds_overflow_and_error(self) -> None:
         def run(h: int, q: int, cap: int, rows, aon: int = 1):
@@ -888,6 +939,16 @@ class SelectedKernelsHostTest(unittest.TestCase):
         self.assertEqual(ln, [6000, 130, 6130, 0, 0, 0, 0, 0])
         self.assertEqual(out[:6000].tolist(), list(range(6000)))
         self.assertTrue(np.all(out[6000:] == 0x5A5A5A5A))
+
+        # Two disjoint 4096-id cohorts exceed MERGE_IDS together. The caller
+        # must handle capacity before merging; helper input (4096,4096) is
+        # intentionally outside its reachable production precondition.
+        rows_full = [np.arange(i * 2048, (i + 1) * 2048, dtype=np.int32) for i in range(4)]
+        rows_full += [[0] for _ in range(126)]
+        ln, out = run(16384, 130, 8320, rows_full)
+        self.assertEqual(ln, [8192, 130, 8322, 0, 0, 0, 0, 0])
+        self.assertEqual(out[:8192].tolist(), list(range(8192)))
+        self.assertTrue(np.all(out[8192:] == 0x5A5A5A5A))
 
         # 9. Q = 1026 (cohorts = 513 > COHORT_META_GROUPS = 512) multi-batch descriptor loop
         rows_multi = [[i % 16] for i in range(1024)] + [[777], [1500]]
