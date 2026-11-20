@@ -4,7 +4,6 @@
 import ast
 import ctypes
 import itertools
-import re
 import sys
 import threading
 import types
@@ -17,6 +16,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import regex as re
 import torch
 
 ROOT = Path(__file__).resolve().parents[4]

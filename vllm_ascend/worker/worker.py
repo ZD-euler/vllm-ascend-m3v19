@@ -448,6 +448,7 @@ class NPUWorker(WorkerBase):
                 )
 
         from vllm_ascend.core.selected_kv import reserve_selected_kv_workspace
+
         self.available_kv_cache_memory_bytes = reserve_selected_kv_workspace(
             self, int(self.available_kv_cache_memory_bytes)
         )
@@ -869,6 +870,7 @@ class NPUWorker(WorkerBase):
 
     def shutdown(self) -> None:
         from vllm_ascend.core.selected_kv import close_selected_kv_worker
+
         try:
             close_selected_kv_worker(self)
         finally:

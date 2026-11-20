@@ -99,14 +99,14 @@ void Plan(
         "Invalid union geometry"
     );
 
-    int64_t prevEnd = 0, maxQ = 0;
+    int64_t previousQueryEnd = 0, maxQ = 0;
     for (int64_t i = 0; i < count; ++i) {
         TORCH_CHECK(
             h[i] >= 0 && h[i] <= MAX_HISTORY && q[i] > 0 && q[i] <= topk.size(0) &&
-            start[i] >= prevEnd && start[i] <= topk.size(0) - q[i],
+            start[i] >= previousQueryEnd && start[i] <= topk.size(0) - q[i],
             "Invalid selected H/Q span"
         );
-        prevEnd = start[i] + q[i];
+        previousQueryEnd = start[i] + q[i];
         maxQ = std::max(maxQ, q[i]);
     }
 
