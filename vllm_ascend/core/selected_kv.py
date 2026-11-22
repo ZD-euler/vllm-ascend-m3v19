@@ -96,12 +96,12 @@ class SelectedKVConfig:
             return
 
         _check(
-            not bool(envs_ascend.VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD),
+            not bool(getattr(envs_ascend, "VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD", False)),
             "Selected KV prefill cannot be combined with DSA latent offload",
         )
 
         _check(
-            not bool(envs_ascend.VLLM_ASCEND_DSA_USE_ADAPTER_CACHE),
+            not bool(getattr(envs_ascend, "VLLM_ASCEND_DSA_USE_ADAPTER_CACHE", False)),
             "Selected KV prefill cannot be combined with DSA adapter cache",
         )
 
@@ -269,7 +269,9 @@ def reserve_selected_kv_workspace(worker: Any, available_bytes: int) -> int:
     sc = worker.vllm_config.scheduler_config
     avail = int(available_bytes)
     toks = int(sc.max_num_batched_tokens)
-    fixed = psr.selected_workspace_bytes(toks, min(int(sc.max_num_seqs), toks))
+    fixed = psr.selected_workspace_bytes(toks, min(int(sc.max_num_seqs), toks)) + 3 * PAGE_BASES_ENTRY_BYTES * len(
+        names
+    )
     budget = SelectedKVBudget(
         avail, PAGE_ROWS * MAIN_ROW_BYTES, fixed, PAGE_BASES_ENTRY_BYTES * len(names), NATIVE_ALIGNMENT
     )
@@ -370,27 +372,28 @@ def _guard_step(rt: Any, step: Any | None) -> Iterator[None]:
 @contextmanager
 def selected_kv_prepare_context(runner: Any, sched_out: Any, attn_meta: Any = None) -> Iterator[None]:
     rt = _active_rt(runner)
-    if rt is not None:
-        rt._retire_previous()
-        src = rt.source
-        batch = runner.input_batch
-        src._staged_step = None
-        conn_meta = _unwrap_connector_metadata(sched_out.kv_connector_metadata, src)
-        if conn_meta is not None and int(batch.num_reqs) > 0 and isinstance(attn_meta, Mapping):
-            bank_tables = getattr(batch, "layerwise_prefill_block_tables", None)
-            if bank_tables is not None:
-                _rcheck(len(bank_tables) == src.num_banks, "Banks")
-            else:
-                bank_tables = (batch.block_table,)
-                _rcheck(len(bank_tables) >= src.num_banks, "Banks")
-            cpu_tables = [bank_tables[bank][0].get_cpu_tensor().numpy() for bank in range(src.num_banks)]
-            src.begin_runner_step(conn_meta, *_slices(runner), cpu_tables)
     try:
+        if rt is not None:
+            rt._handoff_previous()
+            src = rt.source
+            batch = runner.input_batch
+            src.step = None
+            src._staged_step = None
+            conn_meta = _unwrap_connector_metadata(sched_out.kv_connector_metadata, src)
+            if conn_meta is not None and int(batch.num_reqs) > 0 and isinstance(attn_meta, Mapping):
+                bank_tables = getattr(batch, "layerwise_prefill_block_tables", None)
+                if bank_tables is not None:
+                    _rcheck(len(bank_tables) == src.num_banks, "Banks")
+                else:
+                    bank_tables = (batch.block_table,)
+                    _rcheck(len(bank_tables) >= src.num_banks, "Banks")
+                cpu_tables = [bank_tables[bank][0].get_cpu_tensor().numpy() for bank in range(src.num_banks)]
+                src.begin_runner_step(conn_meta, *_slices(runner), cpu_tables)
         yield
     except BaseException as err:
         if rt is not None:
             step = rt.source.step
-            if step is not None and not getattr(step, "_finished", False):
+            if (step is not None and not getattr(step, "_finished", False)) or getattr(rt.source, "_failed", False):
                 rt.fail(step, err)
         raise
     finally:
@@ -439,13 +442,26 @@ def retire_selected_kv_if_idle(runner: Any) -> None:
     rt = _active_rt(runner)
     if rt is not None:
         rt._retire_previous()
+        rt.source.step = None
 
 
 def abort_active_selected_kv_steps(*, deferred_only: bool = False) -> None:
     err = sys.exc_info()[1] if _ACTIVE_RUNTIMES else None
     for rt in tuple(_ACTIVE_RUNTIMES):
         step = rt.source_step or getattr(rt.source, "step", None)
-        if rt._awaiting_draft or (not deferred_only and step is not None and not getattr(step, "_finished", False)):
+        src_failed = not deferred_only and bool(getattr(rt.source, "_failed", False)) and not rt._failed
+        rt_unsynced = (
+            not deferred_only
+            and rt._failed
+            and hasattr(rt.source, "_failed")
+            and not bool(getattr(rt.source, "_failed", False))
+        )
+        if (
+            rt._awaiting_draft
+            or src_failed
+            or rt_unsynced
+            or (not deferred_only and step is not None and not getattr(step, "_finished", False))
+        ):
             rt.fail(step, err)
 
 
