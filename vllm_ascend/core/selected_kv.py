@@ -105,6 +105,11 @@ class SelectedKVConfig:
             "Selected KV prefill cannot be combined with DSA adapter cache",
         )
 
+        _check(
+            int(getattr(envs_ascend, "VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE", 0)) == 0,
+            "Selected KV prefill cannot be combined with FLASHCOMM2",
+        )
+
         def collect_lmc_roles(spec: Any) -> list[bool]:
             if spec is None:
                 return [False]
@@ -144,12 +149,22 @@ class SelectedKVConfig:
             and not getattr(cfg, "use_v2_model_runner", False)
             and not getattr(pc, "enable_dbo", False)
         )
+        tp_size = getattr(pc, "tensor_parallel_size", 1)
         sp_tokens = getattr(sp, "num_speculative_tokens", None)
+        draft_tp = getattr(sp, "draft_tensor_parallel_size", None)
         spec_ok = sp is None or (
-            getattr(sp, "method", None) in ("mtp", "deepseek_mtp") and type(sp_tokens) is int and sp_tokens == 1
+            getattr(sp, "method", None) in ("mtp", "deepseek_mtp")
+            and type(sp_tokens) is int
+            and sp_tokens == 1
+            and (draft_tp is None or (type(draft_tp) is int and draft_tp == tp_size))
         )
-        pp_ok = all(
-            getattr(pc, f"{axis}_parallel_size", 1) == 1 for axis in ("pipeline", "prefill_context", "decode_context")
+        pp_ok = (
+            type(tp_size) is int
+            and tp_size >= 1
+            and all(
+                getattr(pc, f"{axis}_parallel_size", 1) == 1
+                for axis in ("pipeline", "prefill_context", "decode_context")
+            )
         )
         model_ok = (
             not getattr(mc, "is_encoder_decoder", False)
@@ -178,7 +193,7 @@ def init_selected_kv_config(additional_config: Mapping[str, Any], vllm_config: A
 
 
 class SelectedKVBudget:
-    _topology: tuple[Any, ...] = ((), frozenset(), {})
+    _topology: tuple[Any, ...] = ((), frozenset(), {}, False)
 
     def __init__(self, avail: int, page: int, fixed: int, per_blk: int, pad: int = 0) -> None:
         args_ok = (
@@ -204,7 +219,15 @@ class SelectedKVBudget:
 reserve_workspace_bytes = SelectedKVBudget
 
 
-def _resolve_topology(runner: Any) -> tuple[tuple[str, ...], frozenset[str], dict[str, str]]:
+def _cp_tp_size(vllm_config: Any, dsa_cp: bool) -> int:
+    if not dsa_cp:
+        return 1
+    tp_size = _ga(vllm_config, "parallel_config.tensor_parallel_size", 1)
+    _check(type(tp_size) is int and tp_size >= 1, "Invalid tensor_parallel_size")
+    return tp_size
+
+
+def _resolve_topology(runner: Any) -> tuple[tuple[str, ...], frozenset[str], dict[str, str], bool]:
     ctx = runner.compilation_config.static_forward_context
 
     def layer_index(parts: list[str]) -> int:
@@ -224,14 +247,31 @@ def _resolve_topology(runner: Any) -> tuple[tuple[str, ...], frozenset[str], dic
 
     owners: dict[str, str] = {}
     prev_owner: str | None = None
+    dsa_cp_flags: set[bool] = set()
+    impl_tp_sizes: set[int | None] = set()
     for name in names:
-        impl = ctx[name].impl
+        mod = ctx[name]
+        impl = mod.impl
+        parent_mod = ctx.get(name.removesuffix(".attn")) if name.endswith(".attn") else None
         skip_topk = bool(getattr(impl, "skip_topk", False))
-        dims_ok = (getattr(impl, "kv_lora_rank", 0), getattr(impl, "qk_rope_head_dim", 0)) == (NOPE_ROW_DIM, PE_ROW_DIM)
-        _check(
-            dims_ok and not getattr(impl, "enable_dsa_cp", False) and not (name in draft and skip_topk),
-            f"Bad MLA/draft {name!r}",
+        impl_dsa_cp = bool(getattr(impl, "enable_dsa_cp", False))
+        impl_o_proj_tp = bool(getattr(impl, "enable_dsa_cp_with_o_proj_tp", False))
+        vl_first = any(
+            bool(getattr(obj, "is_vl_first_layer", False)) for obj in (parent_mod, mod, impl) if obj is not None
         )
+        impl_tp = getattr(impl, "tp_size", None)
+        tp_ok = not impl_dsa_cp or impl_tp is None or (type(impl_tp) is int and impl_tp >= 1)
+        dims_ok = (getattr(impl, "kv_lora_rank", 0), getattr(impl, "qk_rope_head_dim", 0)) == (NOPE_ROW_DIM, PE_ROW_DIM)
+        layer_ok = (
+            dims_ok
+            and not impl_o_proj_tp
+            and not (impl_dsa_cp and vl_first)
+            and tp_ok
+            and not (name in draft and skip_topk)
+        )
+        _check(layer_ok, f"Bad MLA/draft {name!r}")
+        dsa_cp_flags.add(impl_dsa_cp)
+        impl_tp_sizes.add(impl_tp)
         if not skip_topk:
             candidates = (
                 getattr(impl, "index_topk", None),
@@ -243,7 +283,15 @@ def _resolve_topology(runner: Any) -> tuple[tuple[str, ...], frozenset[str], dic
             prev_owner = name
         _check(prev_owner is not None, "Selected KV followers require an earlier actual TopK owner")
         owners[name] = str(prev_owner)
-    return names, draft, owners
+    _check(len(dsa_cp_flags) == 1, "Selected KV layers must agree on enable_dsa_cp")
+    dsa_cp = next(iter(dsa_cp_flags))
+    if dsa_cp:
+        _check(len(impl_tp_sizes) == 1, "Selected KV DSA-CP layers must agree on tp_size")
+        resolved_tp = next(iter(impl_tp_sizes))
+        vcfg = getattr(runner, "vllm_config", None)
+        if resolved_tp is not None and vcfg is not None:
+            _check(resolved_tp == _cp_tp_size(vcfg, True), "Selected KV DSA-CP layer tp_size mismatch")
+    return names, draft, owners, dsa_cp
 
 
 def reserve_selected_kv_workspace(worker: Any, available_bytes: int) -> int:
@@ -259,21 +307,23 @@ def reserve_selected_kv_workspace(worker: Any, available_bytes: int) -> int:
         "Selected KV kernels require an A2 or A3 build",
     )
     p_node_ok = (
-        not getattr(runner, "enable_dsa_cp", False)
+        getattr(runner, "pcp_size", 1) == 1
+        and getattr(runner, "dcp_size", 1) == 1
         and bool(getattr(runner, "layerwise_prefill_p_node", False))
         and int(getattr(runner, "layerwise_prefill_bank_count", 0)) >= 2
     )
-    _check(p_node_ok, "Requires non-CP P-node (>=2 banks)")
+    _check(p_node_ok, "Requires P-node (>=2 banks) without PCP/DCP")
 
-    names, draft, owners = _resolve_topology(runner)
+    names, draft, owners, dsa_cp = _resolve_topology(runner)
     sc = worker.vllm_config.scheduler_config
     avail = int(available_bytes)
     toks = int(sc.max_num_batched_tokens)
-    fixed = psr.selected_workspace_bytes(toks, min(int(sc.max_num_seqs), toks))
+    cp_tp_size = _cp_tp_size(worker.vllm_config, dsa_cp)
+    fixed = psr.selected_workspace_bytes(toks, min(int(sc.max_num_seqs), toks), dsa_cp=dsa_cp, cp_tp_size=cp_tp_size)
     budget = SelectedKVBudget(
         avail, PAGE_ROWS * MAIN_ROW_BYTES, fixed, PAGE_BASES_ENTRY_BYTES * len(names), NATIVE_ALIGNMENT
     )
-    budget._topology = (names, draft, owners)
+    budget._topology = (names, draft, owners, dsa_cp)
     override_blocks = _ga(worker, "cache_config.num_gpu_blocks_override")
     if override_blocks is not None:
         budget.validate(int(override_blocks))
@@ -328,7 +378,7 @@ def initialize_selected_kv(runner: Any, kv_cache_config: Any, kv_caches: Mapping
 
     budget = runner._selected_kv_budget
     _rcheck(budget is not None and runner.selected_kv_runtime is None, "Budget once")
-    names, draft, owners = budget._topology if budget._topology[0] else _resolve_topology(runner)
+    names, draft, owners, dsa_cp = budget._topology if budget._topology[0] else _resolve_topology(runner)
 
     def as_tuple(val: Any) -> tuple[Any, ...]:
         return tuple(val) if isinstance(val, (tuple, list)) else (val,)
@@ -350,7 +400,7 @@ def initialize_selected_kv(runner: Any, kv_cache_config: Any, kv_caches: Mapping
     src = lsks.LMCacheSelectedKVSource(runner, impl, names, main_caches)
     src._connector_meta_spec = meta_spec
     try:
-        rt = psr.SelectedKVRuntime(runner, owners, main_caches, src, draft_layer_names=draft)
+        rt = psr.SelectedKVRuntime(runner, owners, main_caches, src, draft_layer_names=draft, dsa_cp=dsa_cp)
     except BaseException as err:
         _run_cleanup(src.close, err)
         raise

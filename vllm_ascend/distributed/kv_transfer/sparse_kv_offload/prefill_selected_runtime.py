@@ -40,9 +40,24 @@ def _plan_shapes(
     return scratch_shapes, output_shapes
 
 
-def selected_workspace_bytes(q_cap: int, max_reqs: int) -> int:
-    scratch_shapes, output_shapes = _plan_shapes(min(skv.MAX_HISTORY_TOKENS, skv.TOPK * q_cap), q_cap, max_reqs)
-    total_ints = sum(prod(shape) for shape in (*scratch_shapes, *output_shapes)) + min(max_reqs, q_cap) * 8
+def selected_workspace_bytes(q_cap: int, max_reqs: int, *, dsa_cp: bool = False, cp_tp_size: int = 1) -> int:
+    _check(
+        type(dsa_cp) is bool
+        and type(cp_tp_size) is int
+        and cp_tp_size >= 1
+        and type(q_cap) is int
+        and 0 < q_cap <= skv.MAX_BATCHED_TOKENS,
+        "Plan bounds exceeded",
+    )
+    eff_tp = cp_tp_size if dsa_cp else 1
+    local_q_cap = (q_cap + eff_tp - 1) // eff_tp
+    scratch_shapes, output_shapes = _plan_shapes(
+        min(skv.MAX_HISTORY_TOKENS, skv.TOPK * local_q_cap), local_q_cap, max_reqs
+    )
+    plan_topk_ints = local_q_cap * skv.TOPK if dsa_cp else 0
+    total_ints = (
+        sum(prod(shape) for shape in (*scratch_shapes, *output_shapes)) + min(max_reqs, q_cap) * 8 + plan_topk_ints
+    )
     return 4 * total_ints
 
 
@@ -164,12 +179,16 @@ class SelectedKVRuntime:
         source: Any,
         planner: Any = None,
         draft_layer_names: Iterable[str] = (),
+        *,
+        dsa_cp: bool = False,
     ) -> None:
+        _check(type(dsa_cp) is bool, "SelectedKVRuntime.dsa_cp must be bool", TypeError)
         owners = dict(owner_by_layer)
         dev = torch.device(runner.device)
         self.device = dev
         self.source = source
         self.owner_by_layer = owners
+        self._dsa_cp = dsa_cp
         self.draft_layer_names = frozenset(map(str, draft_layer_names))
         self.target_layer_names = frozenset(owners) - self.draft_layer_names
 
@@ -190,17 +209,24 @@ class SelectedKVRuntime:
         q_cap = int(sc.max_num_batched_tokens)
         max_reqs = min(int(sc.max_num_seqs), q_cap)
         _check(0 < q_cap <= skv.MAX_BATCHED_TOKENS and 0 < max_reqs <= skv.MAX_REQUESTS, "Bounds exceeded")
+        cp_tp_size = skv._cp_tp_size(runner.vllm_config, dsa_cp)
+        local_q_cap = (q_cap + cp_tp_size - 1) // cp_tp_size
+        self._cp_tp_size = cp_tp_size
         self.query_capacity = q_cap
+        self.local_query_capacity = local_q_cap
         self.max_requests = max_reqs
 
         self._dev_meta: Tensor | None = torch.empty((2, max_reqs, 4), dtype=torch.int32, device=dev)
         self._host_meta: Tensor | None = torch.empty((2, max_reqs, 4), dtype=torch.int32, pin_memory=dev.type != "cpu")
+        self._plan_topk_buf: Tensor | None = (
+            torch.empty((local_q_cap, 1, skv.TOPK), dtype=torch.int32, device=dev) if dsa_cp else None
+        )
         self._failed = False
         self._closed = False
         self._awaiting_draft = False
         self._reset_step_state()
-        union_cap = min(skv.MAX_HISTORY_TOKENS, skv.TOPK * q_cap)
-        self.selection_planner = planner or SelectedKVPlanner(dev, union_cap, q_cap, max_reqs)
+        union_cap = min(skv.MAX_HISTORY_TOKENS, skv.TOPK * local_q_cap)
+        self.selection_planner = planner or SelectedKVPlanner(dev, union_cap, local_q_cap, max_reqs)
         skv._ACTIVE_RUNTIMES.add(self)
 
     def _reset_step_state(self) -> None:
@@ -209,9 +235,15 @@ class SelectedKVRuntime:
         self.current_owner: str | None = None
         self.current_plan: Any | None = None
         self.request_metadata: Tensor | None = None
+        self._meta_key: tuple[Any, ...] | None = None
         self._active = False
         self._selected_indices: tuple[int, ...] = ()
+        self._selected_histories: tuple[int, ...] = ()
+        self._active_selected_indices: tuple[int, ...] = ()
         self._num_reqs = 0
+        self._local_topk_rows = 0
+        self._local_valid_tokens = 0
+        self._query_offsets: list[int] = []
         self.histories: list[int] = []
         self.starts: list[int] = []
         self.queries: list[int] = []
@@ -270,7 +302,10 @@ class SelectedKVRuntime:
 
         max_cols = max(_pages(length) for length in seq_lens)
         by_layer = {name: meta[name] for name in layer_names}
-        for layer_meta in {id(val): val for val in by_layer.values()}.values():
+        unique_metas = tuple({id(val): val for val in by_layer.values()}.values())
+        _check(bool(unique_metas), "Bad meta")
+        cp_bounds: set[tuple[int, int, int, int] | None] = set()
+        for layer_meta in unique_metas:
             bt = layer_meta.block_table
             bt_ok = (
                 (layer_meta.num_actual_tokens, layer_meta.block_size, bt.ndim, bt.dtype)
@@ -282,17 +317,86 @@ class SelectedKVRuntime:
                 and bt.stride(0) >= bt.shape[1]
             )
             _check(bt_ok, "Bad block_table")
+            cp_ctx = getattr(layer_meta, "dsa_cp_context", None)
+            _check(self._dsa_cp == (cp_ctx is not None), "DSA-CP metadata mismatch")
+            if cp_ctx is None:
+                cp_bounds.add(None)
+            else:
+                ls = getattr(cp_ctx, "local_start", None)
+                le = getattr(cp_ctx, "local_end", None)
+                le_pad = getattr(cp_ctx, "local_end_with_pad", None)
+                nt_pad = getattr(cp_ctx, "num_tokens_pad", None)
+                ints_ok = all(isinstance(v, int) and not isinstance(v, bool) for v in (ls, le, le_pad, nt_pad))
+                _check(ints_ok, "Bad dsa_cp_context")
+                cp_bounds.add((int(ls), int(le), int(le_pad), int(nt_pad)))
+        _check(len(cp_bounds) == 1, "Inconsistent dsa_cp_context across layers")
+        bound = next(iter(cp_bounds))
 
-        sel_starts = [qsl[i] for i in self._selected_indices]
-        sel_queries = [queries[i] for i in self._selected_indices]
-        if self.request_metadata is None or (sel_starts, sel_queries) != (self.starts, self.queries):
-            stage = int(self._awaiting_draft)
-            num_sel = len(self._selected_indices)
-            self.starts = sel_starts
-            self.queries = sel_queries
-            host_view = cast(Tensor, self._host_meta)[stage, :num_sel]
-            host_view.numpy()[:] = list(zip(self._selected_indices, self.histories, sel_starts, sel_queries))
-            self.request_metadata = cast(Tensor, self._dev_meta)[stage, :num_sel].copy_(host_view, non_blocking=True)
+        if bound is None:
+            local_start = 0
+            local_end = qsl[-1]
+            self._local_topk_rows = qsl[-1]
+            self._local_valid_tokens = qsl[-1]
+        else:
+            local_start, local_end, local_end_with_pad, num_tokens_pad = bound
+            local_rows = local_end_with_pad - local_start
+            cp_ok = (
+                0 <= local_start < local_end_with_pad <= num_tokens_pad
+                and num_tokens_pad == local_rows * self._cp_tp_size
+                and local_start % local_rows == 0
+                and num_tokens_pad >= qsl[-1]
+                and local_end == min(local_end_with_pad, qsl[-1])
+                and local_rows <= self.local_query_capacity
+            )
+            _check(cp_ok, "Bad dsa_cp_context")
+            self._local_topk_rows = local_rows
+            self._local_valid_tokens = max(0, local_end - local_start)
+
+        active_indices: list[int] = []
+        active_histories: list[int] = []
+        sel_starts: list[int] = []
+        sel_queries: list[int] = []
+        sel_offsets: list[int] = []
+        for idx, hist in zip(self._selected_indices, self._selected_histories):
+            g_start = qsl[idx]
+            g_end = qsl[idx + 1]
+            sub_start = max(g_start, local_start)
+            sub_end = min(g_end, local_end)
+            q_local = sub_end - sub_start
+            if q_local > 0:
+                active_indices.append(idx)
+                active_histories.append(hist)
+                sel_starts.append(sub_start - local_start)
+                sel_queries.append(q_local)
+                sel_offsets.append(sub_start - g_start)
+
+        if sel_offsets and sel_offsets[0] > 0:
+            _check(
+                sel_starts[0] == 0 and all(off == 0 for off in sel_offsets[1:]),
+                "Split DSA-CP request must start at local row 0",
+            )
+        else:
+            _check(all(off == 0 for off in sel_offsets), "Unexpected non-leading DSA-CP query offset")
+
+        stage = int(self._awaiting_draft)
+        active_tuple = tuple(active_indices)
+        self._active_selected_indices = active_tuple
+        self.histories = active_histories
+        self.starts = sel_starts
+        self.queries = sel_queries
+        self._query_offsets = sel_offsets
+        if not active_tuple:
+            self.request_metadata = None
+            self._meta_key = None
+        else:
+            meta_key = (stage, active_tuple, tuple(active_histories), tuple(sel_starts), tuple(sel_queries))
+            if self.request_metadata is None or meta_key != self._meta_key:
+                num_sel = len(active_tuple)
+                host_view = cast(Tensor, self._host_meta)[stage, :num_sel]
+                host_view.numpy()[:] = list(zip(active_tuple, active_histories, sel_starts, sel_queries))
+                dev_view = cast(Tensor, self._dev_meta)[stage, :num_sel]
+                self.request_metadata = dev_view.copy_(host_view, non_blocking=True)
+                self._meta_key = meta_key
 
         self._metadata_by_layer.update(by_layer)
         for layer_meta in by_layer.values():
@@ -373,8 +477,8 @@ class SelectedKVRuntime:
 
         self._scrub_metas(attn_meta[name] for name in self.draft_layer_names if name in attn_meta)
         self._selected_indices = sel_indices
+        self._selected_histories = tuple(histories[idx] for idx in sel_indices)
         self._num_reqs = len(ids)
-        self.histories = [histories[idx] for idx in sel_indices]
         self._compute_stream = torch.npu.current_stream().npu_stream
         seq_lens = [h + q for h, q in zip(histories, queries)]
         return self._apply_step_layout(self.target_layer_names, attn_meta, starts, seq_lens)
@@ -418,16 +522,35 @@ class SelectedKVRuntime:
             and len(seq_lens) == num_reqs
             and all(
                 seq_lens[idx] - (qsl[idx + 1] - qsl[idx]) == hist
-                for idx, hist in zip(self._selected_indices, self.histories)
+                for idx, hist in zip(self._selected_indices, self._selected_histories)
             )
         )
         _check(hist_ok, "Bad draft history")
         self._check_stream("Selected draft bind must stay on bound compute stream")
         return self._apply_step_layout(self.draft_layer_names, draft_meta, qsl, seq_lens)
 
+    def _prepare_plan_topk(self, topk_3d: Tensor) -> Tensor:
+        plan_rows = self.starts[-1] + self.queries[-1]
+        _check(0 < plan_rows <= topk_3d.shape[0] <= self.local_query_capacity, "Invalid selected TopK")
+        q_off0 = self._query_offsets[0]
+        if q_off0 == 0:
+            return topk_3d[:plan_rows] if topk_3d.shape[0] > plan_rows else topk_3d
+        _check(
+            self.starts[0] == 0 and all(off == 0 for off in self._query_offsets[1:]),
+            "Split DSA-CP request must start at local row 0",
+        )
+        _rcheck(self._plan_topk_buf is not None, "Missing DSA-CP TopK staging buffer")
+        h0 = self.histories[0]
+        q0 = self.queries[0]
+        limit0 = h0 + q_off0 + q0
+        buf = self._plan_topk_buf[:plan_rows]
+        buf.copy_(topk_3d[:plan_rows])
+        first = buf[:q0]
+        first.masked_fill_((first >= h0) & (first < limit0), -1)
+        return buf
+
     def load(self, name: str, topk: Tensor, cache: Sequence[Tensor], metadata: Any) -> None:
-        num_tokens = int(metadata.num_actual_tokens)
-        if num_tokens <= 0:
+        if int(metadata.num_actual_tokens) <= 0:
             return
         layer_ok = (
             self._active
@@ -438,28 +561,56 @@ class SelectedKVRuntime:
         )
         _rcheck(layer_ok, "Bad layer")
 
-        sliced = topk[:num_tokens] if isinstance(topk, Tensor) and topk.shape[0] > num_tokens else topk
-        topk_3d = sliced.unsqueeze(1) if sliced.ndim == 2 else sliced
-        topk_ok = (
-            topk_3d.ndim == 3
-            and topk_3d.dtype == torch.int32
-            and topk_3d.shape[1:] == (1, skv.TOPK)
-            and topk_3d.is_contiguous()
-            and topk_3d.device == self.device
-            and num_tokens <= topk_3d.shape[0] <= self.query_capacity
+        expected_rows = self._local_topk_rows
+        rows_ok = (
+            isinstance(topk, Tensor)
+            and expected_rows > 0
+            and (
+                topk.shape[0] == expected_rows
+                if self._dsa_cp
+                else expected_rows <= topk.shape[0] <= self.query_capacity
+            )
         )
-        _check(topk_ok, "Invalid selected TopK")
+        _check(rows_ok, "Invalid selected TopK")
+        local_raw = topk[:expected_rows] if topk.shape[0] > expected_rows else topk
+        raw_3d = local_raw.unsqueeze(1) if local_raw.ndim == 2 else local_raw
+        raw_ok = (
+            raw_3d.ndim == 3
+            and raw_3d.dtype == torch.int32
+            and raw_3d.shape == (expected_rows, 1, skv.TOPK)
+            and raw_3d.is_contiguous()
+            and raw_3d.device == self.device
+            and expected_rows <= self.local_query_capacity
+        )
+        _check(raw_ok, "Invalid selected TopK")
 
         cache_planes = _validate_mla_cache(cache[:2] if isinstance(cache, (tuple, list)) else cache, self.device)
         stream = self._check_stream()
         owner = self.owner_by_layer[name]
+        step = cast(Any, self.source_step)
+        if not self._active_selected_indices:
+            if name == owner:
+                self.current_plan = None
+                self.current_owner = owner
+            else:
+                _rcheck(owner == self.current_owner, "Selected TopK follower ran outside its current owner group")
+            ready_ev = step.ready(name)
+            if ready_ev is not None and id(ready_ev) not in self._waited_evs:
+                stream.wait_event(ready_ev)
+                self._waited_evs.add(id(ready_ev))
+            self._submitted_layers.add(name)
+            return
+
+        topk_3d = raw_3d[: self._local_valid_tokens] if raw_3d.shape[0] > self._local_valid_tokens else raw_3d
+        _check(0 < topk_3d.shape[0] <= self.local_query_capacity, "Invalid selected TopK")
         if name == owner:
-            self.current_plan = self.selection_planner.build(topk_3d, self.histories, self.starts, self.queries)
+            plan_topk = self._prepare_plan_topk(topk_3d)
+            self.current_plan = self.selection_planner.build(plan_topk, self.histories, self.starts, self.queries)
             self.current_owner = owner
         else:
             _rcheck(owner == self.current_owner, "Selected TopK follower ran outside its current owner group")
+            _rcheck(self.current_plan is not None, "Selected TopK owner plan missing")
 
-        step = cast(Any, self.source_step)
         ready_ev = step.ready(name)
         if ready_ev is not None and id(ready_ev) not in self._waited_evs:
             stream.wait_event(ready_ev)
@@ -486,6 +637,8 @@ class SelectedKVRuntime:
             return
         _rcheck(nxt not in self._prefetched and nxt not in self._submitted_layers, "Duplicate follower prefetch")
         self._check_stream("Selected follower prefetch off bound compute stream")
+        if not self._active_selected_indices:
+            return
 
         plan_ready_ev = torch.npu.Event()
         plan_ready_ev.record()
@@ -545,5 +698,6 @@ class SelectedKVRuntime:
         skv._ACTIVE_RUNTIMES.discard(self)
         self._dev_meta = None
         self._host_meta = None
+        self._plan_topk_buf = None
         self.request_metadata = None
         self._closed = True

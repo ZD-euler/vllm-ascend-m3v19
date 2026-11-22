@@ -178,8 +178,8 @@ class SelectedKVUnitTest(unittest.TestCase):
             for dt, msg in (
                 (dt_ns._310P, "A2 or A3 build"),
                 (dt_ns.A5, "A2 or A3 build"),
-                (dt_ns.A2, "non-CP"),
-                (dt_ns.A3, "non-CP"),
+                (dt_ns.A2, "Requires P-node"),
+                (dt_ns.A3, "Requires P-node"),
             ):
                 u_m = {
                     "vllm_ascend.utils": SimpleNamespace(AscendDeviceType=dt_ns, get_ascend_device_type=lambda t=dt: t)
@@ -1462,6 +1462,641 @@ class SelectedKVUnitTest(unittest.TestCase):
             step.wait_main_slot_ready("l1", st1)
             self.assertEqual(st1.waited, [ev2])
             step.finish(failed=True)
+
+    def test_dsa_cp_gates_workspace_and_split_mask_draft_empty_padding(self) -> None:
+        nop = lambda *a, **k: None
+        cfg = skv.SelectedKVConfig.from_dict({"enabled": True})
+        kw = {"VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE": True, "VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS": 2}
+        dt_ns = SimpleNamespace(A2=2, A3=1, _310P=0, A5=3)
+        u_a3 = {"vllm_ascend.utils": SimpleNamespace(AscendDeviceType=dt_ns, get_ascend_device_type=lambda: dt_ns.A3)}
+
+        # 1. Deployment & topology gates
+        with patch.dict(envs_ascend.__dict__, {**kw, "VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE": 2}):
+            self.assertRaisesRegex(ValueError, "FLASHCOMM2", cfg.validate_deployment, _vcfg())
+
+        ctx_cp = {
+            "model.layers.0.self_attn": SimpleNamespace(
+                impl=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64, index_topk=2048, enable_dsa_cp=True)
+            ),
+            "model.layers.1.self_attn": SimpleNamespace(
+                impl=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64, skip_topk=True, enable_dsa_cp=True)
+            ),
+        }
+        vcfg_tp4 = _vcfg(
+            par=SimpleNamespace(
+                tensor_parallel_size=4,
+                pipeline_parallel_size=1,
+                prefill_context_parallel_size=1,
+                decode_context_parallel_size=1,
+            )
+        )
+        with patch.multiple(envs_ascend, **kw), patch.dict(sys.modules, u_a3):
+            for bad_axis in ("pcp_size", "dcp_size"):
+                mr_bad = SimpleNamespace(
+                    ascend_config=SimpleNamespace(selected_kv_config=cfg),
+                    layerwise_prefill_p_node=True,
+                    layerwise_prefill_bank_count=2,
+                    compilation_config=SimpleNamespace(static_forward_context=ctx_cp),
+                    **{bad_axis: 2},
+                )
+                self.assertRaisesRegex(
+                    ValueError,
+                    "Requires P-node",
+                    skv.reserve_selected_kv_workspace,
+                    SimpleNamespace(vllm_config=vcfg_tp4, model_runner=mr_bad),
+                    2 << 30,
+                )
+
+            mr_otp = SimpleNamespace(
+                compilation_config=SimpleNamespace(
+                    static_forward_context={
+                        "model.layers.0.self_attn": SimpleNamespace(
+                            impl=SimpleNamespace(
+                                kv_lora_rank=512,
+                                qk_rope_head_dim=64,
+                                index_topk=2048,
+                                enable_dsa_cp=True,
+                                enable_dsa_cp_with_o_proj_tp=True,
+                            )
+                        )
+                    }
+                )
+            )
+            self.assertRaisesRegex(ValueError, "Bad MLA/draft", skv._resolve_topology, mr_otp)
+
+            mr_mix = SimpleNamespace(
+                compilation_config=SimpleNamespace(
+                    static_forward_context={
+                        "model.layers.0.self_attn": SimpleNamespace(
+                            impl=SimpleNamespace(
+                                kv_lora_rank=512, qk_rope_head_dim=64, index_topk=2048, enable_dsa_cp=True
+                            )
+                        ),
+                        "model.layers.1.self_attn": SimpleNamespace(
+                            impl=SimpleNamespace(
+                                kv_lora_rank=512, qk_rope_head_dim=64, skip_topk=True, enable_dsa_cp=False
+                            )
+                        ),
+                    }
+                )
+            )
+            self.assertRaisesRegex(ValueError, "agree on enable_dsa_cp", skv._resolve_topology, mr_mix)
+
+            mr_cp_ok = SimpleNamespace(
+                ascend_config=SimpleNamespace(selected_kv_config=cfg),
+                pcp_size=1,
+                dcp_size=1,
+                layerwise_prefill_p_node=True,
+                layerwise_prefill_bank_count=2,
+                compilation_config=SimpleNamespace(static_forward_context=ctx_cp),
+            )
+            wk_cp = SimpleNamespace(
+                vllm_config=vcfg_tp4, model_runner=mr_cp_ok, cache_config=SimpleNamespace(num_gpu_blocks_override=16)
+            )
+            nb_cp = skv.reserve_selected_kv_workspace(wk_cp, 2 << 30)
+            self.assertEqual(nb_cp, mr_cp_ok._selected_kv_budget.native_budget_bytes)
+            self.assertTrue(mr_cp_ok._selected_kv_budget._topology[3])
+
+        self.assertEqual(psr.selected_workspace_bytes(8192, 8), 86182400)
+        self.assertEqual(
+            psr.selected_workspace_bytes(16384, 8, dsa_cp=True, cp_tp_size=4),
+            psr.selected_workspace_bytes(4096, 8) + 4 * 4096 * skv.TOPK,
+        )
+
+        # Shared helpers for runtime DSA-CP tests
+        z = lambda k: torch.zeros((8, 128, 1, k), dtype=torch.bfloat16)
+        nsrc = lambda: SimpleNamespace(step=None, _failed=False, close=nop)
+
+        def mk_pl():
+            built = []
+            loads = []
+            return SimpleNamespace(
+                built=built,
+                loads=loads,
+                build=lambda t, h, s, q: (
+                    built.append(t),
+                    (
+                        torch.zeros((len(h), 128), dtype=torch.int32),
+                        torch.tensor([[0, qv, qv, 0, 0, 0, 0, 0] for qv in q], dtype=torch.int32),
+                    ),
+                )[1],
+                load_mla=lambda *a: loads.append(a),
+                release_quiescent=nop,
+                close_quiescent=nop,
+            )
+
+        def mk_st(reqs, layers=("l0", "l1")):
+            s = SimpleNamespace(
+                requests=reqs,
+                _finished=False,
+                _closed=False,
+                page_bases={n: torch.zeros((8, 2), dtype=torch.uint64) for n in layers}.get,
+                ready={n: torch.npu.Event() for n in layers}.get,
+                wait_main_slot_ready=nop,
+                prefetch_main=lambda n, fn: fn(),
+                wait_completion=nop,
+                try_retire=lambda: setattr(s, "_closed", True) or True,
+            )
+            s.finish = lambda *, completion=None, failed=False: setattr(s, "_finished", True)
+            return s
+
+        def mk_rt(pl, src, *, dsa_cp=True, max_tokens=8192, draft_layers=()):
+            ow = {"l0": "l0", "l1": "l0"}
+            if draft_layers:
+                ow["l2"] = "l2"
+            caches = {n: (z(512), z(64)) for n in ow}
+            vc = _vcfg(
+                par=SimpleNamespace(
+                    tensor_parallel_size=4 if dsa_cp else 1,
+                    pipeline_parallel_size=1,
+                    prefill_context_parallel_size=1,
+                    decode_context_parallel_size=1,
+                ),
+                sched=SimpleNamespace(async_scheduling=True, max_num_batched_tokens=max_tokens, max_num_seqs=8),
+            )
+            return psr.SelectedKVRuntime(
+                SimpleNamespace(device="cpu", vllm_config=vc),
+                owner_by_layer=ow,
+                main_caches=caches,
+                source=src,
+                planner=pl,
+                draft_layer_names=draft_layers,
+                dsa_cp=dsa_cp,
+            ), caches
+
+        def mk_metas(n, cp_ctx, layer_names=("l0", "l1")):
+            return {
+                ln: SimpleNamespace(
+                    block_table=torch.zeros((8, 1200), dtype=torch.int32),
+                    num_actual_tokens=n,
+                    block_size=128,
+                    dsa_cp_context=cp_ctx,
+                )
+                for ln in layer_names
+            }
+
+        # 2. BS=1, 128K + 1K (TP=4) split-request & _plan_topk_buf masking across Ranks 0..3
+        with _fake_npu():
+            for rank in range(4):
+                src, pl = nsrc(), mk_pl()
+                rt, caches = mk_rt(pl, src, dsa_cp=True)
+                src.step = step = mk_st([lms.SelectedRequest("r0", 131072, 1024, True, 131072)])
+                cp_ctx = SimpleNamespace(
+                    local_start=256 * rank,
+                    local_end=256 * (rank + 1),
+                    local_end_with_pad=256 * (rank + 1),
+                    num_tokens_pad=1024,
+                )
+                metas = mk_metas(1024, cp_ctx, ("l0", "l1"))
+                rt.bind_step(step, ("r0",), (131072,), (0, 1024), metas)
+                self.assertEqual(rt.request_metadata.tolist(), [[0, 131072, 0, 256]])
+                q_end = 131072 + 256 * (rank + 1)
+                topk = torch.full((256, 1, skv.TOPK), -1, dtype=torch.int32)
+                topk[0, 0, 0] = 0
+                topk[0, 0, 1] = 131071
+                topk[0, 0, 2] = 131072
+                topk[0, 0, 3] = 131072 + 256 * rank
+                topk[0, 0, 4] = q_end - 1
+                topk[0, 0, 5] = q_end
+                topk[0, 0, 6] = -2
+                topk_orig = topk.clone()
+                rt.load("l0", topk, caches["l0"], metas["l0"])
+                rt.prefetch_next("l0", metas["l0"])
+                rt.load("l1", topk, caches["l1"], metas["l1"])
+                rt.finish_step()
+                built = pl.built[0]
+                self.assertTrue(torch.equal(topk, topk_orig))
+                if rank == 0:
+                    self.assertEqual(built.data_ptr(), topk.data_ptr())
+                    self.assertEqual(built[0, 0, :7].tolist(), [0, 131071, 131072, 131072, q_end - 1, q_end, -2])
+                else:
+                    self.assertEqual(built.data_ptr(), rt._plan_topk_buf.data_ptr())
+                    self.assertEqual(built[0, 0, :7].tolist(), [0, 131071, -1, -1, -1, q_end, -2])
+                rt.close()
+
+        # 3. BS=8, 8 * (128K + 128) (TP=4) multi-request filtering + MTP bind_draft_step
+        with _fake_npu():
+            src, pl = nsrc(), mk_pl()
+            rt, caches = mk_rt(pl, src, dsa_cp=True, draft_layers=("l2",))
+            req_ids = tuple(f"r{i}" for i in range(8))
+            src.step = step = mk_st(
+                [lms.SelectedRequest(rid, 131072, 128, True, 131072) for rid in req_ids], ("l0", "l1", "l2")
+            )
+            cp_r1 = SimpleNamespace(local_start=256, local_end=512, local_end_with_pad=512, num_tokens_pad=1024)
+            metas = mk_metas(1024, cp_r1, ("l0", "l1", "l2"))
+            rt.bind_step(step, req_ids, [131072] * 8, [128 * i for i in range(9)], metas)
+            self.assertEqual(rt._active_selected_indices, (2, 3))
+            self.assertEqual(rt.request_metadata.tolist(), [[2, 131072, 0, 128], [3, 131072, 128, 128]])
+            self.assertEqual(rt._query_offsets, [0, 0])
+            topk_r1 = torch.zeros((256, 1, skv.TOPK), dtype=torch.int32)
+            rt.load("l0", topk_r1, caches["l0"], metas["l0"])
+            self.assertEqual(pl.built[0].data_ptr(), topk_r1.data_ptr())
+            rt.prefetch_next("l0", metas["l0"])
+            rt.load("l1", topk_r1, caches["l1"], metas["l1"])
+            rt.defer_to_draft_step()
+
+            cp_draft = SimpleNamespace(local_start=2, local_end=4, local_end_with_pad=4, num_tokens_pad=8)
+            draft_metas = mk_metas(8, cp_draft, ("l2",))
+            common_meta = SimpleNamespace(query_start_loc_cpu=list(range(9)), seq_lens_cpu=[131073] * 8)
+            rt.bind_draft_step(draft_metas, common_meta)
+            self.assertEqual(rt._active_selected_indices, (2, 3))
+            self.assertEqual(rt.request_metadata.tolist(), [[2, 131072, 0, 1], [3, 131072, 1, 1]])
+            rt.load("l2", torch.zeros((2, 1, skv.TOPK), dtype=torch.int32), caches["l2"], draft_metas["l2"])
+            rt.finish_step()
+            rt._retire_previous()
+            self.assertTrue(step._closed)
+            rt.close()
+
+        # 4. Empty rank-local slice (mixed hit/miss and short batch < TP)
+        with _fake_npu():
+            c_stream = torch.npu.current_stream()
+            # 4a. Mixed hit/miss: Rank 2 owns [256, 384) of selected=False req (TP=4, num_tokens_pad=512)
+            src, pl = nsrc(), mk_pl()
+            rt, caches = mk_rt(pl, src, dsa_cp=True)
+            src.step = step = mk_st(
+                [lms.SelectedRequest("r0", 16384, 256, True, 16384), lms.SelectedRequest("r1", 128, 256, False, 0)]
+            )
+            cp_mix = SimpleNamespace(local_start=256, local_end=384, local_end_with_pad=384, num_tokens_pad=512)
+            metas = mk_metas(512, cp_mix)
+            rt.bind_step(step, ("r0", "r1"), (16384, 128), (0, 256, 512), metas)
+            self.assertEqual((rt._active_selected_indices, rt.request_metadata), ((), None))
+            topk_mix = torch.zeros((128, 1, skv.TOPK), dtype=torch.int32)
+            rt.load("l0", topk_mix, caches["l0"], metas["l0"])
+            rt.prefetch_next("l0", metas["l0"])
+            rt.load("l1", topk_mix, caches["l1"], metas["l1"])
+            rt.finish_step()
+            rt._retire_previous()
+            self.assertEqual((len(pl.built), len(pl.loads), step._closed), (0, 0, True))
+            self.assertEqual(len(c_stream.waited), 2)
+            rt.close()
+
+            # 4b. Short batch (num_actual_tokens=2, TP=4): Rank 2 has local_valid_tokens=0, local_topk_rows=1
+            c_stream.waited.clear()
+            src2, pl2 = nsrc(), mk_pl()
+            rt2, caches2 = mk_rt(pl2, src2, dsa_cp=True)
+            src2.step = step2 = mk_st([lms.SelectedRequest("r0", 16384, 2, True, 16384)])
+            cp_short = SimpleNamespace(local_start=2, local_end=2, local_end_with_pad=3, num_tokens_pad=4)
+            metas2 = mk_metas(2, cp_short)
+            rt2.bind_step(step2, ("r0",), (16384,), (0, 2), metas2)
+            self.assertEqual((rt2._local_valid_tokens, rt2._local_topk_rows, rt2.request_metadata), (0, 1, None))
+            topk_short = torch.zeros((1, 1, skv.TOPK), dtype=torch.int32)
+            rt2.load("l0", topk_short, caches2["l0"], metas2["l0"])
+            rt2.prefetch_next("l0", metas2["l0"])
+            rt2.load("l1", topk_short, caches2["l1"], metas2["l1"])
+            rt2.finish_step()
+            rt2._retire_previous()
+            self.assertEqual((len(pl2.built), len(pl2.loads), step2._closed), (0, 0, True))
+            self.assertEqual(len(c_stream.waited), 2)
+            rt2.close()
+
+            # 4c. Reject mismatched-TP dsa_cp_context (num_tokens_pad != local_rows * cp_tp_size or unaligned start)
+            for bad_cp in (
+                SimpleNamespace(local_start=256, local_end=512, local_end_with_pad=512, num_tokens_pad=512),
+                SimpleNamespace(local_start=64, local_end=192, local_end_with_pad=192, num_tokens_pad=512),
+            ):
+                src_bad, pl_bad = nsrc(), mk_pl()
+                rt_bad, _ = mk_rt(pl_bad, src_bad, dsa_cp=True)
+                step_bad = mk_st([lms.SelectedRequest("r0", 16384, 512, True, 16384)])
+                self.assertRaisesRegex(
+                    ValueError,
+                    "Bad dsa_cp_context",
+                    rt_bad.bind_step,
+                    step_bad,
+                    ("r0",),
+                    (16384,),
+                    (0, 512),
+                    mk_metas(512, bad_cp),
+                )
+                rt_bad.fail(step_bad)
+                self.assertRaisesRegex(RuntimeError, "retained", rt_bad.close)
+
+        # 5. Trailing SP padding & fail-closed metadata mismatch
+        with _fake_npu():
+            src, pl = nsrc(), mk_pl()
+            rt, caches = mk_rt(pl, src, dsa_cp=True)
+            src.step = step = mk_st([lms.SelectedRequest("r0", 16384, 5, True, 16384)])
+            cp_pad = SimpleNamespace(local_start=4, local_end=5, local_end_with_pad=6, num_tokens_pad=8)
+            metas = mk_metas(5, cp_pad)
+            rt.bind_step(step, ("r0",), (16384,), (0, 5), metas)
+            self.assertRaisesRegex(
+                ValueError,
+                "Invalid selected TopK",
+                rt.load,
+                "l0",
+                torch.zeros((1, 1, skv.TOPK), dtype=torch.int32),
+                caches["l0"],
+                metas["l0"],
+            )
+            rt.load("l0", torch.zeros((2, 1, skv.TOPK), dtype=torch.int32), caches["l0"], metas["l0"])
+            self.assertEqual(pl.built[0].shape[0], 1)
+            rt.fail(step)
+            self.assertTrue(step._finished)
+            self.assertRaisesRegex(RuntimeError, "retained", rt.close)
+
+            # Mismatch: dsa_cp=True with dsa_cp_context=None
+            src_m1, pl_m1 = nsrc(), mk_pl()
+            rt_m1, _ = mk_rt(pl_m1, src_m1, dsa_cp=True)
+            step_m1 = mk_st([lms.SelectedRequest("r0", 16384, 4, True, 16384)])
+            self.assertRaisesRegex(
+                ValueError,
+                "DSA-CP metadata mismatch",
+                rt_m1.bind_step,
+                step_m1,
+                ("r0",),
+                (16384,),
+                (0, 4),
+                mk_metas(4, None),
+            )
+            rt_m1.fail(step_m1)
+            self.assertRaisesRegex(RuntimeError, "retained", rt_m1.close)
+
+            # Mismatch: dsa_cp=False with dsa_cp_context != None
+            src_m2, pl_m2 = nsrc(), mk_pl()
+            rt_m2, _ = mk_rt(pl_m2, src_m2, dsa_cp=False)
+            step_m2 = mk_st([lms.SelectedRequest("r0", 16384, 4, True, 16384)])
+            cp_ok = SimpleNamespace(local_start=0, local_end=4, local_end_with_pad=4, num_tokens_pad=4)
+            self.assertRaisesRegex(
+                ValueError,
+                "DSA-CP metadata mismatch",
+                rt_m2.bind_step,
+                step_m2,
+                ("r0",),
+                (16384,),
+                (0, 4),
+                mk_metas(4, cp_ok),
+            )
+            rt_m2.fail(step_m2)
+            self.assertRaisesRegex(RuntimeError, "retained", rt_m2.close)
+
+            # Inconsistent dsa_cp_context across layers
+            src_m3, pl_m3 = nsrc(), mk_pl()
+            rt_m3, _ = mk_rt(pl_m3, src_m3, dsa_cp=True)
+            step_m3 = mk_st([lms.SelectedRequest("r0", 16384, 8, True, 16384)])
+            bad_metas = {
+                "l0": SimpleNamespace(
+                    block_table=torch.zeros((8, 1200), dtype=torch.int32),
+                    num_actual_tokens=8,
+                    block_size=128,
+                    dsa_cp_context=SimpleNamespace(local_start=0, local_end=2, local_end_with_pad=2, num_tokens_pad=8),
+                ),
+                "l1": SimpleNamespace(
+                    block_table=torch.zeros((8, 1200), dtype=torch.int32),
+                    num_actual_tokens=8,
+                    block_size=128,
+                    dsa_cp_context=SimpleNamespace(local_start=2, local_end=4, local_end_with_pad=4, num_tokens_pad=8),
+                ),
+            }
+            self.assertRaisesRegex(
+                ValueError,
+                "Inconsistent dsa_cp_context across layers",
+                rt_m3.bind_step,
+                step_m3,
+                ("r0",),
+                (16384,),
+                (0, 8),
+                bad_metas,
+            )
+            rt_m3.fail(step_m3)
+            self.assertRaisesRegex(RuntimeError, "retained", rt_m3.close)
+
+        # 6. Straddling rank boundaries, oversized TopK guards, [B2] topology gates, initialize_selected_kv, draft empty
+        with _fake_npu():
+            # 6a. Multi-request straddling rank boundary (q_off0 > 0 with len(active_indices) == 2)
+            src_s1, pl_s1 = nsrc(), mk_pl()
+            rt_s1, caches_s1 = mk_rt(pl_s1, src_s1, dsa_cp=True)
+            src_s1.step = step_s1 = mk_st(
+                [
+                    lms.SelectedRequest("r0", 32768, 300, True, 32768),
+                    lms.SelectedRequest("r1", 131072, 212, True, 131072),
+                ]
+            )
+            cp_s1 = SimpleNamespace(local_start=256, local_end=512, local_end_with_pad=512, num_tokens_pad=1024)
+            metas_s1 = mk_metas(512, cp_s1)
+            rt_s1.bind_step(step_s1, ("r0", "r1"), (32768, 131072), (0, 300, 512), metas_s1)
+            self.assertEqual(rt_s1._active_selected_indices, (0, 1))
+            self.assertEqual(rt_s1._query_offsets, [256, 0])
+            self.assertEqual(rt_s1.request_metadata.tolist(), [[0, 32768, 0, 44], [1, 131072, 44, 212]])
+            topk_s1 = torch.full((256, 1, skv.TOPK), -1, dtype=torch.int32)
+            topk_s1[0, 0, :4] = torch.tensor([32767, 32768, 33067, 33068], dtype=torch.int32)
+            topk_s1[44, 0, :3] = torch.tensor([32768, 33067, 131071], dtype=torch.int32)
+            rt_s1.load("l0", topk_s1, caches_s1["l0"], metas_s1["l0"])
+            rt_s1.prefetch_next("l0", metas_s1["l0"])
+            rt_s1.load("l1", topk_s1, caches_s1["l1"], metas_s1["l1"])
+            rt_s1.finish_step()
+            rt_s1._retire_previous()
+            self.assertEqual(pl_s1.built[0][0, 0, :4].tolist(), [32767, -1, -1, 33068])
+            self.assertEqual(pl_s1.built[0][44, 0, :3].tolist(), [32768, 33067, 131071])
+            rt_s1.close()
+
+            # 6b. Non-selected request straddling local_start before a selected request
+            src_s2, pl_s2 = nsrc(), mk_pl()
+            rt_s2, caches_s2 = mk_rt(pl_s2, src_s2, dsa_cp=True)
+            src_s2.step = step_s2 = mk_st(
+                [
+                    lms.SelectedRequest("r0", 128, 300, False, 0),
+                    lms.SelectedRequest("r1", 16384, 212, True, 16384),
+                ]
+            )
+            rt_s2.bind_step(step_s2, ("r0", "r1"), (128, 16384), (0, 300, 512), metas_s1)
+            self.assertEqual(rt_s2._active_selected_indices, (1,))
+            self.assertEqual((rt_s2.starts, rt_s2.queries, rt_s2._query_offsets), ([44], [212], [0]))
+            self.assertEqual(rt_s2.request_metadata.tolist(), [[1, 16384, 44, 212]])
+            rt_s2.fail(step_s2)
+            self.assertRaisesRegex(RuntimeError, "retained", rt_s2.close)
+
+            # 6c. Oversized TopK fail-closed checks (dsa_cp=True and dsa_cp=False)
+            src_o1, pl_o1 = nsrc(), mk_pl()
+            rt_o1, caches_o1 = mk_rt(pl_o1, src_o1, dsa_cp=True)
+            step_o1 = mk_st([lms.SelectedRequest("r0", 16384, 512, True, 16384)])
+            cp_o1 = SimpleNamespace(local_start=0, local_end=128, local_end_with_pad=128, num_tokens_pad=512)
+            metas_o1 = mk_metas(512, cp_o1)
+            rt_o1.bind_step(step_o1, ("r0",), (16384,), (0, 512), metas_o1)
+            self.assertRaisesRegex(
+                ValueError,
+                "Invalid selected TopK",
+                rt_o1.load,
+                "l0",
+                torch.zeros((256, 1, skv.TOPK), dtype=torch.int32),
+                caches_o1["l0"],
+                metas_o1["l0"],
+            )
+            rt_o1.fail(step_o1)
+            self.assertRaisesRegex(RuntimeError, "retained", rt_o1.close)
+
+            src_o2, pl_o2 = nsrc(), mk_pl()
+            rt_o2, caches_o2 = mk_rt(pl_o2, src_o2, dsa_cp=False, max_tokens=16)
+            step_o2 = mk_st([lms.SelectedRequest("r0", 16384, 4, True, 16384)])
+            metas_o2 = mk_metas(4, None)
+            rt_o2.bind_step(step_o2, ("r0",), (16384,), (0, 4), metas_o2)
+            self.assertRaisesRegex(
+                ValueError,
+                "Invalid selected TopK",
+                rt_o2.load,
+                "l0",
+                torch.zeros((17, 1, skv.TOPK), dtype=torch.int32),
+                caches_o2["l0"],
+                metas_o2["l0"],
+            )
+            rt_o2.fail(step_o2)
+            self.assertRaisesRegex(RuntimeError, "retained", rt_o2.close)
+
+            # 6d. Target-non-empty -> draft-empty rank transition (Rank 2: active target -> empty draft)
+            src_d, pl_d = nsrc(), mk_pl()
+            rt_d, caches_d = mk_rt(pl_d, src_d, dsa_cp=True, draft_layers=("l2",))
+            src_d.step = step_d = mk_st(
+                [
+                    lms.SelectedRequest("r0", 16384, 2, True, 16384),
+                    lms.SelectedRequest("r1", 16384, 2, True, 16384),
+                ],
+                ("l0", "l1", "l2"),
+            )
+            cp_tgt = SimpleNamespace(local_start=2, local_end=3, local_end_with_pad=3, num_tokens_pad=4)
+            metas_tgt = mk_metas(4, cp_tgt, ("l0", "l1", "l2"))
+            rt_d.bind_step(step_d, ("r0", "r1"), (16384, 16384), (0, 2, 4), metas_tgt)
+            self.assertEqual(rt_d._active_selected_indices, (1,))
+            topk_tgt = torch.zeros((1, 1, skv.TOPK), dtype=torch.int32)
+            rt_d.load("l0", topk_tgt, caches_d["l0"], metas_tgt["l0"])
+            rt_d.prefetch_next("l0", metas_tgt["l0"])
+            rt_d.load("l1", topk_tgt, caches_d["l1"], metas_tgt["l1"])
+            rt_d.defer_to_draft_step()
+
+            cp_dr = SimpleNamespace(local_start=2, local_end=2, local_end_with_pad=3, num_tokens_pad=4)
+            metas_dr = mk_metas(2, cp_dr, ("l2",))
+            common_dr = SimpleNamespace(query_start_loc_cpu=[0, 1, 2], seq_lens_cpu=[16385, 16385])
+            rt_d.bind_draft_step(metas_dr, common_dr)
+            self.assertEqual((rt_d._active_selected_indices, rt_d.request_metadata), ((), None))
+            rt_d.load("l2", torch.zeros((1, 1, skv.TOPK), dtype=torch.int32), caches_d["l2"], metas_dr["l2"])
+            rt_d.finish_step()
+            rt_d._retire_previous()
+            self.assertTrue(step_d._closed)
+            rt_d.close()
+
+        # 6e. [B2] gates + end-to-end initialize_selected_kv dsa_cp=True wiring
+        vcfg_bad_draft_tp = _vcfg(
+            par=SimpleNamespace(
+                tensor_parallel_size=4,
+                pipeline_parallel_size=1,
+                prefill_context_parallel_size=1,
+                decode_context_parallel_size=1,
+            ),
+            spec=SimpleNamespace(method="deepseek_mtp", num_speculative_tokens=1, draft_tensor_parallel_size=1),
+        )
+        with patch.multiple(envs_ascend, **kw):
+            self.assertRaisesRegex(ValueError, "Unsupported deployment", cfg.validate_deployment, vcfg_bad_draft_tp)
+
+        for bad_ctx in (
+            {
+                "model.layers.0.self_attn": SimpleNamespace(
+                    impl=SimpleNamespace(
+                        kv_lora_rank=512,
+                        qk_rope_head_dim=64,
+                        index_topk=2048,
+                        enable_dsa_cp=True,
+                        is_vl_first_layer=True,
+                    )
+                )
+            },
+            {
+                "model.layers.0.self_attn": SimpleNamespace(
+                    impl=SimpleNamespace(
+                        kv_lora_rank=512, qk_rope_head_dim=64, index_topk=2048, enable_dsa_cp=True, tp_size=4
+                    )
+                ),
+                "model.layers.1.self_attn": SimpleNamespace(
+                    impl=SimpleNamespace(
+                        kv_lora_rank=512, qk_rope_head_dim=64, skip_topk=True, enable_dsa_cp=True, tp_size=1
+                    )
+                ),
+            },
+        ):
+            self.assertRaises(
+                ValueError,
+                skv._resolve_topology,
+                SimpleNamespace(
+                    vllm_config=vcfg_tp4, compilation_config=SimpleNamespace(static_forward_context=bad_ctx)
+                ),
+            )
+
+        ctx_tp2 = {
+            "model.layers.0.self_attn": SimpleNamespace(
+                impl=SimpleNamespace(
+                    kv_lora_rank=512, qk_rope_head_dim=64, index_topk=2048, enable_dsa_cp=True, tp_size=2
+                )
+            )
+        }
+        self.assertRaisesRegex(
+            ValueError,
+            "tp_size mismatch",
+            skv._resolve_topology,
+            SimpleNamespace(vllm_config=vcfg_tp4, compilation_config=SimpleNamespace(static_forward_context=ctx_tp2)),
+        )
+
+        # End-to-end initialize_selected_kv with dsa_cp=True, tp_size=4
+        ctx_init = {
+            "model.layers.0.self_attn": SimpleNamespace(
+                impl=SimpleNamespace(
+                    kv_lora_rank=512, qk_rope_head_dim=64, index_topk=2048, enable_dsa_cp=True, tp_size=4
+                )
+            ),
+            "model.layers.1.self_attn": SimpleNamespace(
+                impl=SimpleNamespace(
+                    kv_lora_rank=512, qk_rope_head_dim=64, skip_topk=True, enable_dsa_cp=True, tp_size=4
+                )
+            ),
+        }
+        vcfg_init = _vcfg(
+            par=SimpleNamespace(
+                tensor_parallel_size=4,
+                pipeline_parallel_size=1,
+                prefill_context_parallel_size=1,
+                decode_context_parallel_size=1,
+            ),
+            sched=SimpleNamespace(async_scheduling=True, max_num_batched_tokens=8192, max_num_seqs=8),
+            spec=None,
+        )
+        rn_init = SimpleNamespace(
+            device="cpu",
+            vllm_config=vcfg_init,
+            ascend_config=SimpleNamespace(selected_kv_config=cfg),
+            pcp_size=1,
+            dcp_size=1,
+            layerwise_prefill_p_node=True,
+            layerwise_prefill_bank_count=2,
+            compilation_config=SimpleNamespace(static_forward_context=ctx_init),
+            selected_kv_runtime=None,
+            _selected_kv_budget=None,
+        )
+        wk_init = SimpleNamespace(vllm_config=vcfg_init, model_runner=rn_init)
+        with patch.multiple(envs_ascend, **kw), patch.dict(sys.modules, u_a3):
+            skv.reserve_selected_kv_workspace(wk_init, 2 << 30)
+
+        kv_caches_init = {
+            "model.layers.0.self_attn": (
+                torch.zeros((16, 128, 1, 512), dtype=torch.bfloat16),
+                torch.zeros((16, 128, 1, 64), dtype=torch.bfloat16),
+            ),
+            "model.layers.1.self_attn": (
+                torch.zeros((16, 128, 1, 512), dtype=torch.bfloat16),
+                torch.zeros((16, 128, 1, 64), dtype=torch.bfloat16),
+            ),
+        }
+        fake_impl = SimpleNamespace(selected_kv_source=None)
+        fake_conn = SimpleNamespace(_lmcache_engine=fake_impl)
+        fake_src = SimpleNamespace(close=nop)
+        fake_planner = mk_pl()
+        with (
+            _fake_npu(),
+            patch.object(sys.modules["vllm.distributed.kv_transfer"], "get_kv_transfer_group", lambda: fake_conn),
+            patch.object(lms, "LMCacheSelectedKVSource", return_value=fake_src),
+            patch.object(psr, "SelectedKVPlanner", return_value=fake_planner),
+        ):
+            skv.initialize_selected_kv(rn_init, None, kv_caches_init)
+            rt_init = rn_init.selected_kv_runtime
+            self.assertIsNotNone(rt_init)
+            self.assertIs(fake_impl.selected_kv_source, fake_src)
+            self.assertEqual((rt_init._dsa_cp, rt_init._cp_tp_size, rt_init.local_query_capacity), (True, 4, 2048))
+            self.assertEqual(tuple(rt_init._plan_topk_buf.shape), (2048, 1, skv.TOPK))
+            rt_init.close()
 
 
 if __name__ == "__main__":
