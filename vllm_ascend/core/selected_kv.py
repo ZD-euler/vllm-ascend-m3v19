@@ -204,6 +204,29 @@ class SelectedKVBudget:
 reserve_workspace_bytes = SelectedKVBudget
 
 
+def _topology_diagnostic_type(value: Any) -> str:
+    # Bypass custom metaclass hooks and str-subclass slicing on class names.
+    name = type.__dict__["__name__"].__get__(type(value))
+    return str.__getitem__(name, slice(0, 80))
+
+
+def _topology_diagnostic_value(value: Any) -> str:
+    """Describe small builtins without inspecting device values or custom reprs."""
+    value_type = type(value)
+    type_name = _topology_diagnostic_type(value)
+    if value_type is str:
+        rendered = repr(value[:80])[:120]
+        if len(value) > 80:
+            rendered += "..."
+    elif value_type is int:
+        rendered = repr(value) if value.bit_length() <= 256 else "<more than 256 bits>"
+    elif value_type is bool or value_type is float or value is None:
+        rendered = repr(value)
+    else:
+        return f"<type={type_name}>"
+    return f"{rendered} (type={type_name})"
+
+
 def _resolve_topology(runner: Any) -> tuple[tuple[str, ...], frozenset[str], dict[str, str]]:
     ctx = runner.compilation_config.static_forward_context
 
@@ -227,11 +250,22 @@ def _resolve_topology(runner: Any) -> tuple[tuple[str, ...], frozenset[str], dic
     for name in names:
         impl = ctx[name].impl
         skip_topk = bool(getattr(impl, "skip_topk", False))
-        dims_ok = (getattr(impl, "kv_lora_rank", 0), getattr(impl, "qk_rope_head_dim", 0)) == (NOPE_ROW_DIM, PE_ROW_DIM)
-        _check(
-            dims_ok and not getattr(impl, "enable_dsa_cp", False) and not (name in draft and skip_topk),
-            f"Bad MLA/draft {name!r}",
+        kv_lora_rank = getattr(impl, "kv_lora_rank", 0)
+        qk_rope_head_dim = getattr(impl, "qk_rope_head_dim", 0)
+        dims_ok = (kv_lora_rank, qk_rope_head_dim) == (NOPE_ROW_DIM, PE_ROW_DIM)
+        valid = (
+            dims_ok
+            and not (enable_dsa_cp := getattr(impl, "enable_dsa_cp", False))
+            and not (name in draft and skip_topk)
         )
+        if not valid:
+            cp_detail = _topology_diagnostic_value(enable_dsa_cp) if dims_ok else "<not evaluated: dimensions mismatch>"
+            raise ValueError(
+                f"Bad MLA/draft {name!r}: impl_type={_topology_diagnostic_type(impl)}, "
+                f"kv_lora_rank={_topology_diagnostic_value(kv_lora_rank)} (expected {NOPE_ROW_DIM}), "
+                f"qk_rope_head_dim={_topology_diagnostic_value(qk_rope_head_dim)} (expected {PE_ROW_DIM}), "
+                f"impl.enable_dsa_cp={cp_detail}, is_draft={name in draft}, skip_topk={skip_topk}"
+            )
         if not skip_topk:
             candidates = (
                 getattr(impl, "index_topk", None),

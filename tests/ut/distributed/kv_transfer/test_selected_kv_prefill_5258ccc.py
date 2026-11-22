@@ -141,6 +141,158 @@ def _mk_obj(ptr_base: int, tokens: int):
     )
 
 
+class SelectedKVTopologyDiagnosticTest(unittest.TestCase):
+    @staticmethod
+    def _runner(impl, *, is_draft=False):
+        name = "model.layers.0.self_attn.attn"
+        ctx = {name: SimpleNamespace(impl=impl)}
+        if is_draft:
+            ctx["model.layers.1.self_attn.attn"] = SimpleNamespace(
+                impl=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64, index_topk=2048)
+            )
+        return SimpleNamespace(
+            compilation_config=SimpleNamespace(static_forward_context=ctx),
+            drafter=SimpleNamespace(attn_layer_names=(name,) if is_draft else ()),
+        )
+
+    def test_topology_failure_reports_values_types_and_guards(self) -> None:
+        cases = (
+            ({"kv_lora_rank": 256}, False, "kv_lora_rank=256 (type=int) (expected 512)"),
+            ({"qk_rope_head_dim": 32}, False, "qk_rope_head_dim=32 (type=int) (expected 64)"),
+            ({"enable_dsa_cp": True}, False, "impl.enable_dsa_cp=True (type=bool)"),
+            ({"skip_topk": True}, True, "is_draft=True, skip_topk=True"),
+            ({"kv_lora_rank": "512"}, False, "kv_lora_rank='512' (type=str) (expected 512)"),
+        )
+        for overrides, is_draft, detail in cases:
+            with self.subTest(overrides=overrides, is_draft=is_draft):
+                fields = dict(kv_lora_rank=512, qk_rope_head_dim=64, index_topk=2048)
+                fields.update(overrides)
+                with self.assertRaises(ValueError) as raised:
+                    skv._resolve_topology(self._runner(SimpleNamespace(**fields), is_draft=is_draft))
+                message = str(raised.exception)
+                self.assertTrue(message.startswith("Bad MLA/draft 'model.layers.0.self_attn.attn':"))
+                self.assertIn("impl_type=SimpleNamespace", message)
+                self.assertIn(detail, message)
+                self.assertIn("kv_lora_rank=", message)
+                self.assertIn("qk_rope_head_dim=", message)
+                self.assertIn(f"is_draft={is_draft}", message)
+
+    def test_dimension_failure_preserves_property_access_order(self) -> None:
+        accesses = []
+
+        class _Impl:
+            @property
+            def skip_topk(self):
+                accesses.append("skip_topk")
+                return False
+
+            @property
+            def kv_lora_rank(self):
+                accesses.append("kv_lora_rank")
+                return 256
+
+            @property
+            def qk_rope_head_dim(self):
+                accesses.append("qk_rope_head_dim")
+                return 64
+
+            @property
+            def enable_dsa_cp(self):
+                raise AssertionError("CP property must remain unevaluated")
+
+        with self.assertRaises(ValueError) as raised:
+            skv._resolve_topology(self._runner(_Impl()))
+        self.assertIn("impl.enable_dsa_cp=<not evaluated: dimensions mismatch>", str(raised.exception))
+        self.assertEqual(accesses, ["kv_lora_rank", "skip_topk", "kv_lora_rank", "qk_rope_head_dim"])
+
+    def test_cp_failure_reads_property_once(self) -> None:
+        accesses = []
+
+        class _Impl:
+            kv_lora_rank = 512
+            qk_rope_head_dim = 64
+
+            @property
+            def enable_dsa_cp(self):
+                accesses.append("enable_dsa_cp")
+                return True
+
+        with self.assertRaisesRegex(ValueError, "impl.enable_dsa_cp=True"):
+            skv._resolve_topology(self._runner(_Impl()))
+        self.assertEqual(accesses, ["enable_dsa_cp"])
+
+    def test_topology_diagnostic_does_not_inspect_unknown_values(self) -> None:
+        class _Meta(type):
+            @property
+            def __name__(cls):
+                raise AssertionError("custom type-name property must not be called")
+
+        class _DeviceValue(metaclass=_Meta):
+            def __repr__(self):
+                raise AssertionError("custom repr must not be called")
+
+            def item(self):
+                raise AssertionError("device value must not be read")
+
+            def cpu(self):
+                raise AssertionError("device value must not be copied")
+
+        for field in ("kv_lora_rank", "qk_rope_head_dim", "enable_dsa_cp"):
+            with self.subTest(field=field):
+                fields = dict(kv_lora_rank=512, qk_rope_head_dim=64, index_topk=2048)
+                fields[field] = _DeviceValue()
+                with self.assertRaises(ValueError) as raised:
+                    skv._resolve_topology(self._runner(SimpleNamespace(**fields)))
+                self.assertIn(f"{field}=<type=_DeviceValue>", str(raised.exception))
+
+    def test_topology_diagnostic_bypasses_class_name_subclass_slicing(self) -> None:
+        class _UnsafeName(str):
+            def __getitem__(self, key):
+                raise RuntimeError("custom class-name slicing must not be called")
+
+        class _Value:
+            pass
+
+        class _Impl:
+            kv_lora_rank = _Value()
+            qk_rope_head_dim = 64
+
+        _Value.__name__ = _UnsafeName("DiagnosticValue")
+        _Impl.__name__ = _UnsafeName("DiagnosticImpl")
+        with self.assertRaises(ValueError) as raised:
+            skv._resolve_topology(self._runner(_Impl()))
+        message = str(raised.exception)
+        self.assertTrue(message.startswith("Bad MLA/draft 'model.layers.0.self_attn.attn':"))
+        self.assertIn("impl_type=DiagnosticImpl", message)
+        self.assertIn("kv_lora_rank=<type=DiagnosticValue>", message)
+
+    def test_topology_diagnostic_bounds_builtin_values(self) -> None:
+        for value, type_name in (("\\n" * 10000, "str"), (1 << 10000, "int")):
+            with self.subTest(type_name=type_name):
+                detail = skv._topology_diagnostic_value(value)
+                self.assertLess(len(detail), 160)
+                self.assertIn(f"type={type_name}", detail)
+        for value, expected in ((None, "None (type=NoneType)"), (1.5, "1.5 (type=float)")):
+            self.assertEqual(skv._topology_diagnostic_value(value), expected)
+
+    def test_valid_topology_preserves_owners_and_draft(self) -> None:
+        names = tuple(f"model.layers.{idx}.self_attn.attn" for idx in range(3))
+        ctx = {
+            name: SimpleNamespace(
+                impl=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64, index_topk=2048, skip_topk=idx == 1)
+            )
+            for idx, name in enumerate(names)
+        }
+        runner = SimpleNamespace(
+            compilation_config=SimpleNamespace(static_forward_context=ctx),
+            drafter=SimpleNamespace(attn_layer_names=(names[2],)),
+        )
+        self.assertEqual(
+            skv._resolve_topology(runner),
+            (names, frozenset((names[2],)), {names[0]: names[0], names[1]: names[0], names[2]: names[2]}),
+        )
+
+
 class SelectedKVUnitTest(unittest.TestCase):
     def test_selected_prefill_rejects_adapter_cache(self) -> None:
         with patch.dict(
