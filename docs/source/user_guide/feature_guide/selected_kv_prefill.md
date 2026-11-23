@@ -37,8 +37,12 @@ native loading where needed.
 - Native two-plane main KV: BF16 or FP16 with 512 non-RoPE and 64 RoPE elements
   per row, 128-token pages and indexer TopK width 2048.
 - At most 16,384 scheduled tokens and 256 requests per step. Selected histories
-  must be between 16,384 and 524,288 tokens; request selection also depends on
-  query/history geometry and source-cache availability.
+  must be at least 16,384 tokens and total sequence length (history plus query)
+  must not exceed 1,048,576 tokens; request selection also depends on
+  query/history geometry and source-cache availability. Fixed planner output
+  workspace scales with `max_num_seqs` up to `min(1,048,576, 2048 * local_q_cap)`
+  IDs per request slot before KV-cache sizing, so `max_num_seqs` on P nodes
+  should match actual prefill concurrency rather than an oversized decode limit.
 - Optional `mtp` / `deepseek_mtp` speculation with exactly one speculative token
   and matching target/draft tensor parallel sizes. Target and draft passes share
   a deferred source lifetime; multimodal MTP draft passes under DSA-CP are
@@ -68,7 +72,9 @@ INT8 storage, and weight quantization is independent of the KV dtype.
 
 Build the Ascend extensions from this source checkout with the matching Torch,
 Torch-NPU and CANN toolchain. The build produces the selected union and in-place
-MLA gather libraries from `csrc/sparse_prefill_native`.
+MLA gather libraries and the 1M-capable `sparse_prefill_fused_fixed_1m.o` device
+object from `csrc/sparse_prefill_native`; startup probes reject stale pre-1M
+shared libraries or missing device objects immediately.
 
 The implementation originated from vLLM-Ascend `5258cccf` and is integrated with
 the current main runner. The original companion snapshots were vLLM `a386a401`,

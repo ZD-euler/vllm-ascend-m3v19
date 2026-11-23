@@ -217,7 +217,9 @@ template <QuePosition, QuePosition, int D> struct TQueBind {
         }
         ++live;
         ++queueDepth;
-        return {new U8[qBytes], qBytes, 1};
+        U8* p = new U8[qBytes];
+        std::fill_n(p, qBytes, 0xA5U);
+        return {p, qBytes, 1};
     }
     template <class T> void EnQue(LocalTensor<T> t) {
         if (!t.k || static_cast<int>(q.size()) >= cap) {
@@ -248,6 +250,7 @@ template <QuePosition, QuePosition, int D> struct TQueBind {
 
 struct TPipe {
     bool tracked_;
+    Z ubUsed = 0;
     explicit TPipe(bool track = true) : tracked_(track) {
         if (tracked_) {
             if (activePipes != 0) {
@@ -263,10 +266,27 @@ struct TPipe {
             cleanCacheLines.clear();
         }
     }
-    void Reset() {}
+    void AccountUb(Z n) {
+        if (n == 0U || n % 32U != 0U || n > 195584U || ubUsed > 195584U - n) {
+            throw std::runtime_error("ub_overflow_or_align");
+        }
+        ubUsed += n;
+    }
+    void Reset() { ubUsed = 0; }
     event_t FetchEventID(HardEvent) { return 0; }
-    template <auto P> void InitBuffer(TBuf<P>& b, Z n) { b.v.assign(n, 0); }
+    template <auto P> void InitBuffer(TBuf<P>& b, Z n) {
+        AccountUb(n);
+        b.v.assign(n, 0xA5U);
+    }
     template <QuePosition A, QuePosition B, int D> void InitBuffer(TQueBind<A, B, D>& q, int num, Z n) {
+        if (num <= 0) {
+            throw std::runtime_error("ub_overflow_or_align");
+        }
+        Z nu = static_cast<Z>(num);
+        if (n > 195584U / nu) {
+            throw std::runtime_error("ub_overflow_or_align");
+        }
+        AccountUb(nu * n);
         q.Init(num, n);
     }
 };
@@ -580,7 +600,9 @@ int test_mla_decode_and_copy(int gc_in, int mode, int aon) {
                 1
             ) ||
             AdjacentMla({1000, 2000, 3000, 4000}, {1000, 2000, 3000, 4000}, 1) ||
-            rl(2, 131072, 2) != 8 || rl(1, 262144, 1) != 16 || rl(0, 128, 1) != -1) {
+            rl(2, 131072, 2) != 8 || rl(2, 131200, 2) != 16 || rl(1, 262144, 1) != 16 ||
+            rl(1, 262272, 1) != 32 || rl(1, 524288, 1) != 32 || rl(1, 524416, 1) != 32 ||
+            rl(1, 1048576, 1) != 32 || rl(1, 1048704, 1) != -1 || rl(0, 128, 1) != -1) {
             throw std::runtime_error("dec");
         }
         const U32 R = (mode == 3) ? 5U : 2U, P = (mode == 3) ? 10U : 6U;
@@ -640,6 +662,100 @@ int test_mla_decode_and_copy(int gc_in, int mode, int aon) {
                     CopyRowRef(exp_cn, exp_cpe, sn, spe, selPg[r], r, rw, NR, ER);
                 }
             }
+        }
+        if (cn != exp_cn || cpe != exp_cpe) {
+            throw std::runtime_error("cp");
+        }
+    });
+}
+
+int test_mla_multitile_and_1m_bounds(int mode, int aon) {
+    return Guard(aon != 0, [&] {
+        constexpr U32 K_1M_STRIDE = 8208U, NR = PAGE_ROWS * NOPE_ROW_BYTES, ER = PAGE_ROWS * PE_ROW_BYTES;
+        const U32 R = (mode == 0) ? 2U : 1U;
+        const U32 P = (mode == 0) ? 6U : 5U;
+        const U32 K = (mode == 3) ? 1024U : K_1M_STRIDE;
+        const U32 C = (mode == 4) ? 1048576U : ((mode == 3) ? 32896U : 32768U);
+        const U32 gc = (mode == 4) ? 32U : 1U;
+        const int32_t h = (mode == 2) ? 1048704 : ((mode == 3) ? 131072 : 1048576);
+        const int32_t cnt = (mode == 4) ? 524320 : ((mode == 3) ? 32769 : ((mode == 0) ? 32768 : 20000));
+        const U32 srcPages = (mode == 0) ? 4U : 3U;
+        std::vector<U8> sn(srcPages * NR), spe(srcPages * ER);
+        std::vector<U8> cn(P * NR, 0xA5), cpe(P * ER, 0x5A), exp_cn = cn, exp_cpe = cpe;
+        FillPlane(sn, 0x21U, NR, NOPE_ROW_BYTES);
+        FillPlane(spe, 0x83U, ER, PE_ROW_BYTES);
+        std::vector<int32_t> ids(R * C, 128), st(R * 8U, 0), meta(R * 4U, 0), tbl(R * K, 1);
+        std::vector<U64> mb(P * 2U, 0);
+        tbl[0] = 2;
+        mb[4] = uintptr_t(sn.data());
+        mb[5] = uintptr_t(spe.data());
+        if (K >= 8192U) {
+            tbl[4096] = 3;
+            tbl[8191] = 4;
+            mb[6] = uintptr_t(sn.data() + NR);
+            mb[7] = uintptr_t(spe.data() + ER);
+            mb[8] = uintptr_t(sn.data() + 2U * NR);
+            mb[9] = uintptr_t(spe.data() + 2U * ER);
+        }
+        st[0] = cnt;
+        st[1] = 4;
+        meta = (mode == 0) ? std::vector<int32_t>{0, h, 0, 4, 1, 256, 4, 4} : std::vector<int32_t>{0, h, 0, 4};
+        if (mode == 0) {
+            tbl[K] = 5;
+            mb[10] = uintptr_t(sn.data() + 3U * NR);
+            mb[11] = uintptr_t(spe.data() + 3U * ER);
+            st[8] = 4;
+            st[9] = 4;
+            ids[0] = 0;
+            ids[1] = 1;
+            ids[1000] = 524288;
+            ids[1001] = 524290;
+            ids[16382] = 1048572;
+            ids[16383] = 1048573;
+            ids[16384] = 1048574;
+            ids[16385] = 1048575;
+            ids[32766] = 524291;
+            ids[32767] = 127;
+            ids[C] = 0;
+            ids[C + 1U] = 1;
+            ids[C + 2U] = 3;
+            ids[C + 3U] = 128;
+        } else if (mode == 1) {
+            ids[0] = 0;
+            ids[16384] = 1048574;
+            ids[16385] = 128;
+            ids[16386] = 1048576;
+        } else if (mode == 4) {
+            ids[0] = 0;
+            ids[16384] = 1048574;
+            const U32 l31 = 31U * 16385U;
+            ids[l31] = 524289;
+            ids[l31 + 16384U] = 1048575;
+        }
+        regions.clear();
+        queueDepth = 0;
+        ([](auto&... a) { (Reg(a.data(), a.size() * sizeof(a[0])), ...); })(ids, st, meta, tbl, mb, cn, cpe, sn, spe);
+        for (blockIndex = 0; blockIndex < 32U; ++blockIndex) {
+            sparse_prefill_bf16_mla_inplace(
+                P8(ids), P8(st), P8(mb), P8(meta), P8(tbl), cn.data(), cpe.data(),
+                R, C, P, R, K, K, P, gc
+            );
+        }
+        if (queueDepth != 0U) {
+            throw std::runtime_error("lk");
+        }
+        if (mode == 0) {
+            for (U32 rw : {0U, 1U, 127U}) { CopyRowRef(exp_cn, exp_cpe, sn, spe, 2, 0, rw, NR, ER); }
+            for (U32 rw : {0U, 2U, 3U}) { CopyRowRef(exp_cn, exp_cpe, sn, spe, 3, 1, rw, NR, ER); }
+            for (U32 rw : {124U, 125U, 126U, 127U}) { CopyRowRef(exp_cn, exp_cpe, sn, spe, 4, 2, rw, NR, ER); }
+            for (U32 rw : {0U, 1U, 3U}) { CopyRowRef(exp_cn, exp_cpe, sn, spe, 5, 3, rw, NR, ER); }
+        } else if (mode == 1) {
+            CopyRowRef(exp_cn, exp_cpe, sn, spe, 2, 0, 0, NR, ER);
+        } else if (mode == 4) {
+            CopyRowRef(exp_cn, exp_cpe, sn, spe, 2, 0, 0, NR, ER);
+            CopyRowRef(exp_cn, exp_cpe, sn, spe, 3, 1, 1, NR, ER);
+            CopyRowRef(exp_cn, exp_cpe, sn, spe, 4, 2, 126, NR, ER);
+            CopyRowRef(exp_cn, exp_cpe, sn, spe, 4, 2, 127, NR, ER);
         }
         if (cn != exp_cn || cpe != exp_cpe) {
             throw std::runtime_error("cp");
@@ -827,7 +943,11 @@ def _compile(tmp: Path) -> ctypes.CDLL:
         ("f.cpp", "sparse_prefill_fused_fixed.cpp"),
     ):
         dst = nat / name
-        dst.write_text((KDIR / fname).read_text().split('extern "C" int32_t launch')[0])
+        txt = (KDIR / fname).read_text()
+        src_txt = txt.split('extern "C" int32_t launch')[0]
+        if 'extern "C" uint32_t selected_prefill_' in txt:
+            src_txt += 'extern "C" uint32_t selected_prefill_' + txt.split('extern "C" uint32_t selected_prefill_')[1]
+        dst.write_text(src_txt)
         srcs.append(str(dst))
     so = tmp / "libhost.so"
     cmd = [cxx, "-shared", "-fPIC", "-std=c++17", "-O2", "-UNDEBUG", "-DASCENDC_DUMP=1", "-pthread", f"-I{nat}"]
@@ -835,11 +955,21 @@ def _compile(tmp: Path) -> ctypes.CDLL:
     assert res.returncode == 0, res.stderr.decode("utf-8", errors="replace")
     lib = ctypes.CDLL(str(so))
     lib.host_last_error.restype = ctypes.c_char_p
-    lib.test_dcache_guard.argtypes = []
-    lib.test_merge_sorted_runs.argtypes = [ctypes.c_uint32] * 2
-    lib.test_mla_decode_and_copy.argtypes = [ctypes.c_int32] * 3
-    lib.test_union_pipeline.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_uint32] * 3 + [ctypes.c_int32]
-    lib.test_union_pipeline_reuse.argtypes = [ctypes.c_void_p] * 6 + [ctypes.c_uint32] * 3 + [ctypes.c_int32]
+    for fn in ("selected_prefill_mla_max_history", "selected_prefill_union_max_history"):
+        attr = getattr(lib, fn)
+        attr.argtypes = []
+        attr.restype = ctypes.c_uint32
+    for fn, args in (
+        ("test_dcache_guard", []),
+        ("test_merge_sorted_runs", [ctypes.c_uint32] * 2),
+        ("test_mla_decode_and_copy", [ctypes.c_int32] * 3),
+        ("test_mla_multitile_and_1m_bounds", [ctypes.c_int32] * 2),
+        ("test_union_pipeline", [ctypes.c_void_p] * 3 + [ctypes.c_uint32] * 3 + [ctypes.c_int32]),
+        ("test_union_pipeline_reuse", [ctypes.c_void_p] * 6 + [ctypes.c_uint32] * 3 + [ctypes.c_int32]),
+    ):
+        attr = getattr(lib, fn)
+        attr.argtypes = args
+        attr.restype = ctypes.c_int32
     return lib
 
 
@@ -854,6 +984,8 @@ class SelectedKernelsHostTest(unittest.TestCase):
         cls._td.cleanup()
 
     def test_mla_copy_coalesce_lanes_abort_and_slice_guard(self) -> None:
+        self.assertEqual(self.lib.selected_prefill_mla_max_history(), 1_048_576)
+        self.assertEqual(self.lib.selected_prefill_union_max_history(), 1_048_576)
         err = lambda: self.lib.host_last_error().decode()
         # (a) Normal copy: gc=1U, gc=8U (R=2), and gc=8U (R=5 -> group 0 executes r=0 and r=4)
         for gc, mode in ((1, 0), (8, 0), (8, 3)):
@@ -869,6 +1001,19 @@ class SelectedKernelsHostTest(unittest.TestCase):
         self.assertEqual(self.lib.test_mla_decode_and_copy(1, 2, 0), 0, err())
         # (e) GlobalTensor scalar D$ invalidation guard
         self.assertEqual(self.lib.test_dcache_guard(), 0, err())
+        # (f) 1M multi-tile localIds streaming (perLane > 16384), Tile-1 abort (queueDepth==0),
+        #     and MAX_COLUMNS / MAX_LANE_IDS guards
+        self.assertEqual(self.lib.test_mla_multitile_and_1m_bounds(0, 1), 0, err())
+        self.assertEqual(self.lib.test_mla_multitile_and_1m_bounds(1, 1), 1)
+        self.assertIn("Selected copy token outside history", err())
+        self.assertEqual(self.lib.test_mla_multitile_and_1m_bounds(1, 0), 0, err())
+        self.assertEqual(self.lib.test_mla_multitile_and_1m_bounds(2, 1), 1)
+        self.assertIn("Invalid selected copy metadata or union status", err())
+        self.assertEqual(self.lib.test_mla_multitile_and_1m_bounds(2, 0), 0, err())
+        self.assertEqual(self.lib.test_mla_multitile_and_1m_bounds(3, 1), 1)
+        self.assertIn("Selected copy local ID capacity exceeded", err())
+        self.assertEqual(self.lib.test_mla_multitile_and_1m_bounds(3, 0), 0, err())
+        self.assertEqual(self.lib.test_mla_multitile_and_1m_bounds(4, 1), 0, err())
 
     def test_merge_source_length_split_on_either_side(self) -> None:
         # Each case exceeds the API source bound on one side only. Removing
@@ -910,11 +1055,22 @@ class SelectedKernelsHostTest(unittest.TestCase):
         ln, _ = run(1024, 2, 128, r_ovf)
         self.assertEqual(ln, [129, 2, 131, 0, 1, 0, 0, 0])
 
-        # 5. Max history h=524288 with id=524287 (words_=512)
+        # 5. Max history h=524288 (words_=512) & 1M h=1048576 (words_=1024, causal + OOR err=1)
         ln, out = run(524288, 2, 256, [[524287], [0]])
         self.assertEqual(ln, [2, 2, 4, 0, 0, 0, 0, 0])
         self.assertEqual(out[:2].tolist(), [0, 524287])
         self.assertTrue(np.all(out[2:] == 0x5A5A5A5A))
+        ln, out = run(
+            1048576,
+            2,
+            256,
+            [[1048575, 524287, 1048574] + [0] * 2045, [524288, 1048576] + [0] * 2046],
+        )
+        self.assertEqual(ln, [5, 2, 7, 0, 0, 0, 0, 0])
+        self.assertEqual(out[:5].tolist(), [0, 524287, 524288, 1048574, 1048575])
+        self.assertTrue(np.all(out[5:] == 0x5A5A5A5A))
+        ln, _ = run(1048576, 2, 256, [[1048578] + [0] * 2047, [0]])
+        self.assertEqual(ln, [1, 2, 3, 1, 0, 0, 0, 0])
 
         # 6. Zero history h=0, q=4, cap=128 -> total=0
         ln, out = run(0, 4, 128, [[0], [1], [2], [3]])
@@ -950,17 +1106,26 @@ class SelectedKernelsHostTest(unittest.TestCase):
         self.assertEqual(out[:8192].tolist(), list(range(8192)))
         self.assertTrue(np.all(out[8192:] == 0x5A5A5A5A))
 
-        # 9. Q = 1026 (cohorts = 513 > COHORT_META_GROUPS = 512) multi-batch descriptor loop
+        # 9. Q = 1026 (cohorts = 513 > COHORT_META_GROUPS = 256) multi-batch descriptor loop
         rows_multi = [[i % 16] for i in range(1024)] + [[777], [1500]]
         ln, out = run(2048, 1026, 256, rows_multi)
         self.assertEqual(ln, [18, 1026, 1044, 0, 0, 0, 0, 0])
         self.assertEqual(out[:18].tolist(), list(range(16)) + [777, 1500])
         self.assertTrue(np.all(out[18:] == 0x5A5A5A5A))
 
-        # 10. Variable-history buffer reuse: h=65536 (words_=64) -> h=131072 (words_=128) -> h=65536 (words_=64)
+        # 9b. 1M (h=1048576, q=514 -> cohorts = 257 > COHORT_META_GROUPS = 256) at peak width_=32768 (180,256 B UB)
+        rows_1m_mb = [[i * 2048] for i in range(512)] + [[1048574], [1048575]]
+        ln, out = run(1048576, 514, 1024, rows_1m_mb)
+        self.assertEqual(ln, [514, 514, 1028, 0, 0, 0, 0, 0])
+        exp_1m_mb = [i * 2048 for i in range(512)] + [1048574, 1048575]
+        self.assertEqual(out[:514].tolist(), exp_1m_mb)
+        self.assertTrue(np.all(out[514:] == 0x5A5A5A5A))
+
+        # 10. Variable-history buffer reuse: 65536 -> 1048576 -> 135169 (0 < cols < words_) -> 65536
         step_specs = [
             (65536, 4, 64, [[10], [65535], [10], [0]], [0, 10, 65535]),
-            (131072, 4, 64, [[5], [65536], [131071], [5]], [5, 65536, 131071]),
+            (1048576, 4, 64, [[5], [524288], [1048575], [5]], [5, 524288, 1048575]),
+            (135169, 4, 64, [[3], [135168], [135170], [3]], [3, 135168]),
             (65536, 4, 64, [[7], [65535], [65538], [7]], [7, 65535]),
         ]
         tks, outs, lns = [], [], []
@@ -985,7 +1150,7 @@ class SelectedKernelsHostTest(unittest.TestCase):
             out_ptrs.ctypes.data,
             ln_ptrs.ctypes.data,
             len(step_specs),
-            131072,
+            1048576,
             4,
             1,
         )

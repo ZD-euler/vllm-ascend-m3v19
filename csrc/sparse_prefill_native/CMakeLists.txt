@@ -18,6 +18,9 @@ add_custom_command(TARGET sparse_prefill_fused_fixed POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_BINARY_DIR}/sparse_prefill_fused_fixed_merge_obj_dir/device_aiv.o"
         "${SELECTED_KV_LIBRARY_DIR}/sparse_prefill_fused_fixed.o"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_BINARY_DIR}/sparse_prefill_fused_fixed_merge_obj_dir/device_aiv.o"
+        "${SELECTED_KV_LIBRARY_DIR}/sparse_prefill_fused_fixed_1m.o"
 )
 
 add_library(sparse_prefill_fused_fixed_launch SHARED "${CMAKE_CURRENT_LIST_DIR}/sparse_prefill_batch_queued.cpp")
@@ -58,5 +61,10 @@ endif()
 
 foreach(_dir IN LISTS _selected_dirs)
     install(TARGETS ${SELECTED_KV_TARGETS} LIBRARY DESTINATION "${_dir}")
-    install(FILES "${SELECTED_KV_LIBRARY_DIR}/sparse_prefill_fused_fixed.o" DESTINATION "${_dir}")
+    install(
+        FILES
+            "${SELECTED_KV_LIBRARY_DIR}/sparse_prefill_fused_fixed.o"
+            "${SELECTED_KV_LIBRARY_DIR}/sparse_prefill_fused_fixed_1m.o"
+        DESTINATION "${_dir}"
+    )
 endforeach()

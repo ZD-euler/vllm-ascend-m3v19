@@ -24,7 +24,7 @@ using LIServiceVec::ExtractIndex;
 using LIServiceVec::SortAll;
 
 constexpr uint32_t TOPK = 2048U, COHORT_ROWS = 2U, COHORT_SIZE = TOPK * COHORT_ROWS, CORES = 32U;
-constexpr uint32_t MAX_PARTITION = 32768U, CHUNK = 4096U, COUNTER_STRIDE = 8U, COHORT_META_GROUPS = 512U, MASK_BYTES = 4096U;
+constexpr uint32_t MAX_PARTITION = 32768U, CHUNK = 4096U, COUNTER_STRIDE = 8U, COHORT_META_GROUPS = 256U, MASK_BYTES = 4096U;
 constexpr int32_t SOURCE_KEY_BASE = static_cast<int32_t>(0x40000000U + ((1U << 21U) - 1U));
 
 template <HardEvent E>
@@ -145,7 +145,8 @@ struct PartitionUnion {
         cohorts_ = (query + COHORT_ROWS - 1U) / COHORT_ROWS;
         width_ = width;
         base_ = GetBlockIdx();
-        pipe.InitBuffer(bitmapBuf, MAX_PARTITION * 4U);
+        ASSERT_MSG(width_ >= 128U && width_ <= MAX_PARTITION && width_ % 128U == 0U, "Invalid partition bitmap width");
+        pipe.InitBuffer(bitmapBuf, width_ * 4U);
         pipe.InitBuffer(inputBuf, CHUNK * 4U);
         pipe.InitBuffer(compactBuf, CHUNK * 4U);
         pipe.InitBuffer(maskBuf, MASK_BYTES * 2U);
@@ -466,7 +467,7 @@ namespace SparsePrefillBitmap {
 using namespace AscendC;
 using namespace SparsePrefillPlan;
 
-constexpr uint32_t MAX_HISTORY = 524288U, WORDS = MAX_HISTORY / 32U, WORDS_PER_CORE = WORDS / CORES;
+constexpr uint32_t MAX_HISTORY = 1048576U, WORDS = MAX_HISTORY / 32U, WORDS_PER_CORE = WORDS / CORES, TRANSPOSE_BITS = 16U * CORES;
 
 struct BuildMembershipWords {
     __aicore__ inline void Init(GM_ADDR membership, GM_ADDR residueCounts, GM_ADDR groupCounts, GM_ADDR bitmap, uint32_t width, TPipe& pipe) {
@@ -476,6 +477,7 @@ struct BuildMembershipWords {
         BindGm(bitmapGm, bitmap);
         width_ = width;
         words_ = ((width + CORES - 1U) / CORES + 63U) / 64U * 64U;
+        ASSERT_MSG(words_ >= 64U && words_ <= WORDS_PER_CORE && words_ % 64U == 0U, "Invalid membership bitmap extent");
         pipe.InitBuffer(matrixBuf, CORES * words_ * 4U);
         for (uint32_t i = 0U; i < 5U; ++i) {
             pipe.InitBuffer(rows[i], WORDS_PER_CORE * 4U);
@@ -503,24 +505,24 @@ struct BuildMembershipWords {
         auto constant = rows[3].Get<int32_t>(), high = rows[4].Get<int32_t>();
         auto bits = bitsBuf.Get<uint32_t>();
 
-        ArithProgression(offsets, 0, 1, WORDS_PER_CORE);
+        ArithProgression(offsets, 0, 1, TRANSPOSE_BITS);
         PipeBarrier<PIPE_V>();
-        Shr32(tmp, offsets, 5U, WORDS_PER_CORE);
-        Shl32(constant, tmp, 5U, WORDS_PER_CORE);
-        VSub(offsets, offsets, constant, WORDS_PER_CORE);
-        Muls(offsets, offsets, static_cast<int32_t>(words_), WORDS_PER_CORE);
+        Shr32(tmp, offsets, 5U, TRANSPOSE_BITS);
+        Shl32(constant, tmp, 5U, TRANSPOSE_BITS);
+        VSub(offsets, offsets, constant, TRANSPOSE_BITS);
+        Muls(offsets, offsets, static_cast<int32_t>(words_), TRANSPOSE_BITS);
         PipeBarrier<PIPE_V>();
-        VAdd(offsets, offsets, tmp, WORDS_PER_CORE);
-        Muls(offsets, offsets, 4, WORDS_PER_CORE);
+        VAdd(offsets, offsets, tmp, TRANSPOSE_BITS);
+        Muls(offsets, offsets, 4, TRANSPOSE_BITS);
         PipeBarrier<PIPE_V>();
 
         for (uint32_t b = 0U; b < words_ / 16U; ++b) {
-            Gather(values.ReinterpretCast<float>(), matrix, offsets.ReinterpretCast<uint32_t>(), 0U, WORDS_PER_CORE);
+            Gather(values.ReinterpretCast<float>(), matrix, offsets.ReinterpretCast<uint32_t>(), 0U, TRANSPOSE_BITS);
             PipeBarrier<PIPE_V>();
-            CompareScalar(bits.ReinterpretCast<uint8_t>()[b * 64U], values.ReinterpretCast<float>(), 0.0F, CMPMODE::GT, WORDS_PER_CORE);
+            CompareScalar(bits.ReinterpretCast<uint8_t>()[b * 64U], values.ReinterpretCast<float>(), 0.0F, CMPMODE::GT, TRANSPOSE_BITS);
             PipeBarrier<PIPE_V>();
             if (b + 1U < words_ / 16U) {
-                Adds(offsets, offsets, 64, WORDS_PER_CORE);
+                Adds(offsets, offsets, 64, TRANSPOSE_BITS);
                 PipeBarrier<PIPE_V>();
             }
         }

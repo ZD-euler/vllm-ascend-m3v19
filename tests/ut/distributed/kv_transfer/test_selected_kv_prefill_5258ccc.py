@@ -554,6 +554,69 @@ class SelectedKVUnitTest(unittest.TestCase):
                 ):
                     psr.SelectedKVPlanner("cpu", 1024, 16, 2)
 
+            p_calls.clear()
+            f_1m = SimpleNamespace(
+                create_sparse_prefill_fixed_handle=_Fn(
+                    lambda p, c, hp: (
+                        p_calls.append(("cr1m", Path(p.decode()).name, c)),
+                        setattr(hp._obj, "value", 0xBEEF),
+                        0,
+                    )[2]
+                ),
+                destroy_sparse_prefill_fused_handle=_Fn(
+                    lambda h: p_calls.append(("ds1m", getattr(h, "value", h))) or 0
+                ),
+                launch_sparse_prefill_fused_plan=ctypes.c_void_p(0x1111),
+                selected_prefill_fused_max_history=_Fn(lambda: 1048576),
+            )
+            m_1m = SimpleNamespace(
+                launch_sparse_prefill_bf16_mla_inplace=ctypes.c_void_p(0x2222),
+                selected_prefill_mla_max_history=_Fn(lambda: 1048576),
+            )
+            with patch.object(ctypes, "CDLL", side_effect=[f_1m, m_1m]):
+                pl_1m = psr.SelectedKVPlanner("cpu", 1048576, 512, 2)
+                pl_1m.close_quiescent()
+            self.assertEqual(p_calls[-2], ("cr1m", "sparse_prefill_fused_fixed_1m.o", 1048576))
+            self.assertRaisesRegex(ValueError, "Plan bounds exceeded", psr._plan_shapes, 1048576 + 128, 512, 2)
+
+            f_stale = SimpleNamespace(
+                create_sparse_prefill_fixed_handle=f_1m.create_sparse_prefill_fixed_handle,
+                destroy_sparse_prefill_fused_handle=f_1m.destroy_sparse_prefill_fused_handle,
+                launch_sparse_prefill_fused_plan=ctypes.c_void_p(0x1111),
+                selected_prefill_fused_max_history=_Fn(lambda: 524288),
+            )
+            m_stale = SimpleNamespace(
+                launch_sparse_prefill_bf16_mla_inplace=ctypes.c_void_p(0x2222),
+                selected_prefill_mla_max_history=_Fn(lambda: 524288),
+            )
+
+            class _StaleCDLL(psr._CDLL_TYPE):
+                def __init__(self) -> None:
+                    pass
+
+                def __getattr__(self, name: str) -> Any:
+                    raise AttributeError(name)
+
+            for pair in ((f_stale, m_1m), (f_1m, m_stale), (_StaleCDLL(), m_1m), (f_1m, _StaleCDLL())):
+                with (
+                    patch.object(ctypes, "CDLL", side_effect=list(pair)),
+                    self.assertRaisesRegex(RuntimeError, "Selected KV native libraries are outdated"),
+                ):
+                    psr.SelectedKVPlanner("cpu", 524288, 256, 2)
+
+            class _MissingObjCDLL(_StaleCDLL):
+                create_sparse_prefill_fixed_handle = f_1m.create_sparse_prefill_fixed_handle
+                destroy_sparse_prefill_fused_handle = f_1m.destroy_sparse_prefill_fused_handle
+                launch_sparse_prefill_fused_plan = ctypes.c_void_p(0x1111)
+                selected_prefill_fused_max_history = _Fn(lambda: 1048576)
+
+            with (
+                patch.object(ctypes, "CDLL", side_effect=[_MissingObjCDLL(), m_1m]),
+                patch.object(Path, "is_file", return_value=False),
+                self.assertRaisesRegex(RuntimeError, "Missing 1M selected-KV device object"),
+            ):
+                psr.SelectedKVPlanner("cpu", 524288, 256, 2)
+
         budget = skv.reserve_workspace_bytes(1024 * 1024, 4096, 8192, 64, 4096)
         budget.validate(10)
         self.assertRaises(ValueError, skv.SelectedKVConfig.from_dict, {"bad": 1})
@@ -572,7 +635,7 @@ class SelectedKVUnitTest(unittest.TestCase):
             (16384, 248, 0, 0, 16384),
             (16384, 250, 0, 0, 16384),
             (16383, 16, 0, 0, 16384),
-            (524289, 16, 0, 0, 16384),
+            (1048577, 16, 0, 0, 16384),
             (16384, 16, 1, 0, 16384),
             (16384, 16, 0, 1, 16384),
             (16384, 16, 0, 0, 8192),
@@ -581,6 +644,15 @@ class SelectedKVUnitTest(unittest.TestCase):
             [lms.classify_lmcache_request("r", *c[:2], mk(*c[2:])).selected for c in cs], [True] + [False] * 6
         )
         self.assertEqual(lms.classify_lmcache_request("r6", 16384, 16, mk(), kv_role="kv_both").omit_end_token, 8192)
+        ok_1m = lms.classify_lmcache_request("r_1m_ok", 1047552, 1024, mk(ct=1047552))
+        self.assertEqual((ok_1m.selected, ok_1m.omit_end_token), (True, 1047552))
+        self.assertTrue(lms.classify_lmcache_request("r_1m_ratio", 1032960, 15616, mk(ct=1032960)).selected)
+        self.assertTrue(lms.classify_lmcache_request("r_1m_cliff_ok", 1032848, 15728, mk(ct=1032848)).selected)
+        self.assertFalse(lms.classify_lmcache_request("r_1m_cliff_bad", 1032847, 15729, mk(ct=1032847)).selected)
+        max_h_1m = lms.classify_lmcache_request("r_1m_max_h", 1048575, 1, mk(ct=1048575))
+        self.assertEqual((max_h_1m.selected, max_h_1m.omit_end_token), (True, 1047552))
+        self.assertFalse(lms.classify_lmcache_request("r_1m_ovf1", 1047552, 1025, mk(ct=1047552)).selected)
+        self.assertFalse(lms.classify_lmcache_request("r_1m_ovf2", 1048576, 1, mk(ct=1048576)).selected)
 
         reqs = [lms.SelectedRequest("a", 16384, 128, True, 16384), lms.SelectedRequest("b", 128, 128, False, 0)]
         blk = (np.array([[*range(129)], [2, 9] + [0] * 127], dtype=np.int32),)
@@ -1836,7 +1908,7 @@ class SelectedKVUnitTest(unittest.TestCase):
             self.assertEqual(nb_cp, mr_cp_ok._selected_kv_budget.native_budget_bytes)
             self.assertTrue(mr_cp_ok._selected_kv_budget._topology[3])
 
-        self.assertEqual(psr.selected_workspace_bytes(8192, 8), 86182400 + 75 * 1024)
+        self.assertEqual(psr.selected_workspace_bytes(8192, 8), 105122304 + 75 * 1024)
         self.assertEqual(
             psr.selected_workspace_bytes(16384, 8, dsa_cp=True, cp_tp_size=4),
             psr.selected_workspace_bytes(4096, 8) + 4 * 4096 * skv.TOPK,
@@ -1879,14 +1951,14 @@ class SelectedKVUnitTest(unittest.TestCase):
             s.finish = lambda *, completion=None, failed=False: setattr(s, "_finished", True)
             return s
 
-        def mk_rt(pl, src, *, dsa_cp=True, max_tokens=8192, draft_layers=()):
+        def mk_rt(pl, src, *, dsa_cp=True, max_tokens=8192, draft_layers=(), tp=4):
             ow = {"l0": "l0", "l1": "l0"}
             if draft_layers:
                 ow["l2"] = "l2"
             caches = {n: (z(512), z(64)) for n in ow}
             vc = _vcfg(
                 par=SimpleNamespace(
-                    tensor_parallel_size=4 if dsa_cp else 1,
+                    tensor_parallel_size=tp if dsa_cp else 1,
                     pipeline_parallel_size=1,
                     prefill_context_parallel_size=1,
                     decode_context_parallel_size=1,
@@ -1952,6 +2024,130 @@ class SelectedKVUnitTest(unittest.TestCase):
                     self.assertEqual(built.data_ptr(), rt._plan_topk_buf.data_ptr())
                     self.assertEqual(built[0, 0, :7].tolist(), [0, 131071, -1, -1, -1, q_end, -2])
                 rt.close()
+
+        # 2b. BS=1, 1M (H=1,047,552 + Q=1,024, TP=4) bind_step acceptance & H+Q>1M rejection
+        with _fake_npu():
+            src, pl = nsrc(), mk_pl()
+            rt, caches_1m = mk_rt(pl, src, dsa_cp=True)
+            cp_ctx = SimpleNamespace(local_start=256, local_end=512, local_end_with_pad=512, num_tokens_pad=1024)
+            metas_1m = {
+                ln: SimpleNamespace(
+                    block_table=torch.zeros((8, 8192), dtype=torch.int32),
+                    num_actual_tokens=1024,
+                    block_size=128,
+                    dsa_cp_context=cp_ctx,
+                )
+                for ln in ("l0", "l1")
+            }
+            src.step = step_1m = mk_st([lms.SelectedRequest("r_1m", 1047552, 1024, True, 1047552)])
+            rt.bind_step(step_1m, ("r_1m",), (1047552,), (0, 1024), metas_1m)
+            self.assertEqual(rt.request_metadata.tolist(), [[0, 1047552, 0, 256]])
+            topk_1m = torch.zeros((256, 1, skv.TOPK), dtype=torch.int32)
+            rt.load("l0", topk_1m, caches_1m["l0"], metas_1m["l0"])
+            rt.prefetch_next("l0", metas_1m["l0"])
+            rt.load("l1", topk_1m, caches_1m["l1"], metas_1m["l1"])
+            rt.finish_step()
+            src.step = step_bad = mk_st([lms.SelectedRequest("r_bad", 1047552, 1025, True, 1047552)])
+            with self.assertRaisesRegex(ValueError, "Invalid selected batch H/Q"):
+                rt.bind_step(step_bad, ("r_bad",), (1047552,), (0, 1025), metas_1m)
+            rt.fail(step_bad)
+            self.assertRaisesRegex(RuntimeError, "retained", rt.close)
+
+        # 2c. 1M MTP draft + max reachable H=1,048,575, Q=1 (TP=4, Rank 0, 18-aligned block_table) & draft rejection
+        with _fake_npu():
+            src, pl = nsrc(), mk_pl()
+            rt, caches = mk_rt(pl, src, dsa_cp=True, draft_layers=("l2",))
+            cp_r0 = SimpleNamespace(local_start=0, local_end=1, local_end_with_pad=1, num_tokens_pad=4)
+            tbl_1m = torch.zeros((8, 8224), dtype=torch.int32)[:, :8208]
+            metas_m = {
+                ln: SimpleNamespace(
+                    block_table=tbl_1m,
+                    num_actual_tokens=1,
+                    block_size=128,
+                    dsa_cp_context=cp_r0,
+                )
+                for ln in ("l0", "l1", "l2")
+            }
+            src.step = step_m = mk_st([lms.SelectedRequest("r_m", 1048575, 1, True, 1047552)], ("l0", "l1", "l2"))
+            rt.bind_step(step_m, ("r_m",), (1048575,), (0, 1), metas_m)
+            self.assertEqual(rt.request_metadata.tolist(), [[0, 1048575, 0, 1]])
+            topk_m = torch.zeros((1, 1, skv.TOPK), dtype=torch.int32)
+            rt.load("l0", topk_m, caches["l0"], metas_m["l0"])
+            rt.prefetch_next("l0", metas_m["l0"])
+            rt.load("l1", topk_m, caches["l1"], metas_m["l1"])
+            rt.defer_to_draft_step()
+            draft_metas = {"l2": metas_m["l2"]}
+            rt.bind_draft_step(draft_metas, SimpleNamespace(query_start_loc_cpu=[0, 1], seq_lens_cpu=[1048576]))
+            rt.load("l2", topk_m, caches["l2"], draft_metas["l2"])
+            rt.finish_step()
+            rt._retire_previous()
+            self.assertTrue(step_m._closed)
+            rt.close()
+
+            src_d, pl_d = nsrc(), mk_pl()
+            rt_d, caches_d = mk_rt(pl_d, src_d, dsa_cp=True, draft_layers=("l2",))
+            src_d.step = step_d = mk_st([lms.SelectedRequest("r_d", 1048575, 1, True, 1047552)], ("l0", "l1", "l2"))
+            rt_d.bind_step(step_d, ("r_d",), (1048575,), (0, 1), metas_m)
+            rt_d.load("l0", topk_m, caches_d["l0"], metas_m["l0"])
+            rt_d.prefetch_next("l0", metas_m["l0"])
+            rt_d.load("l1", topk_m, caches_d["l1"], metas_m["l1"])
+            rt_d.defer_to_draft_step()
+            with self.assertRaisesRegex(ValueError, "Bad draft history"):
+                rt_d.bind_draft_step(
+                    {"l2": metas_m["l2"]},
+                    SimpleNamespace(query_start_loc_cpu=[0, 2], seq_lens_cpu=[1048577]),
+                )
+            rt_d.fail(step_d)
+            self.assertRaisesRegex(RuntimeError, "retained", rt_d.close)
+
+        # 2d. TP=8 DSA-CP straddling + 1-token MTP + mixed selected/native batch at H+Q=1,048,576 (Rank 7, limit0==1M)
+        with _fake_npu():
+            src, pl = nsrc(), mk_pl()
+            rt, caches = mk_rt(pl, src, dsa_cp=True, draft_layers=("l2",), tp=8)
+            tbl_8k = torch.zeros((8, 8224), dtype=torch.int32)[:, :8208]
+            cp_r7 = SimpleNamespace(local_start=1008, local_end=1152, local_end_with_pad=1152, num_tokens_pad=1152)
+            metas_tp8 = {
+                ln: SimpleNamespace(
+                    block_table=tbl_8k,
+                    num_actual_tokens=1152,
+                    block_size=128,
+                    dsa_cp_context=cp_r7,
+                )
+                for ln in ("l0", "l1", "l2")
+            }
+            reqs_tp8 = [
+                lms.SelectedRequest("r0", 1047552, 1024, True, 1047552),
+                lms.SelectedRequest("r1", 0, 128, False, 0),
+            ]
+            src.step = step_tp8 = mk_st(reqs_tp8, ("l0", "l1", "l2"))
+            rt.bind_step(step_tp8, ("r0", "r1"), (1047552, 0), (0, 1024, 1152), metas_tp8)
+            self.assertEqual(rt.request_metadata.tolist(), [[0, 1047552, 0, 16]])
+            topk_r7 = torch.full((144, 1, skv.TOPK), -1, dtype=torch.int32)
+            topk_r7[0, 0, :6] = torch.tensor([0, 1047551, 1047552, 1048560, 1048575, 1048576], dtype=torch.int32)
+            topk_r7_orig = topk_r7.clone()
+            rt.load("l0", topk_r7, caches["l0"], metas_tp8["l0"])
+            rt.prefetch_next("l0", metas_tp8["l0"])
+            rt.load("l1", topk_r7, caches["l1"], metas_tp8["l1"])
+            built = pl.built[0]
+            self.assertTrue(torch.equal(topk_r7, topk_r7_orig))
+            self.assertEqual(built.data_ptr(), rt._plan_topk_buf.data_ptr())
+            self.assertEqual(built[0, 0, :6].tolist(), [0, 1047551, -1, -1, -1, 1048576])
+            rt.defer_to_draft_step()
+
+            cp_draft_r7 = SimpleNamespace(local_start=903, local_end=1025, local_end_with_pad=1032, num_tokens_pad=1032)
+            draft_metas_tp8 = {
+                "l2": SimpleNamespace(
+                    block_table=tbl_8k, num_actual_tokens=1025, block_size=128, dsa_cp_context=cp_draft_r7
+                )
+            }
+            rt.bind_draft_step(
+                draft_metas_tp8, SimpleNamespace(query_start_loc_cpu=[0, 1024, 1025], seq_lens_cpu=[1048576, 129])
+            )
+            rt.load("l2", torch.zeros((129, 1, skv.TOPK), dtype=torch.int32), caches["l2"], draft_metas_tp8["l2"])
+            rt.finish_step()
+            rt._retire_previous()
+            self.assertTrue(step_tp8._closed)
+            rt.close()
 
         # 3. BS=8, 8 * (128K + 128) (TP=4) multi-request filtering + MTP bind_draft_step
         with _fake_npu():
@@ -3113,11 +3309,12 @@ class SelectedKVUnitTest(unittest.TestCase):
                     self.assertFalse(st0_f._closed)
                     skv.close_selected_kv_worker(ef.wk)
                     self.assertEqual(o0_f.s, {"p": 1, "r": 1})
+            h_max = 1048576
             exp_ws = (
-                4 * (8192 * (4096 + 8) + 524288 + 2 * 32 * 8 + (524288 // 32) + 8 * 524288 + 8 * 8 + min(8, 16384) * 8)
+                4 * (8192 * (4096 + 8) + h_max + 2 * 32 * 8 + (h_max // 32) + 8 * h_max + 8 * 8 + min(8, 16384) * 8)
                 + 75 * 1024
             )
-            self.assertEqual((exp_ws, psr.selected_workspace_bytes(16384, 8)), (153_499_136, exp_ws))
+            self.assertEqual((exp_ws, psr.selected_workspace_bytes(16384, 8)), (172_439_040, exp_ws))
             ew, pb_b, d1 = _build_env(), skv.PAGE_ROWS * skv.MAIN_ROW_BYTES, 16385
             avail = skv.NATIVE_ALIGNMENT + d1 * pb_b + 1024
             with self._init_rt(ew, avail=avail) as nret:
@@ -3386,6 +3583,131 @@ class SelectedKVUnitTest(unittest.TestCase):
             [(1, 0x13000), (1, 0x13000), (1, 0x14000), (1, 0x15000), (1, 0x16000), (1, 0x16000)],
         )
         self.assertEqual((len(ptr_calls), len(src._dva_cache)), (9, 1))
+
+    def test_1m_1024_chunk_8192_page_partition_populate_and_dva_cache(self) -> None:
+        nop = lambda *a, **k: None
+        req = lms.SelectedRequest("r_1m", 1047552, 1024, True, 1047552)
+        blk0 = np.arange(8192, dtype=np.int32)[None, :]
+        blk1 = (np.arange(8192, dtype=np.int32) + 8192)[None, :]
+        om, kp = lms.compute_per_bank_block_partition([req], (blk0, blk1), domain=16384)
+        self.assertEqual((len(om[0]), len(kp[0]), len(om[1]), len(kp[1])), (8184, 8, 8184, 8))
+
+        class _Chunk1M:
+            num_layers = 2
+            valid = True
+
+            def __init__(self, base: int, tokens: int) -> None:
+                self._base = base
+                self.layer_size = tokens * skv.MAIN_ROW_BYTES
+
+            def layer_size_bytes(self, _lid: int) -> int:
+                return self.layer_size
+
+            def layer_data_ptr(self, lid: int) -> int:
+                return self._base + lid * 0x100
+
+        with _fake_npu():
+            gc = SimpleNamespace(
+                _layerwise_prefill_bank_count=2, batched_to_gpu=nop, release_layerwise_prefill_dma_cache=nop
+            )
+            eng = SimpleNamespace(
+                gpu_connector=gc,
+                shared_cpu_cache_generation=1,
+                _prepare_shared_prefill_sources=nop,
+                release_shared_cpu_sparse_request=nop,
+            )
+            impl = SimpleNamespace(
+                lmcache_engine=eng,
+                _submit_initial_layerwise_prefill_load=nop,
+                submit_layerwise_prefill_load=nop,
+                start_load_kv=nop,
+                _parent=SimpleNamespace(_kv_transfer_config=SimpleNamespace(kv_role="kv_producer")),
+            )
+            npu_m = SimpleNamespace(bind_incremental_copy_addresses=nop, BoundCopyPrefix=nop)
+            mc = {n: (torch.empty((16384, 1, 1, 1)),) * 2 for n in ("l0", "l1")}
+            src = lms.LMCacheSelectedKVSource(
+                SimpleNamespace(device="cpu"),
+                impl,
+                ("l0", "l1"),
+                mc,
+                get_device_ptr_fn=lambda ptr, _sz: (1 << 63) | ptr,
+                npu_connectors_module=npu_m,
+            )
+            src._step_host, src._step_dev = src._host_bases, src._dev_bases
+            step = lms.LMCacheSelectedLoadStep(
+                src, SimpleNamespace(requests=[]), [req], (blk0, blk1), om, src._step_dev
+            )
+            objs = [_Chunk1M(0x1000_0000_0000 + i * 0x1_0000_0000, 1024) for i in range(1024)]
+            starts = [i * 1024 for i in range(1024)]
+            ends = [(i + 1) * 1024 for i in range(1024)]
+            src._populate_bases(step, "r_1m", 0, objs, starts, ends)
+            src._populate_bases(step, "r_1m", 1, objs, starts, ends)
+            host_u64 = src._step_host.numpy().view(np.uint64)
+            for lid, base_blk in ((0, 0), (1, 8192)):
+                for p in (0, 8183):
+                    base0 = np.uint64((1 << 63) | (0x1000_0000_0000 + (p // 8) * 0x1_0000_0000 + lid * 0x100))
+                    row = np.uint64((p % 8) * skv.PAGE_ROWS)
+                    exp0 = base0 + row * np.uint64(skv.MLA_NOPE_ROW_BYTES)
+                    exp1 = base0 + np.uint64(1024 * skv.MLA_NOPE_ROW_BYTES) + row * np.uint64(skv.MLA_PE_ROW_BYTES)
+                    self.assertEqual(
+                        (int(host_u64[lid, base_blk + p, 0]), int(host_u64[lid, base_blk + p, 1])),
+                        (int(exp0), int(exp1)),
+                    )
+                self.assertTrue(np.all(host_u64[lid, base_blk + 8184 : base_blk + 8192] == 0))
+
+            # Vectorized _prepare_shared (LayerPageSource path) across 1,024 chunks with > 4 GiB slab offsets
+            src._step_host.zero_()
+            step_vec = lms.LMCacheSelectedLoadStep(
+                src, SimpleNamespace(requests=[]), [req], (blk0, blk1), om, src._step_dev
+            )
+            src.step = step_vec
+            pages_1m = tuple(objs)
+            prep_vec = [SimpleNamespace(pages=pages_1m, suffix=(), layer_id=lid) for lid in range(2)]
+            eng._prepare_shared_prefill_sources(
+                prep_vec, 0, {"req_id": "r_1m", "_shared_prefill_starts": starts, "_shared_prefill_ends": ends}
+            )
+            for lid, base_blk in ((0, 0), (1, 8192)):
+                for p in (0, 8183):
+                    base0 = np.uint64((1 << 63) | (0x1000_0000_0000 + (p // 8) * 0x1_0000_0000 + lid * 0x100))
+                    row = np.uint64((p % 8) * skv.PAGE_ROWS)
+                    exp0 = base0 + row * np.uint64(skv.MLA_NOPE_ROW_BYTES)
+                    exp1 = base0 + np.uint64(1024 * skv.MLA_NOPE_ROW_BYTES) + row * np.uint64(skv.MLA_PE_ROW_BYTES)
+                    self.assertEqual(
+                        (int(host_u64[lid, base_blk + p, 0]), int(host_u64[lid, base_blk + p, 1])),
+                        (int(exp0), int(exp1)),
+                    )
+                self.assertTrue(np.all(host_u64[lid, base_blk + 8184 : base_blk + 8192] == 0))
+            src.step = None
+
+            # > 65,536 _dva_cache lookups retain cleanly; boundary == MAX_DVA_CACHE_ENTRIES clears on next insert
+            ptr_calls = [0]
+            src._dva_cache.clear()
+            src._get_device_ptr_fn = lambda ptr, _sz: (ptr_calls.__setitem__(0, ptr_calls[0] + 1), ptr + 0x10000)[1]
+            live_al = SimpleNamespace(_mapping=SimpleNamespace(_closed=False))
+            cur_ptr = [0]
+            probe_obj = SimpleNamespace(
+                layer_size_bytes=lambda _l: skv.MAIN_ROW_BYTES,
+                layer_data_ptr=lambda _l: cur_ptr[0],
+                parent_allocator=live_al,
+            )
+            for i in range(70000):
+                cur_ptr[0] = 0x1000_0000 + i * 0x1000
+                src._chunk_info(probe_obj, 0)
+            self.assertEqual((len(src._dva_cache), ptr_calls[0]), (70000, 70000))
+            self.assertLess(len(src._dva_cache), lms.MAX_DVA_CACHE_ENTRIES)
+            for i in range(70000):
+                cur_ptr[0] = 0x1000_0000 + i * 0x1000
+                src._chunk_info(probe_obj, 0)
+            self.assertEqual(ptr_calls[0], 70000)
+
+            gen = src._dva_cache_gen
+            rb = skv.MAIN_ROW_BYTES
+            for j in range(lms.MAX_DVA_CACHE_ENTRIES - len(src._dva_cache)):
+                src._dva_cache[(gen, 0, 0x8000_0000 + j * 0x1000, rb)] = 0x9000_0000 + j * 0x1000
+            self.assertEqual(len(src._dva_cache), lms.MAX_DVA_CACHE_ENTRIES)
+            cur_ptr[0] = 0xF000_0000
+            self.assertEqual(src._chunk_info(probe_obj, 0), (1, 0xF001_0000))
+            self.assertEqual(len(src._dva_cache), 1)
 
     def test_kv_both_full_resident_policy_deselects_for_dense_decode(self) -> None:
         with _fake_npu():

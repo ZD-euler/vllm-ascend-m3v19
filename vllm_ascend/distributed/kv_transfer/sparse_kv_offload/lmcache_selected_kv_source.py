@@ -21,6 +21,7 @@ from vllm_ascend.core.selected_kv import PAGE_ROWS, _check, _ga, _pages, _rcheck
 QUERY_TOTAL_RATIO_NUM = 3
 QUERY_TOTAL_RATIO_DEN = 200
 MAX_DOMAIN = 1_048_576
+MAX_DVA_CACHE_ENTRIES = 262_144
 MAX_INFLIGHT_STEPS = 2
 _ROW_STRIDES = np.array([skv.MLA_NOPE_ROW_BYTES, skv.MLA_PE_ROW_BYTES], dtype=np.uint64)
 _BIND_FILTER_TLS = threading.local()
@@ -93,6 +94,7 @@ def classify_lmcache_request(
     eligible = (
         query > 0
         and skv.MIN_HISTORY_TOKENS <= hist <= skv.MAX_HISTORY_TOKENS
+        and hist + query <= skv.MAX_TOTAL_TOKENS
         and chunk_size > 0
         and query * QUERY_TOTAL_RATIO_DEN < (hist + query) * QUERY_TOTAL_RATIO_NUM
         and bool(getattr(load_spec, "can_load", False))
@@ -592,7 +594,7 @@ class LMCacheSelectedKVSource:
                     raise RuntimeError(f"Bad DDR ptr {host_ptr}")
                 dva = int(resolved)
                 if alloc_live:
-                    if len(self._dva_cache) >= 8192:
+                    if len(self._dva_cache) >= MAX_DVA_CACHE_ENTRIES:
                         self._dva_cache.clear()
                     self._dva_cache[cache_key] = dva
         return byte_size // skv.MAIN_ROW_BYTES, dva

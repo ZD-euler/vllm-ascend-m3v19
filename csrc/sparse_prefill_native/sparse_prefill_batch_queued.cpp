@@ -15,11 +15,12 @@
 extern "C" int32_t launch_sparse_prefill_adaptive_prefix(
     void* stream, void* topk, void* lists, void* descriptors, uint32_t history, uint32_t query
 );
+extern "C" uint32_t selected_prefill_union_max_history();
 
 namespace {
 
 constexpr uint32_t KERNEL_CORES = 32U, ASSERT_DUMP_BYTES = 75U * 1024U;
-constexpr int64_t MAX_HISTORY = 524288, MAX_TOKENS = 16384, MAX_REQUESTS = 256;
+constexpr int64_t MAX_HISTORY = 1048576, MAX_TOKENS = 16384, MAX_REQUESTS = 256;
 constexpr int64_t TOPK = 2048, PAGE_ROWS = 128, NOPE_DIM = 512, PE_DIM = 64;
 
 struct SparsePrefillFusedHandle {
@@ -170,12 +171,17 @@ void MlaInplaceCopy(
 
 } // namespace
 
+extern "C" uint32_t selected_prefill_fused_max_history() {
+    return std::min<uint32_t>(static_cast<uint32_t>(MAX_HISTORY), selected_prefill_union_max_history());
+}
+
 extern "C" int32_t create_sparse_prefill_fixed_handle(const char* path, uint32_t maxCapacity, void** result) {
     if (!result) {
         return -1;
     }
     *result = nullptr;
-    if (!path || maxCapacity == 0U || maxCapacity > MAX_HISTORY || maxCapacity % PAGE_ROWS != 0U) {
+    if (!path || maxCapacity == 0U || maxCapacity > MAX_HISTORY || maxCapacity % PAGE_ROWS != 0U ||
+        selected_prefill_union_max_history() < static_cast<uint32_t>(MAX_HISTORY)) {
         return -1;
     }
     int32_t devId = 0;
@@ -247,7 +253,7 @@ extern "C" int32_t launch_sparse_prefill_fused_plan(
         history > MAX_HISTORY || query == 0U || query > MAX_TOKENS ||
         cap == 0U || cap > MAX_HISTORY || cap % PAGE_ROWS != 0U ||
         (h->maxCapacity != 0U && cap > h->maxCapacity) ||
-        width < 128U || width > 16384U || width % 128U != 0U || width * 32U < history) {
+        width < 128U || width > static_cast<uint32_t>(MAX_HISTORY / KERNEL_CORES) || width % 128U != 0U || width * 32U < history) {
         return -1;
     }
     struct Args {

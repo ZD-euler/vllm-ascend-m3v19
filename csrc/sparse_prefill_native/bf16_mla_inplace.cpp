@@ -27,3 +27,7 @@ extern "C" int32_t launch_sparse_prefill_bf16_mla_inplace(
     );
     return 0;
 }
+
+extern "C" uint32_t selected_prefill_mla_max_history() {
+    return static_cast<uint32_t>(SparsePrefillCopy::MAX_HISTORY);
+}

@@ -14,11 +14,15 @@ extern "C" __global__ __aicore__ void sparse_prefill_adaptive_union(
 extern "C" int32_t launch_sparse_prefill_adaptive_prefix(
     void* stream, void* topk, void* lists, void* descriptors, uint32_t history, uint32_t query
 ) {
-    if (!stream || !topk || !lists || !descriptors || history > 524288U || query == 0U || query > 16384U) {
+    if (!stream || !topk || !lists || !descriptors || history > SparsePrefillBitmap::MAX_HISTORY || query == 0U || query > 16384U) {
         return -1;
     }
     sparse_prefill_adaptive_union<<<SparsePrefillPlan::CORES, nullptr, stream>>>(
         static_cast<GM_ADDR>(topk), static_cast<GM_ADDR>(lists), static_cast<GM_ADDR>(descriptors), history, query
     );
     return 0;
+}
+
+extern "C" uint32_t selected_prefill_union_max_history() {
+    return SparsePrefillBitmap::MAX_HISTORY;
 }

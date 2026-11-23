@@ -16,6 +16,7 @@ import vllm_ascend.core.selected_kv as skv
 from vllm_ascend.core.selected_kv import _check, _pages, _rcheck, _run_cleanup
 
 _LIBS = ("sparse_prefill_fused_fixed_launch", "dsa_bf16_mla_inplace")
+_CDLL_TYPE = ctypes.CDLL
 MAX_INFLIGHT_STEPS = 2
 
 
@@ -80,6 +81,25 @@ class SelectedKVPlanner:
         self._libs = (fused_lib, mla_lib)
         self.ops = torch.ops.dsa_prefill_queue
 
+        for lib, sym in (
+            (fused_lib, "selected_prefill_fused_max_history"),
+            (mla_lib, "selected_prefill_mla_max_history"),
+        ):
+            probe = getattr(lib, sym, None)
+            if probe is None:
+                _rcheck(
+                    not isinstance(lib, _CDLL_TYPE),
+                    "Selected KV native libraries are outdated; rebuild csrc/sparse_prefill_native",
+                )
+                continue
+            if hasattr(probe, "argtypes"):
+                probe.argtypes = []
+                probe.restype = ctypes.c_uint32
+            _rcheck(
+                int(probe()) >= skv.MAX_HISTORY_TOKENS,
+                "Selected KV native libraries are outdated; rebuild csrc/sparse_prefill_native",
+            )
+
         create_fn = fused_lib.create_sparse_prefill_fixed_handle
         destroy_fn = fused_lib.destroy_sparse_prefill_fused_handle
         create_fn.argtypes = [ctypes.c_char_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)]
@@ -93,8 +113,14 @@ class SelectedKVPlanner:
         self.scratch = [torch.empty(shape, dtype=torch.int32, device=dev) for shape in scratch_shapes]
         self.outputs = [torch.empty(shape, dtype=torch.int32, device=dev) for shape in output_shapes]
 
+        obj_path = lib_dir / "sparse_prefill_fused_fixed_1m.o"
+        if isinstance(fused_lib, _CDLL_TYPE):
+            _rcheck(
+                obj_path.is_file(),
+                f"Missing 1M selected-KV device object: {obj_path}; rebuild csrc/sparse_prefill_native",
+            )
         with torch.npu.device(dev):
-            rc = create_fn(bytes(lib_dir / "sparse_prefill_fused_fixed.o"), capacity, ctypes.byref(self.handle))
+            rc = create_fn(bytes(obj_path), capacity, ctypes.byref(self.handle))
         _rcheck(
             rc == 0,
             "Selected KV kernels require >= 32 vector cores" if rc == -2 else f"Fused handle init failed: {rc}",
@@ -559,7 +585,9 @@ class SelectedKVRuntime:
             for rid, h, q in zip(ids, histories, queries)
         )
         hist_ok = bool(sel_indices) and all(
-            skv.MIN_HISTORY_TOKENS <= histories[idx] <= skv.MAX_HISTORY_TOKENS for idx in sel_indices
+            skv.MIN_HISTORY_TOKENS <= histories[idx] <= skv.MAX_HISTORY_TOKENS
+            and histories[idx] + queries[idx] <= skv.MAX_TOTAL_TOKENS
+            for idx in sel_indices
         )
         _check(hq_ok and hist_ok, "Invalid selected batch H/Q")
 
@@ -622,7 +650,7 @@ class SelectedKVRuntime:
             len(qsl) == num_reqs + 1
             and len(seq_lens) == num_reqs
             and all(
-                seq_lens[idx] - (qsl[idx + 1] - qsl[idx]) == hist
+                seq_lens[idx] - (qsl[idx + 1] - qsl[idx]) == hist and seq_lens[idx] <= skv.MAX_TOTAL_TOKENS
                 for idx, hist in zip(self._selected_indices, self._selected_histories)
             )
         )

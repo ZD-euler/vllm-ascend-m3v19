@@ -20,9 +20,9 @@ namespace SparsePrefillCopy {
 using namespace AscendC;
 using CopyQueue = TQueBind<QuePosition::VECIN, QuePosition::VECOUT, 2>;
 
-constexpr uint32_t PAGE_ROWS = 128U, CORES = 32U, MAX_LOCAL_IDS = 16384U, MAX_COLUMNS = 4096U, MAX_RUN = 32U;
+constexpr uint32_t PAGE_ROWS = 128U, CORES = 32U, MAX_LOCAL_IDS = 16384U, MAX_LANE_IDS = MAX_LOCAL_IDS * 2U, MAX_COLUMNS = 8192U, MAX_RUN = 32U;
 constexpr uint32_t NOPE_ROW_BYTES = 1024U, PE_ROW_BYTES = 128U;
-constexpr int32_t MAX_HISTORY = 524288, MAX_BATCHED_TOKENS = 16384;
+constexpr int32_t MAX_HISTORY = 1048576, MAX_BATCHED_TOKENS = 16384;
 
 enum class RowState : uint8_t { Invalid, Full, Selected };
 enum class SliceState : uint8_t { Abort, Empty, Ready };
@@ -168,6 +168,7 @@ __aicore__ inline SliceState LoadRequestSlice(
     const bool valid =
         row >= 0 && static_cast<uint32_t>(row) < tRows &&
         h > 0 && h <= MAX_HISTORY && HistoryPages(static_cast<uint32_t>(h)) <= tCols &&
+        HistoryPages(static_cast<uint32_t>(h)) <= MAX_COLUMNS &&
         query > 0 && query <= MAX_BATCHED_TOKENS && qStart >= 0 && qStart <= MAX_BATCHED_TOKENS - query &&
         cnt >= 0 && static_cast<uint32_t>(cnt) <= cap && cnt <= h &&
         LoadGmScalar(state, r * 8U + 1U) == query &&
@@ -180,8 +181,8 @@ __aicore__ inline SliceState LoadRequestSlice(
 
     const uint32_t count = static_cast<uint32_t>(cnt);
     const uint32_t perLane = (count + gc - 1U) / gc;
-    ASSERT_MSG(perLane <= MAX_LOCAL_IDS, "Selected copy local ID capacity exceeded");
-    if (perLane > MAX_LOCAL_IDS) {
+    ASSERT_MSG(perLane <= MAX_LANE_IDS, "Selected copy local ID capacity exceeded");
+    if (perLane > MAX_LANE_IDS) {
         return SliceState::Abort;
     }
 
@@ -191,9 +192,10 @@ __aicore__ inline SliceState LoadRequestSlice(
         return SliceState::Empty;
     }
 
+    const uint32_t firstTile = end - begin < MAX_LOCAL_IDS ? end - begin : MAX_LOCAL_IDS;
     DataCopyPadExtParams<int32_t> pad{false, 0, 0, 0};
     DataCopyPad(localTable, blockTable[static_cast<uint64_t>(row) * tStride], {1, HistoryPages(static_cast<uint32_t>(h)) * 4U, 0, 0, 0}, pad);
-    DataCopyPad(localIds, selection[static_cast<uint64_t>(r) * cap + begin], {1, (end - begin) * 4U, 0, 0, 0}, pad);
+    DataCopyPad(localIds, selection[static_cast<uint64_t>(r) * cap + begin], {1, firstTile * 4U, 0, 0, 0}, pad);
     Fence<HardEvent::MTE2_S>();
     hOut = h;
     beginOut = begin;
@@ -229,7 +231,7 @@ __aicore__ inline void RunSelectedMlaInplace(
     const uint32_t lane = GetBlockIdx() % gc, groups = GetBlockNum() / gc;
     for (uint32_t r = GetBlockIdx() / gc; r < requests; r += groups) {
         int32_t h = 0, page = -1;
-        uint32_t begin = 0U, end = 0U, col = UINT32_MAX, pending = 0U;
+        uint32_t begin = 0U, end = 0U, col = UINT32_MAX;
         uint64_t b0 = 0U, b1 = 0U;
 
         const auto slice = LoadRequestSlice(
@@ -243,54 +245,63 @@ __aicore__ inline void RunSelectedMlaInplace(
             continue;
         }
 
-        DualRowAddress next{}, pend{};
-        RowState nextState = RowState::Invalid;
-        bool resolved = false;
-        for (uint32_t cursor = begin; cursor < end;) {
-            if (!resolved) {
-                nextState = ResolveCopyRow(localIds.GetValue(cursor - begin), h, localTable, pages, sp, dp, col, page, b0, b1, next);
+        DataCopyPadExtParams<int32_t> idPad{false, 0, 0, 0};
+        for (uint32_t tileBegin = begin; tileBegin < end; tileBegin += MAX_LOCAL_IDS) {
+            const uint32_t tileEnd = end - tileBegin < MAX_LOCAL_IDS ? end : tileBegin + MAX_LOCAL_IDS;
+            if (tileBegin != begin) {
+                DataCopyPad(localIds, selection[static_cast<uint64_t>(r) * cap + tileBegin], {1, (tileEnd - tileBegin) * 4U, 0, 0, 0}, idPad);
+                Fence<HardEvent::MTE2_S>();
             }
-            resolved = false;
-            if (nextState == RowState::Invalid) {
-                AbortCopy(q0, q1, pending);
-                return;
-            }
-            if (nextState == RowState::Full) {
-                ++cursor;
-                continue;
-            }
-
-            const DualRowAddress cur = next;
-            uint32_t run = 1U;
-            while (run < MAX_RUN && cursor + run < end) {
-                nextState = ResolveCopyRow(localIds.GetValue(cursor + run - begin), h, localTable, pages, sp, dp, col, page, b0, b1, next);
+            DualRowAddress next{}, pend{};
+            RowState nextState = RowState::Invalid;
+            bool resolved = false;
+            uint32_t pending = 0U;
+            for (uint32_t cursor = tileBegin; cursor < tileEnd;) {
+                if (!resolved) {
+                    nextState = ResolveCopyRow(localIds.GetValue(cursor - tileBegin), h, localTable, pages, sp, dp, col, page, b0, b1, next);
+                }
+                resolved = false;
                 if (nextState == RowState::Invalid) {
                     AbortCopy(q0, q1, pending);
                     return;
                 }
-                if (nextState == RowState::Full || !AdjacentMla(cur, next, run)) {
-                    resolved = true;
-                    break;
+                if (nextState == RowState::Full) {
+                    ++cursor;
+                    continue;
                 }
-                ++run;
+
+                const DualRowAddress cur = next;
+                uint32_t run = 1U;
+                while (run < MAX_RUN && cursor + run < tileEnd) {
+                    nextState = ResolveCopyRow(localIds.GetValue(cursor + run - tileBegin), h, localTable, pages, sp, dp, col, page, b0, b1, next);
+                    if (nextState == RowState::Invalid) {
+                        AbortCopy(q0, q1, pending);
+                        return;
+                    }
+                    if (nextState == RowState::Full || !AdjacentMla(cur, next, run)) {
+                        resolved = true;
+                        break;
+                    }
+                    ++run;
+                }
+
+                src0.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(cur.nopeSource));
+                src1.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(cur.peSource));
+                CopyIn(q0, src0, run * NOPE_ROW_BYTES);
+                CopyIn(q1, src1, run * PE_ROW_BYTES);
+                if (pending != 0U) {
+                    FlushCopy(q0, q1, dst0, dst1, pend, pending);
+                }
+                pend = cur;
+                pending = run;
+                cursor += run;
             }
 
-            src0.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(cur.nopeSource));
-            src1.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(cur.peSource));
-            CopyIn(q0, src0, run * NOPE_ROW_BYTES);
-            CopyIn(q1, src1, run * PE_ROW_BYTES);
             if (pending != 0U) {
                 FlushCopy(q0, q1, dst0, dst1, pend, pending);
             }
-            pend = cur;
-            pending = run;
-            cursor += run;
+            Fence<HardEvent::S_MTE2>();
         }
-
-        if (pending != 0U) {
-            FlushCopy(q0, q1, dst0, dst1, pend, pending);
-        }
-        Fence<HardEvent::S_MTE2>();
     }
     PipeBarrier<PIPE_ALL>();
 }
@@ -298,15 +309,15 @@ __aicore__ inline void RunSelectedMlaInplace(
 inline int32_t ResolveLaunchGroupCores(
     uint32_t requests, uint32_t cap, uint32_t sp, uint32_t tRows, uint32_t tCols, uint32_t tStride, uint32_t dp
 ) {
-    if (requests == 0U || requests > 256U || cap == 0U || cap > 524288U || cap % PAGE_ROWS != 0U ||
+    if (requests == 0U || requests > 256U || cap == 0U || cap > static_cast<uint32_t>(MAX_HISTORY) || cap % PAGE_ROWS != 0U ||
         sp == 0U || sp > dp || tRows == 0U || tRows > 256U || tCols == 0U || tStride < tCols) {
         return -1;
     }
     uint32_t gc = 8U;
-    while (gc * MAX_LOCAL_IDS < cap) {
+    while (gc < CORES && gc * MAX_LOCAL_IDS < cap) {
         gc *= 2U;
     }
-    return gc <= CORES ? static_cast<int32_t>(gc) : -1;
+    return gc * MAX_LANE_IDS >= cap ? static_cast<int32_t>(gc) : -1;
 }
 
 } // namespace SparsePrefillCopy
