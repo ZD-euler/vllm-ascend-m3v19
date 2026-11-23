@@ -1495,7 +1495,61 @@ class LMCacheSelectedKVSource:
 
         init_range = range(self._init_lim)
 
-        def defer_release(ret_val: Any, orig: Any, req_id: str, *args: Any, **kw: Any) -> Any:
+        def _detach_cb(kind: str, orig: Any, req_id: str, *args: Any, **kw: Any) -> Any:
+            if args or kw or not req_id:
+                return lambda: orig(req_id, *args, **kw)
+            if kind == "cpu":
+                detach_fn = getattr(self.engine, "detach_shared_cpu_sparse_request", None)
+                if callable(detach_fn):
+                    return detach_fn(req_id)
+                leases = getattr(self.engine, "_shared_cpu_request_leases", None)
+                if isinstance(leases, dict):
+                    lease = leases.pop(req_id, None)
+                    if lease is None:
+                        return None
+                    if hasattr(lease, "active"):
+                        lease.active = False
+                    seq = getattr(self, "_detached_release_seq", 0) + 1
+                    self._detached_release_seq = seq
+                    dkey = f"{req_id}#detached#{seq}"
+                    leases[dkey] = lease
+                    return lambda: orig(dkey)
+                return lambda: orig(req_id)
+            detach_dma = getattr(self.gpu_connector, "detach_layerwise_prefill_dma_cache", None)
+            if callable(detach_dma):
+                return detach_dma(req_id)
+            dma_attrs = (
+                "_layerwise_prefill_unfenced_loads",
+                "_layerwise_prefill_unfenced_stores",
+                "_layerwise_prefill_async_store_events",
+                "_layerwise_prefill_load_request_events",
+                "_layerwise_prefill_load_owners",
+            )
+            host_attrs = (
+                "_prefill_dma_bound_loads",
+                "_prefill_dma_plan_cache",
+                "_prefill_dma_source_cache",
+            )
+            for a in host_attrs:
+                m = getattr(self.gpu_connector, a, None)
+                if isinstance(m, dict):
+                    m.pop(req_id, None)
+            if any(isinstance(getattr(self.gpu_connector, a, None), dict) for a in dma_attrs):
+                seq = getattr(self, "_detached_release_seq", 0) + 1
+                self._detached_release_seq = seq
+                dkey = f"{req_id}#detached#{seq}"
+                moved = False
+                for a in dma_attrs:
+                    m = getattr(self.gpu_connector, a, None)
+                    if isinstance(m, dict) and req_id in m:
+                        m[dkey] = m.pop(req_id)
+                        moved = True
+                return (lambda: orig(dkey)) if moved else None
+            return lambda: orig(req_id)
+
+        def defer_release(
+            ret_val: Any, kind: str, orig: Any, req_id: str, *args: Any, **kw: Any
+        ) -> Any:
             with self._steps_lock:
                 self._prune_retired_steps()
                 owner_step = next(
@@ -1509,7 +1563,9 @@ class LMCacheSelectedKVSource:
                 if owner_step is not None:
                     with owner_step._lock:
                         if not owner_step._closed or owner_step._failed:
-                            owner_step._deferred_cbs.append(lambda: orig(req_id, *args, **kw))
+                            cb = _detach_cb(kind, orig, req_id, *args, **kw)
+                            if cb is not None:
+                                owner_step._deferred_cbs.append(cb)
                             return ret_val
             return orig(req_id, *args, **kw)
 
@@ -1536,12 +1592,12 @@ class LMCacheSelectedKVSource:
             (
                 self.engine,
                 "release_shared_cpu_sparse_request",
-                lambda orig, *a, **k: defer_release(False, orig, *a, **k),
+                lambda orig, *a, **k: defer_release(False, "cpu", orig, *a, **k),
             ),
             (
                 self.gpu_connector,
                 "release_layerwise_prefill_dma_cache",
-                lambda orig, *a, **k: defer_release(None, orig, *a, **k),
+                lambda orig, *a, **k: defer_release(None, "dma", orig, *a, **k),
             ),
             (self.impl, "_submit_initial_layerwise_prefill_load", wrap_submit_initial),
             (self.impl, "submit_layerwise_prefill_load", wrap_submit_layer),

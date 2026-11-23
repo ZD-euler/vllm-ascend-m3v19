@@ -4950,6 +4950,103 @@ class SelectedKVUnitTest(unittest.TestCase):
                     for fn in reversed(src._restorers):
                         fn()
 
+    def test_defer_release_detach_prevents_req_id_reuse_clobber_both_modes(self) -> None:
+        _, _CtrlEv, _build_env, _run_step = self._pipe_setup()
+        for use_detach in (True, False):
+            with _fake_npu(), patch.object(torch.npu, "Event", _CtrlEv):
+                e = _build_env()
+                e.eng._shared_cpu_request_leases = {}
+
+                def _rel_cpu(rid: str, eng: Any = e.eng) -> None:
+                    lease = eng._shared_cpu_request_leases.pop(rid, None)
+                    if lease is not None:
+                        lease.close()
+
+                e.eng.release_shared_cpu_sparse_request = _rel_cpu
+                if use_detach:
+
+                    def _det_cpu(rid: str, eng: Any = e.eng) -> Any:
+                        lease = eng._shared_cpu_request_leases.pop(rid, None)
+                        if lease is None:
+                            return None
+                        lease.active = False
+                        dseq = getattr(eng, "_det_seq", 0) + 1
+                        eng._det_seq = dseq
+                        dk = f"{rid}#detached#{dseq}"
+                        eng._shared_cpu_request_leases[dk] = lease
+                        return lambda: _rel_cpu(dk)
+
+                    e.eng.detach_shared_cpu_sparse_request = _det_cpu
+
+                e.gc._layerwise_prefill_load_owners = {}
+                e.gc._prefill_dma_bound_loads = {}
+
+                def _rel_dma(rid: str, gc: Any = e.gc) -> None:
+                    owns = gc._layerwise_prefill_load_owners.pop(rid, None)
+                    if owns:
+                        for own in owns.values():
+                            if own.is_valid():
+                                own.ref_count_down()
+                    gc._prefill_dma_bound_loads.pop(rid, None)
+
+                e.gc.release_layerwise_prefill_dma_cache = _rel_dma
+                if use_detach:
+
+                    def _det_dma(rid: str, gc: Any = e.gc) -> Any:
+                        gc._prefill_dma_bound_loads.pop(rid, None)
+                        owns = gc._layerwise_prefill_load_owners.pop(rid, None)
+                        if owns is None:
+                            return None
+                        dseq = getattr(gc, "_det_seq", 0) + 1
+                        gc._det_seq = dseq
+                        dk = f"{rid}#detached#{dseq}"
+                        gc._layerwise_prefill_load_owners[dk] = owns
+                        return lambda: _rel_dma(dk)
+
+                    e.gc.detach_layerwise_prefill_dma_cache = _det_dma
+
+                def _mk_lease() -> Any:
+                    lease: Any = SimpleNamespace(active=True, closed=0)
+                    lease.close = lambda: setattr(lease, "closed", lease.closed + 1)
+                    return lease
+
+                def _mk_owner() -> Any:
+                    own: Any = SimpleNamespace(ref_count=1)
+                    own.is_valid = lambda: own.ref_count > 0
+                    own.ref_count_down = lambda: setattr(own, "ref_count", own.ref_count - 1)
+                    return own
+
+                with self._init_rt(e):
+                    # (a) CPU lease overlap on same req_id ("req_1")
+                    st_cpu, ev_cpu, _ = _run_step(e, "req_1", bb=0, hold=True)
+                    lease_prefill, lease_decode = _mk_lease(), _mk_lease()
+                    e.eng._shared_cpu_request_leases["req_1"] = lease_prefill
+                    e.eng.release_shared_cpu_sparse_request("req_1")
+                    e.eng._shared_cpu_request_leases["req_1"] = lease_decode
+                    self.assertEqual((lease_prefill.closed, lease_prefill.active), (0, False))
+                    self.assertEqual(lease_decode.closed, 0)
+                    self.assertIs(e.eng._shared_cpu_request_leases["req_1"], lease_decode)
+                    ev_cpu.done = True
+                    self.assertTrue(st_cpu.try_retire())
+                    self.assertEqual((lease_prefill.closed, lease_decode.closed), (1, 0))
+                    self.assertIs(e.eng._shared_cpu_request_leases["req_1"], lease_decode)
+
+                    # (b) DMA owner/bound overlap on same req_id ("req_d")
+                    st_dma, ev_dma, _ = _run_step(e, "req_d", bb=130, hold=True)
+                    owner_0, owner_1 = _mk_owner(), _mk_owner()
+                    e.gc._layerwise_prefill_load_owners["req_d"] = {"l0": owner_0}
+                    e.gc._prefill_dma_bound_loads["req_d"] = ("bound_0",)
+                    e.gc.release_layerwise_prefill_dma_cache("req_d")
+                    self.assertNotIn("req_d", e.gc._prefill_dma_bound_loads)
+                    e.gc._layerwise_prefill_load_owners["req_d"] = {"l0": owner_1}
+                    e.gc._prefill_dma_bound_loads["req_d"] = ("bound_1",)
+                    self.assertEqual((owner_0.ref_count, owner_1.ref_count), (1, 1))
+                    ev_dma.done = True
+                    self.assertTrue(st_dma.try_retire())
+                    self.assertEqual((owner_0.ref_count, owner_1.ref_count), (0, 1))
+                    self.assertIs(e.gc._layerwise_prefill_load_owners["req_d"]["l0"], owner_1)
+                    self.assertEqual(e.gc._prefill_dma_bound_loads["req_d"], ("bound_1",))
+
 
 if __name__ == "__main__":
     unittest.main()
