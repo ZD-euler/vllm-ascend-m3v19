@@ -1,7 +1,7 @@
 import os
 from contextlib import nullcontext
 from copy import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from threading import Lock
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -24,6 +24,7 @@ from vllm.logger import logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.triton_utils import HAS_TRITON
+from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backend import (
     AttentionBackend,  # type: ignore
     AttentionCGSupport,
@@ -59,7 +60,8 @@ from vllm_ascend.attention.utils import (
     staged_sfa_connector_supports_sparse_load,
     trans_rope_weight,
     transdata,
-    wait_for_kv_layer_from_connector)
+    wait_for_kv_layer_from_connector,
+)
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.kv_transfer.sparse_offload import _prof as _dsa_prof
 from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
@@ -1266,6 +1268,11 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         self._dsa_general_decode_rows = 0
         self.actual_seq_lengths_query = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
         self.actual_seq_lengths_key = torch.empty_like(self.actual_seq_lengths_query)
+        self._dsa_cp_seq_lens_cpu_ring: torch.Tensor | None = None
+        self._dsa_cp_seq_lens_events: list[Any | None] = [None] * 4
+        self._dsa_cp_seq_lens_slot: int = 0
+        if self.enable_dsa_cp:
+            self._ensure_dsa_cp_seq_lens_ring(max_num_reqs + 1)
         self._full_graph_tables = None
         # Staged SHRINK_LATENT=2 graph input. The address must survive metadata
         # rebuilds across decode steps, so keep one builder-owned device buffer
@@ -1295,6 +1302,32 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         # Explicit override in case the underlying builder specialized this getter.
         # @override omitted only because of mypy limitation due to type variable.
         return AttentionCGSupport.UNIFORM_BATCH
+
+    def _ensure_dsa_cp_seq_lens_ring(self, min_cols: int) -> torch.Tensor:
+        ring = getattr(self, "_dsa_cp_seq_lens_cpu_ring", None)
+        if ring is not None and ring.shape[2] >= min_cols:
+            return ring
+        events = getattr(self, "_dsa_cp_seq_lens_events", None)
+        if events is None:
+            events = [None] * 4
+            self._dsa_cp_seq_lens_events = events
+            self._dsa_cp_seq_lens_slot = 0
+        else:
+            for idx, ev in enumerate(events):
+                if ev is not None:
+                    ev.synchronize()
+                    events[idx] = None
+        cols = max(min_cols, 1)
+        use_pin = self.actual_seq_lengths_query.device.type != "cpu" and is_pin_memory_available()
+        if use_pin:
+            try:
+                ring = torch.empty((4, 2, cols), dtype=torch.int32, pin_memory=True)
+            except RuntimeError:
+                ring = torch.empty((4, 2, cols), dtype=torch.int32)
+        else:
+            ring = torch.empty((4, 2, cols), dtype=torch.int32)
+        self._dsa_cp_seq_lens_cpu_ring = ring
+        return ring
 
     def reorder_batch(self, input_batch: "NPUInputBatch", scheduler_output: "SchedulerOutput") -> bool:
         # No need to reorder for Ascend SFA
@@ -1728,7 +1761,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         cos, sin = get_cos_and_sin_mla(input_positions, True)
 
         dsa_cp_context = None
+        dsa_cp_rebind_cache = None
         if self.enable_dsa_cp:
+            raw_slot_mapping = slot_mapping
             global_tp_size = get_tp_group().world_size
             num_tokens = num_input_tokens
             num_tokens_pad = _round_up(num_tokens, global_tp_size)
@@ -1767,30 +1802,109 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                     got {slot_mapping.shape[0]} and {num_tokens_pad}"
             )
 
+            num_segs = int(cum_query_lens.shape[0])
+            if self.actual_seq_lengths_query.shape[0] < num_segs:
+                self.actual_seq_lengths_query = torch.zeros(
+                    num_segs, dtype=torch.int32, device=self.actual_seq_lengths_query.device
+                )
+                self.actual_seq_lengths_key = torch.empty_like(self.actual_seq_lengths_query)
             actual_seq_lengths_query = self.actual_seq_lengths_query
             actual_seq_lengths_key = self.actual_seq_lengths_key
 
-            num_segs = cum_query_lens.shape[0]
-            last_token = 0
-            cum = 0
-            for i in range(0, num_segs):
-                global_start = last_token
-                global_end = cum_query_lens[i].item()
-                last_token = global_end
+            spec_cfg = getattr(self, "speculative_config", None)
+            uses_draft_fn = getattr(spec_cfg, "uses_draft_model", None)
+            cpu_mirror_safe = spec_cfg is None or (
+                getattr(spec_cfg, "method", None)
+                in (None, "mtp", "deepseek_mtp", "eagle", "eagle3", "ngram", "medusa", "suffix")
+                and not (callable(uses_draft_fn) and uses_draft_fn() is True)
+                and getattr(spec_cfg, "num_speculative_tokens", 1) == 1
+                and getattr(spec_cfg, "parallel_drafting", False) is not True
+                and getattr(spec_cfg, "needs_extra_input_slots", False) is not True
+            )
+            qsl_cpu_raw = common_attn_metadata.query_start_loc_cpu if cpu_mirror_safe else None
+            q_ends_cpu: list[int] | None = None
+            s_lens_cpu: list[int] | None = None
+            if qsl_cpu_raw is not None and seq_lens_cpu is not None:
+                q_ends_slice = qsl_cpu_raw[1 : num_reqs + 1]
+                q_ends_cpu = (
+                    [int(x) for x in q_ends_slice.tolist()]
+                    if hasattr(q_ends_slice, "tolist")
+                    else [int(x) for x in q_ends_slice]
+                )
+                if getattr(common_attn_metadata, "sfa_full_graph", False):
+                    q_ends_cpu.append(int(num_input_tokens))
+                s_lens_cpu = (
+                    [int(x) for x in seq_lens_cpu.tolist()]
+                    if hasattr(seq_lens_cpu, "tolist")
+                    else [int(x) for x in seq_lens_cpu]
+                )
 
-                req_local_start = max(global_start, local_start)
-                req_local_end = min(global_end, local_end_with_pad)
-                num_local_tokens = req_local_end - req_local_start
+            if (
+                q_ends_cpu is not None
+                and s_lens_cpu is not None
+                and len(q_ends_cpu) >= num_segs
+                and len(s_lens_cpu) >= num_segs
+            ):
+                q_local_list: list[int] = []
+                k_local_list: list[int] = []
+                last_token = 0
+                cum = 0
+                for i in range(num_segs):
+                    global_start = last_token
+                    global_end = q_ends_cpu[i]
+                    last_token = global_end
+                    req_local_start = max(global_start, local_start)
+                    req_local_end = min(global_end, local_end_with_pad)
+                    num_local_tokens = req_local_end - req_local_start
+                    if num_local_tokens > 0:
+                        cum += num_local_tokens
+                        q_local_list.append(cum)
+                        k_local_list.append(s_lens_cpu[i] - (global_end - req_local_end))
+                    else:
+                        q_local_list.append(cum)
+                        k_local_list.append(0)
+                if num_segs > 0:
+                    ring = self._ensure_dsa_cp_seq_lens_ring(num_segs)
+                    slot = self._dsa_cp_seq_lens_slot
+                    self._dsa_cp_seq_lens_slot = (slot + 1) & 3
+                    prev_ev = self._dsa_cp_seq_lens_events[slot]
+                    if prev_ev is not None and not prev_ev.query():
+                        prev_ev.synchronize()
+                    host_pair = ring[slot]
+                    host_np = host_pair.numpy()
+                    host_np[0, :num_segs] = q_local_list
+                    host_np[1, :num_segs] = k_local_list
+                    actual_seq_lengths_query[:num_segs].copy_(
+                        host_pair[0, :num_segs], non_blocking=True
+                    )
+                    actual_seq_lengths_key[:num_segs].copy_(
+                        host_pair[1, :num_segs], non_blocking=True
+                    )
+                    if actual_seq_lengths_query.device.type != "cpu":
+                        ev = torch.npu.Event()
+                        ev.record()
+                        self._dsa_cp_seq_lens_events[slot] = ev
+            else:
+                last_token = 0
+                cum = 0
+                for i in range(0, num_segs):
+                    global_start = last_token
+                    global_end = cum_query_lens[i].item()
+                    last_token = global_end
 
-                if num_local_tokens > 0:
-                    cum += num_local_tokens
-                    actual_seq_lengths_query[i] = cum
+                    req_local_start = max(global_start, local_start)
+                    req_local_end = min(global_end, local_end_with_pad)
+                    num_local_tokens = req_local_end - req_local_start
 
-                    offset = global_end - req_local_end
-                    actual_seq_lengths_key[i] = seq_lens[i].item() - offset
-                else:
-                    actual_seq_lengths_query[i] = cum
-                    actual_seq_lengths_key[i] = 0
+                    if num_local_tokens > 0:
+                        cum += num_local_tokens
+                        actual_seq_lengths_query[i] = cum
+
+                        offset = global_end - req_local_end
+                        actual_seq_lengths_key[i] = seq_lens[i].item() - offset
+                    else:
+                        actual_seq_lengths_query[i] = cum
+                        actual_seq_lengths_key[i] = 0
 
             actual_seq_lengths_query = actual_seq_lengths_query[:num_reqs]
             actual_seq_lengths_key = actual_seq_lengths_key[:num_reqs]
@@ -1805,16 +1919,27 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
             )
+            dsa_cp_rebind_cache = {
+                (
+                    raw_slot_mapping.data_ptr(),
+                    raw_slot_mapping.shape,
+                    raw_slot_mapping.stride(),
+                    raw_slot_mapping.dtype,
+                    raw_slot_mapping.device,
+                ): (raw_slot_mapping, slot_mapping, dsa_cp_context)
+            }
 
-        return self.metadata_cls(  # type: ignore
+        built_metadata = self.metadata_cls(  # type: ignore
             num_input_tokens=common_attn_metadata.num_input_tokens,
             num_actual_tokens=num_actual_tokens,
             cum_query_lens=cum_query_lens,
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
-            query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu[
-                : num_reqs + 1
-            ],
+            query_start_loc_cpu=(
+                common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
+                if common_attn_metadata.query_start_loc_cpu is not None
+                else None
+            ),
             slot_mapping=slot_mapping,
             head_dim=self.model_config.get_head_size(),
             attn_mask=self.attn_mask_builder.get_attention_mask(self.model_config),
@@ -1882,6 +2007,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             num_decode_tokens=num_decode_rows,
             block_size=self.block_size,
         )
+        if dsa_cp_rebind_cache is not None:
+            built_metadata._dsa_cp_rebind_cache = dsa_cp_rebind_cache  # type: ignore[attr-defined]
+        return built_metadata
 
     def rebind_layerwise_prefill_metadata(
         self,
@@ -1893,24 +2021,62 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         RoPE, sequence lengths and masks do not depend on the rotating bank.
         Keep each layer's metadata object separate, and replace *all* bank
         views, including clearing indexer views on shared-indexer layers.
-        Never cache this template across forwards. CP derives additional slot
-        mappings, and decode has mutable sparse state: use normal build there.
+        Never cache this template across forwards. Under DSA-CP, derive and
+        cache each bank's padded slot_mapping and local slot_mapping_cp slice;
+        decode has mutable sparse state and uses normal build.
         """
         if (
-            self.enable_dsa_cp
-            or template.attn_state not in (
+            template.attn_state not in (
                 AscendAttentionState.PrefillNoCache,
                 AscendAttentionState.PrefillCacheHit,
                 AscendAttentionState.ChunkedPrefill,
             )
             or template.num_decode_tokens
+            or getattr(common_attn_metadata, "sfa_full_graph", False)
+        ):
+            return None
+        num_reqs = common_attn_metadata.num_reqs
+        num_tokens = common_attn_metadata.num_input_tokens
+        if self.enable_dsa_cp and (
+            template.dsa_cp_context is None
+            or num_reqs != int(template.dsa_cp_context.actual_seq_lengths_query.shape[0])
+            or num_tokens != template.dsa_cp_context.num_tokens
+            or common_attn_metadata.num_actual_tokens != template.num_actual_tokens
         ):
             return None
         metadata = copy(template)
-        num_reqs = common_attn_metadata.num_reqs
-        num_tokens = common_attn_metadata.num_input_tokens
         metadata.block_table = common_attn_metadata.block_table_tensor[:num_reqs]
-        metadata.slot_mapping = common_attn_metadata.slot_mapping[:num_tokens]
+        raw_slots = common_attn_metadata.slot_mapping[:num_tokens]
+        if self.enable_dsa_cp:
+            cp_ctx = template.dsa_cp_context
+            assert cp_ctx is not None
+            bank_cache = getattr(template, "_dsa_cp_rebind_cache", None)
+            if bank_cache is None:
+                bank_cache = {}
+                template._dsa_cp_rebind_cache = bank_cache  # type: ignore[attr-defined]
+            slot_key = (
+                raw_slots.data_ptr(),
+                raw_slots.shape,
+                raw_slots.stride(),
+                raw_slots.dtype,
+                raw_slots.device,
+            )
+            cached_cp = bank_cache.get(slot_key)
+            if cached_cp is None:
+                pad_size_slot = cp_ctx.num_tokens_pad - raw_slots.shape[0]
+                if pad_size_slot > 0:
+                    padded_slots = nn.functional.pad(raw_slots, (0, pad_size_slot), value=-1)
+                else:
+                    padded_slots = raw_slots[: cp_ctx.num_tokens_pad]
+                rebound_ctx = replace(
+                    cp_ctx,
+                    slot_mapping_cp=padded_slots[cp_ctx.local_start : cp_ctx.local_end_with_pad],
+                )
+                cached_cp = (raw_slots, padded_slots, rebound_ctx)
+                bank_cache[slot_key] = cached_cp
+            _, metadata.slot_mapping, metadata.dsa_cp_context = cached_cp
+        else:
+            metadata.slot_mapping = raw_slots
         metadata.indexer_block_table = None
         metadata.indexer_slot_mapping = None
         metadata.indexer_c8_block_table = None

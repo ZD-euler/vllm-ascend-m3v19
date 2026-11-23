@@ -3,10 +3,11 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import weakref
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from typing import Any
 
@@ -96,17 +97,18 @@ class SelectedKVConfig:
             return
 
         _check(
-            not bool(envs_ascend.VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD),
+            not bool(getattr(envs_ascend, "VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD", False)),
             "Selected KV prefill cannot be combined with DSA latent offload",
         )
 
         _check(
-            not bool(envs_ascend.VLLM_ASCEND_DSA_USE_ADAPTER_CACHE),
+            not bool(getattr(envs_ascend, "VLLM_ASCEND_DSA_USE_ADAPTER_CACHE", False)),
             "Selected KV prefill cannot be combined with DSA adapter cache",
         )
 
+        fc2_size = getattr(envs_ascend, "VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE", 0)
         _check(
-            int(getattr(envs_ascend, "VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE", 0)) == 0,
+            not isinstance(fc2_size, bool) and int(fc2_size or 0) == 0,
             "Selected KV prefill cannot be combined with FLASHCOMM2",
         )
 
@@ -134,7 +136,36 @@ class SelectedKVConfig:
             direct = direct or "lmcache" in str(_ga(spec, "kv_connector_module_path", "")).lower()
             return [spec_prod] if direct else []
 
+        def _is_truthy_flag(val: Any) -> bool:
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, int):
+                return val != 0
+            if isinstance(val, str):
+                return val.strip().lower() in ("1", "true", "yes", "on")
+            return False
+
+        def has_preemption_ckpt(spec: Any) -> bool:
+            if spec is None:
+                return False
+            for path in (
+                "decode_preemption_checkpoint",
+                "kv_connector_extra_config.decode_preemption_checkpoint",
+                "kv_connector_extra_config.lmcache_config.decode_preemption_checkpoint",
+            ):
+                if _is_truthy_flag(_ga(spec, path)):
+                    return True
+            children = _ga(spec, "kv_connector_extra_config.connectors")
+            if isinstance(children, (list, tuple)):
+                return any(has_preemption_ckpt(child) for child in children)
+            return False
+
         tr = cfg.kv_transfer_config
+        _check(
+            not _is_truthy_flag(os.environ.get("LMCACHE_DECODE_PREEMPTION_CHECKPOINT", ""))
+            and not has_preemption_ckpt(tr),
+            "Selected KV prefill cannot be combined with decode_preemption_checkpoint",
+        )
         sc = cfg.scheduler_config
         mc = cfg.model_config
         pc = cfg.parallel_config
@@ -219,6 +250,29 @@ class SelectedKVBudget:
 reserve_workspace_bytes = SelectedKVBudget
 
 
+def _topology_diagnostic_type(value: Any) -> str:
+    # Bypass custom metaclass hooks and str-subclass slicing on class names.
+    name = type.__dict__["__name__"].__get__(type(value))
+    return str.__getitem__(name, slice(0, 80))
+
+
+def _topology_diagnostic_value(value: Any) -> str:
+    """Describe small builtins without inspecting device values or custom reprs."""
+    value_type = type(value)
+    type_name = _topology_diagnostic_type(value)
+    if value_type is str:
+        rendered = repr(value[:80])[:120]
+        if len(value) > 80:
+            rendered += "..."
+    elif value_type is int:
+        rendered = repr(value) if value.bit_length() <= 256 else "<more than 256 bits>"
+    elif value_type is bool or value_type is float or value is None:
+        rendered = repr(value)
+    else:
+        return f"<type={type_name}>"
+    return f"{rendered} (type={type_name})"
+
+
 def _cp_tp_size(vllm_config: Any, dsa_cp: bool) -> int:
     if not dsa_cp:
         return 1
@@ -254,14 +308,18 @@ def _resolve_topology(runner: Any) -> tuple[tuple[str, ...], frozenset[str], dic
         impl = mod.impl
         parent_mod = ctx.get(name.removesuffix(".attn")) if name.endswith(".attn") else None
         skip_topk = bool(getattr(impl, "skip_topk", False))
-        impl_dsa_cp = bool(getattr(impl, "enable_dsa_cp", False))
-        impl_o_proj_tp = bool(getattr(impl, "enable_dsa_cp_with_o_proj_tp", False))
+        raw_dsa_cp = getattr(impl, "enable_dsa_cp", False)
+        impl_dsa_cp = bool(raw_dsa_cp)
+        raw_o_proj_tp = getattr(impl, "enable_dsa_cp_with_o_proj_tp", False)
+        impl_o_proj_tp = bool(raw_o_proj_tp)
         vl_first = any(
             bool(getattr(obj, "is_vl_first_layer", False)) for obj in (parent_mod, mod, impl) if obj is not None
         )
         impl_tp = getattr(impl, "tp_size", None)
         tp_ok = not impl_dsa_cp or impl_tp is None or (type(impl_tp) is int and impl_tp >= 1)
-        dims_ok = (getattr(impl, "kv_lora_rank", 0), getattr(impl, "qk_rope_head_dim", 0)) == (NOPE_ROW_DIM, PE_ROW_DIM)
+        kv_lora_rank = getattr(impl, "kv_lora_rank", 0)
+        qk_rope_head_dim = getattr(impl, "qk_rope_head_dim", 0)
+        dims_ok = (kv_lora_rank, qk_rope_head_dim) == (NOPE_ROW_DIM, PE_ROW_DIM)
         layer_ok = (
             dims_ok
             and not impl_o_proj_tp
@@ -269,7 +327,17 @@ def _resolve_topology(runner: Any) -> tuple[tuple[str, ...], frozenset[str], dic
             and tp_ok
             and not (name in draft and skip_topk)
         )
-        _check(layer_ok, f"Bad MLA/draft {name!r}")
+        if not layer_ok:
+            raise ValueError(
+                f"Bad MLA/draft {name!r}: impl_type={_topology_diagnostic_type(impl)}, "
+                f"kv_lora_rank={_topology_diagnostic_value(kv_lora_rank)} (expected {NOPE_ROW_DIM}), "
+                f"qk_rope_head_dim={_topology_diagnostic_value(qk_rope_head_dim)} (expected {PE_ROW_DIM}), "
+                f"impl.enable_dsa_cp={_topology_diagnostic_value(raw_dsa_cp)}, "
+                f"impl.enable_dsa_cp_with_o_proj_tp={_topology_diagnostic_value(raw_o_proj_tp)}, "
+                f"is_vl_first_layer={vl_first}, "
+                f"impl.tp_size={_topology_diagnostic_value(impl_tp)}, "
+                f"is_draft={name in draft}, skip_topk={skip_topk}"
+            )
         dsa_cp_flags.add(impl_dsa_cp)
         impl_tp_sizes.add(impl_tp)
         if not skip_topk:
@@ -289,8 +357,14 @@ def _resolve_topology(runner: Any) -> tuple[tuple[str, ...], frozenset[str], dic
         _check(len(impl_tp_sizes) == 1, "Selected KV DSA-CP layers must agree on tp_size")
         resolved_tp = next(iter(impl_tp_sizes))
         vcfg = getattr(runner, "vllm_config", None)
-        if resolved_tp is not None and vcfg is not None:
-            _check(resolved_tp == _cp_tp_size(vcfg, True), "Selected KV DSA-CP layer tp_size mismatch")
+        if vcfg is not None:
+            cfg_tp = _cp_tp_size(vcfg, True)
+            if resolved_tp is not None:
+                _check(resolved_tp == cfg_tp, "Selected KV DSA-CP layer tp_size mismatch")
+            _check(
+                not (draft and cfg_tp > 1 and bool(_ga(vcfg, "model_config.is_multimodal_model", False))),
+                "Selected KV multimodal MTP draft is unsupported under DSA-CP",
+            )
     return names, draft, owners, dsa_cp
 
 
@@ -319,7 +393,9 @@ def reserve_selected_kv_workspace(worker: Any, available_bytes: int) -> int:
     avail = int(available_bytes)
     toks = int(sc.max_num_batched_tokens)
     cp_tp_size = _cp_tp_size(worker.vllm_config, dsa_cp)
-    fixed = psr.selected_workspace_bytes(toks, min(int(sc.max_num_seqs), toks), dsa_cp=dsa_cp, cp_tp_size=cp_tp_size)
+    fixed = psr.selected_workspace_bytes(
+        toks, min(int(sc.max_num_seqs), toks), dsa_cp=dsa_cp, cp_tp_size=cp_tp_size
+    ) + 3 * PAGE_BASES_ENTRY_BYTES * len(names)
     budget = SelectedKVBudget(
         avail, PAGE_ROWS * MAIN_ROW_BYTES, fixed, PAGE_BASES_ENTRY_BYTES * len(names), NATIVE_ALIGNMENT
     )
@@ -420,27 +496,31 @@ def _guard_step(rt: Any, step: Any | None) -> Iterator[None]:
 @contextmanager
 def selected_kv_prepare_context(runner: Any, sched_out: Any, attn_meta: Any = None) -> Iterator[None]:
     rt = _active_rt(runner)
-    if rt is not None:
-        rt._retire_previous()
-        src = rt.source
-        batch = runner.input_batch
-        src._staged_step = None
-        conn_meta = _unwrap_connector_metadata(sched_out.kv_connector_metadata, src)
-        if conn_meta is not None and int(batch.num_reqs) > 0 and isinstance(attn_meta, Mapping):
-            bank_tables = getattr(batch, "layerwise_prefill_block_tables", None)
-            if bank_tables is not None:
-                _rcheck(len(bank_tables) == src.num_banks, "Banks")
-            else:
-                bank_tables = (batch.block_table,)
-                _rcheck(len(bank_tables) >= src.num_banks, "Banks")
-            cpu_tables = [bank_tables[bank][0].get_cpu_tensor().numpy() for bank in range(src.num_banks)]
-            src.begin_runner_step(conn_meta, *_slices(runner), cpu_tables)
     try:
+        if rt is not None:
+            rt._handoff_previous()
+            src = rt.source
+            prune = getattr(src, "_prune_retired_steps", None)
+            if callable(prune):
+                prune()
+            batch = runner.input_batch
+            src.step = None
+            src._staged_step = None
+            conn_meta = _unwrap_connector_metadata(sched_out.kv_connector_metadata, src)
+            if conn_meta is not None and int(batch.num_reqs) > 0 and isinstance(attn_meta, Mapping):
+                bank_tables = getattr(batch, "layerwise_prefill_block_tables", None)
+                if bank_tables is not None:
+                    _rcheck(len(bank_tables) == src.num_banks, "Banks")
+                else:
+                    bank_tables = (batch.block_table,)
+                    _rcheck(len(bank_tables) >= src.num_banks, "Banks")
+                cpu_tables = [bank_tables[bank][0].get_cpu_tensor().numpy() for bank in range(src.num_banks)]
+                src.begin_runner_step(conn_meta, *_slices(runner), cpu_tables)
         yield
     except BaseException as err:
         if rt is not None:
             step = rt.source.step
-            if step is not None and not getattr(step, "_finished", False):
+            if (step is not None and not getattr(step, "_finished", False)) or getattr(rt.source, "_failed", False):
                 rt.fail(step, err)
         raise
     finally:
@@ -489,13 +569,29 @@ def retire_selected_kv_if_idle(runner: Any) -> None:
     rt = _active_rt(runner)
     if rt is not None:
         rt._retire_previous()
+        prune = _ga(rt, "source._prune_retired_steps")
+        if callable(prune):
+            prune()
+        rt.source.step = None
 
 
 def abort_active_selected_kv_steps(*, deferred_only: bool = False) -> None:
     err = sys.exc_info()[1] if _ACTIVE_RUNTIMES else None
     for rt in tuple(_ACTIVE_RUNTIMES):
         step = rt.source_step or getattr(rt.source, "step", None)
-        if rt._awaiting_draft or (not deferred_only and step is not None and not getattr(step, "_finished", False)):
+        src_failed = not deferred_only and bool(getattr(rt.source, "_failed", False)) and not rt._failed
+        rt_unsynced = (
+            not deferred_only
+            and rt._failed
+            and hasattr(rt.source, "_failed")
+            and not bool(getattr(rt.source, "_failed", False))
+        )
+        if (
+            rt._awaiting_draft
+            or src_failed
+            or rt_unsynced
+            or (not deferred_only and step is not None and not getattr(step, "_finished", False))
+        ):
             rt.fail(step, err)
 
 
@@ -508,4 +604,15 @@ def close_selected_kv_worker(worker: Any) -> None:
     except RuntimeError:
         if not (getattr(rt, "_failed", False) or getattr(getattr(rt, "source", None), "_failed", False)):
             raise
+        eng = _ga(rt, "source.engine")
+        dev = getattr(rt, "device", None) or _ga(rt, "source.device")
+        synced = False
+        if dev is not None and getattr(dev, "type", None) == "npu":
+            sync_fn = _ga(sys.modules.get("torch"), "npu.synchronize")
+            if callable(sync_fn):
+                with suppress(BaseException):
+                    sync_fn(dev)
+                    synced = True
+        if not synced and eng is not None:
+            eng._retain_unfenced_external_dma = True
         logger.warning("Retaining selected-KV workspace/leases during shutdown after failed step.")

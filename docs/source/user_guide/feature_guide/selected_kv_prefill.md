@@ -39,16 +39,27 @@ native loading where needed.
 - At most 16,384 scheduled tokens and 256 requests per step. Selected histories
   must be between 16,384 and 524,288 tokens; request selection also depends on
   query/history geometry and source-cache availability.
-- Optional `mtp` / `deepseek_mtp` speculation with exactly one speculative token.
-  Target and draft passes share a deferred source lifetime.
+- Optional `mtp` / `deepseek_mtp` speculation with exactly one speculative token
+  and matching target/draft tensor parallel sizes. Target and draft passes share
+  a deferred source lifetime; multimodal MTP draft passes under DSA-CP are
+  unsupported and rejected at startup.
 - Pipeline, prefill-context and decode-context parallel sizes must all be one.
-  Encoder-decoder models, sleep mode, DBO and the v2 model runner are unsupported.
+  FlashComm1 DSA-CP (`enable_dsa_cp=True` over tensor parallelism) is supported
+  with per-rank local-query TopK planning, causal masking of current-step tokens
+  when a request straddles a TP rank boundary, and Group-0 dense DMA skipping
+  when all cached history pages are owned by ondemand-selected. FlashComm2
+  (`VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE > 0`), the DSA-CP `o_proj` TP path
+  (`enable_dsa_cp_with_o_proj_tp`), VL first-layer CP layouts, encoder-decoder
+  models, sleep mode, DBO and the v2 model runner are unsupported.
 - DSA latent offload must be disabled; it bypasses the attention path that
   performs selected loads, so enabling both is rejected at startup.
 - DSA adapter cache (`VLLM_ASCEND_DSA_USE_ADAPTER_CACHE`) must also be
   disabled. A one-token cached-prefill tail can use the adapter decode path,
   bypassing the selected load while still advancing selected prefetch.
   Enabling both is rejected at startup.
+- LMCache `decode_preemption_checkpoint` must be disabled; combining decode
+  preemption checkpointing with `ondemand-selected` is rejected at startup
+  across environment, connector, and LMCache configuration files.
 
 This is an opt-in prefill path. It does not enable decode full graph or main-KV
 INT8 storage, and weight quantization is independent of the KV dtype.

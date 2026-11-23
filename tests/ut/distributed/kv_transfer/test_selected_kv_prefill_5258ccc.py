@@ -4,6 +4,7 @@
 import ast
 import ctypes
 import itertools
+import os
 import sys
 import threading
 import types
@@ -13,6 +14,7 @@ from dataclasses import make_dataclass
 from importlib.util import find_spec
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 import numpy as np
@@ -23,18 +25,28 @@ ROOT = Path(__file__).resolve().parents[4]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+_INJECTED_VLLM_MODS: list[str] = []
 if find_spec("vllm") is None:
     _b, _sm = "vllm.distributed.kv_transfer.kv_connector.factory", sys.modules
     for _n in ("vllm.logger", "vllm.v1.core.dsa_shared_pool", _b):
         _c = ""
         for _p in _n.split("."):
             _c = f"{_c}.{_p}" if _c else _p
-            _sm.setdefault(_c, types.ModuleType(_c)).__dict__.setdefault("__path__", [])
+            if _c not in _sm:
+                _sm[_c] = types.ModuleType(_c)
+                _INJECTED_VLLM_MODS.append(_c)
+            _sm[_c].__dict__.setdefault("__path__", [])
     _nop = lambda *a, **k: None
     _sm["vllm.logger"].logger = SimpleNamespace(info=_nop, info_once=_nop, warning=_nop, debug=_nop)
     _sm["vllm.v1.core.dsa_shared_pool"].layerwise_prefill_bank_count = lambda: 2
     _sm["vllm.distributed.kv_transfer"].get_kv_transfer_group = _nop
     _sm[_b].KVConnectorFactory = SimpleNamespace(register_connector=_nop)
+
+
+def tearDownModule() -> None:
+    for _mod in reversed(_INJECTED_VLLM_MODS):
+        sys.modules.pop(_mod, None)
+
 
 import vllm_ascend.core.selected_kv as skv  # noqa: E402
 from vllm_ascend import envs as envs_ascend  # noqa: E402
@@ -120,7 +132,223 @@ def _mk_obj(ptr_base: int, tokens: int):
     )
 
 
+class SelectedKVTopologyDiagnosticTest(unittest.TestCase):
+    def tearDown(self) -> None:
+        skv._ACTIVE_RUNTIMES.clear()
+
+    @staticmethod
+    def _runner(impl, *, is_draft=False):
+        name = "model.layers.0.self_attn.attn"
+        ctx = {name: SimpleNamespace(impl=impl)}
+        if is_draft:
+            ctx["model.layers.1.self_attn.attn"] = SimpleNamespace(
+                impl=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64, index_topk=2048)
+            )
+        return SimpleNamespace(
+            compilation_config=SimpleNamespace(static_forward_context=ctx),
+            drafter=SimpleNamespace(attn_layer_names=(name,) if is_draft else ()),
+        )
+
+    def test_topology_failure_reports_values_types_and_guards(self) -> None:
+        cases = (
+            ({"kv_lora_rank": 256}, False, "kv_lora_rank=256 (type=int) (expected 512)"),
+            ({"qk_rope_head_dim": 32}, False, "qk_rope_head_dim=32 (type=int) (expected 64)"),
+            (
+                {"enable_dsa_cp": True, "enable_dsa_cp_with_o_proj_tp": True},
+                False,
+                "impl.enable_dsa_cp_with_o_proj_tp=True (type=bool)",
+            ),
+            ({"enable_dsa_cp": True, "is_vl_first_layer": True}, False, "is_vl_first_layer=True"),
+            ({"skip_topk": True}, True, "is_draft=True, skip_topk=True"),
+            ({"kv_lora_rank": "512"}, False, "kv_lora_rank='512' (type=str) (expected 512)"),
+        )
+        for overrides, is_draft, detail in cases:
+            with self.subTest(overrides=overrides, is_draft=is_draft):
+                fields = dict(kv_lora_rank=512, qk_rope_head_dim=64, index_topk=2048)
+                fields.update(overrides)
+                with self.assertRaises(ValueError) as raised:
+                    skv._resolve_topology(self._runner(SimpleNamespace(**fields), is_draft=is_draft))
+                message = str(raised.exception)
+                self.assertTrue(message.startswith("Bad MLA/draft 'model.layers.0.self_attn.attn':"))
+                self.assertIn("impl_type=SimpleNamespace", message)
+                self.assertIn(detail, message)
+                self.assertIn("kv_lora_rank=", message)
+                self.assertIn("qk_rope_head_dim=", message)
+                self.assertIn(f"is_draft={is_draft}", message)
+
+    def test_dimension_failure_preserves_property_access_order(self) -> None:
+        accesses = []
+
+        class _Impl:
+            @property
+            def skip_topk(self):
+                accesses.append("skip_topk")
+                return False
+
+            @property
+            def kv_lora_rank(self):
+                accesses.append("kv_lora_rank")
+                return 256
+
+            @property
+            def qk_rope_head_dim(self):
+                accesses.append("qk_rope_head_dim")
+                return 64
+
+            @property
+            def enable_dsa_cp(self):
+                accesses.append("enable_dsa_cp")
+                return True
+
+        with self.assertRaises(ValueError) as raised:
+            skv._resolve_topology(self._runner(_Impl()))
+        msg = str(raised.exception)
+        self.assertIn("kv_lora_rank=256 (type=int) (expected 512)", msg)
+        self.assertIn("impl.enable_dsa_cp=True (type=bool)", msg)
+        self.assertEqual(
+            accesses,
+            ["kv_lora_rank", "skip_topk", "enable_dsa_cp", "kv_lora_rank", "qk_rope_head_dim"],
+        )
+
+    def test_cp_failure_reads_property_once(self) -> None:
+        accesses = []
+
+        class _Impl:
+            kv_lora_rank = 512
+            qk_rope_head_dim = 64
+            enable_dsa_cp_with_o_proj_tp = True
+
+            @property
+            def enable_dsa_cp(self):
+                accesses.append("enable_dsa_cp")
+                return True
+
+        with self.assertRaisesRegex(ValueError, "impl.enable_dsa_cp=True"):
+            skv._resolve_topology(self._runner(_Impl()))
+        self.assertEqual(accesses, ["enable_dsa_cp"])
+
+    def test_topology_diagnostic_does_not_inspect_unknown_values(self) -> None:
+        class _Meta(type):
+            @property
+            def __name__(cls):
+                raise AssertionError("custom type-name property must not be called")
+
+        class _DeviceValue(metaclass=_Meta):
+            def __repr__(self):
+                raise AssertionError("custom repr must not be called")
+
+            def item(self):
+                raise AssertionError("device value must not be read")
+
+            def cpu(self):
+                raise AssertionError("device value must not be copied")
+
+        for field in ("kv_lora_rank", "qk_rope_head_dim", "enable_dsa_cp", "enable_dsa_cp_with_o_proj_tp"):
+            with self.subTest(field=field):
+                fields = dict(kv_lora_rank=512, qk_rope_head_dim=64, index_topk=2048)
+                fields[field] = _DeviceValue()
+                if field == "enable_dsa_cp":
+                    fields["enable_dsa_cp_with_o_proj_tp"] = True
+                with self.assertRaises(ValueError) as raised:
+                    skv._resolve_topology(self._runner(SimpleNamespace(**fields)))
+                self.assertIn(f"{field}=<type=_DeviceValue>", str(raised.exception))
+
+    def test_topology_diagnostic_bypasses_class_name_subclass_slicing(self) -> None:
+        class _UnsafeName(str):
+            def __getitem__(self, key):
+                raise RuntimeError("custom class-name slicing must not be called")
+
+        class _Value:
+            pass
+
+        class _Impl:
+            kv_lora_rank = _Value()
+            qk_rope_head_dim = 64
+
+        _Value.__name__ = _UnsafeName("DiagnosticValue")
+        _Impl.__name__ = _UnsafeName("DiagnosticImpl")
+        with self.assertRaises(ValueError) as raised:
+            skv._resolve_topology(self._runner(_Impl()))
+        message = str(raised.exception)
+        self.assertTrue(message.startswith("Bad MLA/draft 'model.layers.0.self_attn.attn':"))
+        self.assertIn("impl_type=DiagnosticImpl", message)
+        self.assertIn("kv_lora_rank=<type=DiagnosticValue>", message)
+
+    def test_topology_diagnostic_bounds_builtin_values(self) -> None:
+        for value, type_name in (("\\n" * 10000, "str"), (1 << 10000, "int")):
+            with self.subTest(type_name=type_name):
+                detail = skv._topology_diagnostic_value(value)
+                self.assertLess(len(detail), 160)
+                self.assertIn(f"type={type_name}", detail)
+        for value, expected in ((None, "None (type=NoneType)"), (1.5, "1.5 (type=float)")):
+            self.assertEqual(skv._topology_diagnostic_value(value), expected)
+
+    def test_valid_topology_preserves_owners_and_draft(self) -> None:
+        names = tuple(f"model.layers.{idx}.self_attn.attn" for idx in range(3))
+        ctx = {
+            name: SimpleNamespace(
+                impl=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64, index_topk=2048, skip_topk=idx == 1)
+            )
+            for idx, name in enumerate(names)
+        }
+        runner = SimpleNamespace(
+            compilation_config=SimpleNamespace(static_forward_context=ctx),
+            drafter=SimpleNamespace(attn_layer_names=(names[2],)),
+        )
+        self.assertEqual(
+            skv._resolve_topology(runner),
+            (names, frozenset((names[2],)), {names[0]: names[0], names[1]: names[0], names[2]: names[2]}, False),
+        )
+
+    def test_multimodal_mtp_draft_rejected_under_dsa_cp_tp_gt_1(self) -> None:
+        names = ("model.layers.0.self_attn.attn", "model.layers.1.self_attn.attn")
+        ctx = {
+            name: SimpleNamespace(
+                impl=SimpleNamespace(
+                    kv_lora_rank=512,
+                    qk_rope_head_dim=64,
+                    index_topk=2048,
+                    enable_dsa_cp=True,
+                )
+            )
+            for name in names
+        }
+
+        def _mk_runner(tp_size: int, is_mm: bool) -> Any:
+            return SimpleNamespace(
+                vllm_config=SimpleNamespace(
+                    parallel_config=SimpleNamespace(
+                        tensor_parallel_size=tp_size,
+                        pipeline_parallel_size=1,
+                        prefill_context_parallel_size=1,
+                        decode_context_parallel_size=1,
+                    ),
+                    model_config=SimpleNamespace(is_multimodal_model=is_mm),
+                ),
+                compilation_config=SimpleNamespace(static_forward_context=ctx),
+                drafter=SimpleNamespace(attn_layer_names=(names[1],)),
+            )
+
+        self.assertRaisesRegex(
+            ValueError,
+            "multimodal MTP draft is unsupported under DSA-CP",
+            skv._resolve_topology,
+            _mk_runner(4, True),
+        )
+        self.assertEqual(
+            skv._resolve_topology(_mk_runner(4, False)),
+            (names, frozenset((names[1],)), {names[0]: names[0], names[1]: names[1]}, True),
+        )
+        self.assertEqual(
+            skv._resolve_topology(_mk_runner(1, True)),
+            (names, frozenset((names[1],)), {names[0]: names[0], names[1]: names[1]}, True),
+        )
+
+
 class SelectedKVUnitTest(unittest.TestCase):
+    def tearDown(self) -> None:
+        skv._ACTIVE_RUNTIMES.clear()
+
     def test_selected_prefill_rejects_adapter_cache(self) -> None:
         with patch.dict(
             envs_ascend.__dict__,
@@ -149,6 +377,55 @@ class SelectedKVUnitTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "cannot be combined with DSA latent offload"):
                 skv.SelectedKVConfig(enabled=True).validate_deployment(_vcfg())
             skv.SelectedKVConfig(enabled=False).validate_deployment(_vcfg())
+
+    def test_selected_prefill_rejects_decode_preemption_checkpoint(self) -> None:
+        with patch.dict(
+            envs_ascend.__dict__,
+            {
+                "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE": True,
+                "VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS": 2,
+                "VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD": False,
+                "VLLM_ASCEND_DSA_USE_ADAPTER_CACHE": False,
+            },
+        ):
+            direct_tr = {
+                "kv_connector": "LMCacheAscendConnectorV1Dynamic",
+                "kv_role": "kv_producer",
+                "kv_connector_extra_config": {"decode_preemption_checkpoint": True},
+            }
+            multi_tr = {
+                "kv_connector": "MultiConnector",
+                "kv_role": "kv_producer",
+                "kv_connector_extra_config": {
+                    "connectors": [
+                        {"kv_connector": "MooncakeConnectorV1", "kv_role": "kv_producer"},
+                        {
+                            "kv_connector": "LMCacheAscendConnectorV1Dynamic",
+                            "kv_role": "kv_producer",
+                            "kv_connector_extra_config": {"lmcache_config": {"decode_preemption_checkpoint": True}},
+                        },
+                    ]
+                },
+            }
+            for bad_tr in (direct_tr, multi_tr):
+                with self.assertRaisesRegex(ValueError, "decode_preemption_checkpoint"):
+                    skv.SelectedKVConfig(enabled=True).validate_deployment(_vcfg(tr=bad_tr))
+                skv.SelectedKVConfig(enabled=False).validate_deployment(_vcfg(tr=bad_tr))
+            with patch.dict(os.environ, {"LMCACHE_DECODE_PREEMPTION_CHECKPOINT": "1"}):
+                with self.assertRaisesRegex(ValueError, "decode_preemption_checkpoint"):
+                    skv.SelectedKVConfig(enabled=True).validate_deployment(_vcfg())
+                skv.SelectedKVConfig(enabled=False).validate_deployment(_vcfg())
+            bad_impl = SimpleNamespace(
+                config=SimpleNamespace(decode_preemption_checkpoint=True),
+                lmcache_engine=SimpleNamespace(gpu_connector=SimpleNamespace()),
+            )
+            with self.assertRaisesRegex(ValueError, "decode_preemption_checkpoint"):
+                lms.LMCacheSelectedKVSource(
+                    SimpleNamespace(device="cpu"),
+                    bad_impl,
+                    ("l0",),
+                    {"l0": (torch.zeros((8, 128, 1, 512), dtype=torch.bfloat16), None)},
+                )
 
     def test_config_gates_budget_classify_partition_dma_filter_and_mla_only(self) -> None:
         cfg = skv.SelectedKVConfig.from_dict({"enabled": True})
@@ -525,8 +802,8 @@ class SelectedKVUnitTest(unittest.TestCase):
             s1.wait_main_slot_ready("l1", st_b)
             self.assertEqual((st_a.waited, st_b.waited), ([ev_t1, ev_tail], [ev_t1, ev_tail]))
             self.assertEqual(
-                (len(dvas), ups, s1._shared_reqs, s1._layer_ready_events, s1._shared_ready_event is not None),
-                (3, [0, 1, None], {"r0"}, {}, True),
+                (len(dvas), ups, s1._shared_reqs, set(s1._layer_ready_events), s1._shared_ready_event),
+                (3, [0, 1], {"r0"}, {0, 1}, None),
             )
             self.assertEqual(
                 (binds[:3], len(pf), s1._pending_main),
@@ -571,6 +848,8 @@ class SelectedKVUnitTest(unittest.TestCase):
             self.assertFalse(src.step.try_retire())
             self.assertEqual((len(dvas), len(rel), o0a.s), (6, 2, {"p": 1, "r": 1}))
             self.assertRaises(RuntimeError, src.close)
+            for restore in reversed(src._restorers):
+                restore()
 
             # Unuploaded layer raises RuntimeError on page_bases() and ready()
             mc3 = {n: (torch.empty((520, 1, 1, 1)),) * 2 for n in ("l0", "l1", "l2")}
@@ -1557,7 +1836,7 @@ class SelectedKVUnitTest(unittest.TestCase):
             self.assertEqual(nb_cp, mr_cp_ok._selected_kv_budget.native_budget_bytes)
             self.assertTrue(mr_cp_ok._selected_kv_budget._topology[3])
 
-        self.assertEqual(psr.selected_workspace_bytes(8192, 8), 86182400)
+        self.assertEqual(psr.selected_workspace_bytes(8192, 8), 86182400 + 75 * 1024)
         self.assertEqual(
             psr.selected_workspace_bytes(16384, 8, dsa_cp=True, cp_tp_size=4),
             psr.selected_workspace_bytes(4096, 8) + 4 * 4096 * skv.TOPK,
@@ -2097,6 +2376,2257 @@ class SelectedKVUnitTest(unittest.TestCase):
             self.assertEqual((rt_init._dsa_cp, rt_init._cp_tp_size, rt_init.local_query_capacity), (True, 4, 2048))
             self.assertEqual(tuple(rt_init._plan_topk_buf.shape), (2048, 1, skv.TOPK))
             rt_init.close()
+
+    def _nop(self, *_a: Any, **_k: Any) -> None:
+        return None
+
+    class _LayerSrc:
+        def __init__(self, pages: Any, lid: int, suffix: Any = ()) -> None:
+            self.pages, self.layer_id, self.suffix = pages, lid, suffix
+
+    def _sh_obj(self, pb: int, toks: int, nl: int) -> Any:
+        o = _mk_obj(pb, toks)
+        o.layer_size, o.num_layers, o.valid = toks * skv.MAIN_ROW_BYTES, nl, True
+        return o
+
+    def _ar(self, lo: int, hi: int, *, d2: bool = True) -> np.ndarray:
+        a = np.arange(lo, hi, dtype=np.int32)
+        return a[None, :] if d2 else a
+
+    def _cm(self, *specs: Any) -> Any:
+        NS, reqs = SimpleNamespace, []
+        for sp in specs:
+            rid, t, ld, sd, vc, lp = (
+                (sp + (16384, True, False, None, None)[len(sp) - 1 :])
+                if isinstance(sp, tuple)
+                else (sp, 16384, True, False, None, None)
+            )
+            ls = NS(can_load=ld, lmcache_cached_tokens=t, dsa_cold_compact_load=False)
+            if vc is not None:
+                ls.vllm_cached_tokens = vc
+            rk = {"req_id": rid, "is_decode_window_save": False, "is_sparse_decode": sd}
+            r = NS(block_allocation_mode="prefill_child", load_spec=ls, **rk)
+            if lp is not None:
+                r.is_last_prefill = lp
+            reqs.append(r)
+        return NS(requests=reqs)
+
+    def _am(self, ls: tuple[str, ...], nt: int = 8, bs: int = 1) -> dict[str, Any]:
+        bt = torch.zeros((bs, 200), dtype=torch.int32)
+        return {n: SimpleNamespace(block_table=bt, num_actual_tokens=nt, block_size=128) for n in ls}
+
+    def _dva_grid(self, dva: int, p_tok: int = 16384) -> torch.Tensor:
+        rn, rp = skv.MLA_NOPE_ROW_BYTES, skv.MLA_PE_ROW_BYTES
+        return torch.tensor(
+            [[dva + r * rn, dva + p_tok * rn + r * rp] for r in range(0, 16384, 128)], dtype=torch.uint64
+        )
+
+    def _prep_cm(self, rn: Any, lmc_c: Any, cm: Any, am: dict[str, Any]) -> None:
+        with skv.selected_kv_prepare_context(rn, SimpleNamespace(kv_connector_metadata=cm), am):
+            lmc_c.bind_connector_metadata(cm)
+            lmc_c.start_load_kv(None)
+
+    def _fwd_pair(
+        self,
+        rn: Any,
+        impl: Any,
+        ls: tuple[str, ...],
+        kvc: dict[str, Any],
+        cm: Any,
+        am: dict[str, Any],
+        tk: torch.Tensor,
+        ql: list[int],
+        sl: list[int],
+        *,
+        pre_draft: Any = None,
+    ) -> None:
+        with skv.selected_kv_forward(rn, SimpleNamespace(kv_connector_metadata=cm), am, defer_finish=True) as b:
+            impl.submit_layerwise_prefill_load(-1)
+            b.load(ls[0], tk, kvc[ls[0]], am[ls[0]])
+            b.prefetch_next(ls[0], am[ls[0]])
+            impl.submit_layerwise_prefill_load(ls[0])
+            b.load(ls[1], tk, kvc[ls[1]], am[ls[1]])
+            impl.submit_layerwise_prefill_load(ls[1])
+        qt = ql[-1]
+        dm = {ls[2]: SimpleNamespace(block_table=am[ls[2]].block_table, num_actual_tokens=qt, block_size=128)}
+        skv.bind_selected_kv_draft_metadata(rn, dm, SimpleNamespace(query_start_loc_cpu=ql, seq_lens_cpu=sl))
+        if pre_draft is not None:
+            pre_draft()
+        with skv.selected_kv_draft_forward(rn):
+            dm[ls[2]].selected_kv.load(ls[2], tk[:qt], kvc[ls[2]], dm[ls[2]])
+
+    def _set_batch(self, rn: Any, tbox: list[Any], rids: list[str], ql: list[int], tbl: np.ndarray) -> None:
+        rn.input_batch.req_ids, rn.input_batch.num_reqs = rids, len(rids)
+        rn.input_batch.num_computed_tokens_cpu = np.array([16384] * len(rids), dtype=np.int32)
+        rn.query_start_loc = SimpleNamespace(np=np.array(ql, dtype=np.int32))
+        tbox[0] = tbl
+
+    def _close_src(self, src: Any, *, restore: bool = True) -> None:
+        try:
+            if src.step is not None and not src.step._finished:
+                src.step.finish(failed=True)
+            src.close()
+        finally:
+            if restore:
+                for fn in reversed(src._restorers):
+                    fn()
+
+    def _send(self, gc: Any, impl: Any, rid: str, obj: Any, n: int = 3, *, sub: bool = True) -> Any:
+        g = gc.batched_to_gpu([0], [16384], req_id=rid, kv_group=0)
+        next(g)
+        for _ in range(n):
+            g.send([obj])
+        if sub:
+            impl._submit_initial_layerwise_prefill_load()
+        return g
+
+    def _mk_src(
+        self,
+        nl: int = 4,
+        *,
+        banks: int = 2,
+        mc: int = 320,
+        dva: Any = None,
+        ei: dict[str, Any] | None = None,
+        eg: dict[str, Any] | None = None,
+        ee: dict[str, Any] | None = None,
+        track_btg: bool = False,
+        make_src: bool = True,
+    ) -> Any:
+        NS, nop, ls = SimpleNamespace, self._nop, tuple(f"l{i}" for i in range(nl))
+        cbox, hbox, btg = [None], [nop], []
+
+        def _btg(*_a: Any, **k: Any) -> Any:
+            if track_btg:
+                btg.append(str(k.get("req_id", "")))
+            while True:
+                yield
+
+        gc_k = {"_layerwise_prefill_bank_count": banks, "_prefill_dma_bound_loads": {}, "batched_to_gpu": _btg}
+        gc = NS(**(gc_k | {"release_layerwise_prefill_dma_cache": nop, "fence_debug": None} | (eg or {})))
+        ek = {"gpu_connector": gc, "_prepare_shared_prefill_sources": nop, "release_shared_cpu_sparse_request": nop}
+        eng = NS(**(ek | {"config": NS(chunk_size=1024)} | (ee or {})))
+        par = NS(_get_connector_metadata=lambda: cbox[0], _kv_transfer_config=NS(kv_role="kv_producer"))
+        ik = {"lmcache_engine": eng, "_layerwise_prefill_dma": True, "_layerwise_prefill_p_node": True, "_parent": par}
+        ik.update({"enable_blending": False, "_deferred_layerwise_prefill_load_active": True})
+        ik.update({"_initial_layerwise_prefill_load_submitted": True, "submit_layerwise_prefill_load": nop})
+        ik["_submit_initial_layerwise_prefill_load"] = nop
+        ik["_should_skip_group0_prefill_dma"] = nop
+        im = NS(**(ik | {"start_load_kv": lambda c: hbox[0](c)} | (ei or {})))
+        mc_m = {n: (torch.empty((mc, 1, 1, 1)),) * 2 for n in ls}
+        npu_m = NS(bind_incremental_copy_addresses=nop, BoundCopyPrefix=nop)
+        dva_fn = dva or (lambda p, _b: p + 0x100000)
+        src = (
+            lms.LMCacheSelectedKVSource(
+                NS(device="cpu"), im, ls, mc_m, get_device_ptr_fn=dva_fn, npu_connectors_module=npu_m
+            )
+            if make_src
+            else None
+        )
+        return NS(layers=ls, cm_box=cbox, hook=hbox, gc=gc, eng=eng, impl=im, src=src, btg=btg)
+
+    def _pipe_setup(self, *, track_pending: bool = False) -> tuple[Any, ...]:
+        NS, nop, cfg = SimpleNamespace, self._nop, skv.SelectedKVConfig.from_dict({"enabled": True})
+        ev_cfg = {"done": True, "fail_on_sync": False}
+
+        class _CtrlEv:
+            def __init__(self) -> None:
+                self.recorded_on: int | None = None
+                self.done, self.fail_on_sync, self.sync_calls = bool(ev_cfg["done"]), bool(ev_cfg["fail_on_sync"]), 0
+
+            def record(self, stream=None) -> None:
+                self.recorded_on = int((stream or torch.npu.current_stream()).npu_stream)
+
+            def query(self) -> bool:
+                return self.done
+
+            def synchronize(self) -> None:
+                if self.fail_on_sync:
+                    raise AssertionError("must not sync on handoff")
+                self.sync_calls += 1
+                self.done = True
+
+        class _Fn:
+            def __init__(self, cb=None) -> None:
+                self._cb = cb
+
+            def __call__(self, *a):
+                return self._cb(*a) if self._cb else 0
+
+        def _build() -> Any:
+            ls = tuple(f"model.layers.{i}.self_attn" for i in range(3))
+            sfc = {
+                ls[i]: NS(
+                    impl=NS(
+                        kv_lora_rank=512,
+                        qk_rope_head_dim=64,
+                        **({"skip_topk": True} if i == 1 else {"index_topk": 2048}),
+                    )
+                )
+                for i in range(3)
+            }
+            kvc = {
+                n: (
+                    torch.zeros((300, 128, 1, 512), dtype=torch.bfloat16),
+                    torch.zeros((300, 128, 1, 64), dtype=torch.bfloat16),
+                )
+                for n in ls
+            }
+            rel: list[tuple[str, str]] = []
+            ld, bt = {}, {}
+            eg = {
+                "release_layerwise_prefill_dma_cache": lambda r: rel.append(("dma", r)),
+                "_layerwise_prefill_transfer_state": lambda: (None, {0: 0}, None, ld),
+                "_layerwise_prefill_bank_tail_events": bt,
+            }
+            h = self._mk_src(
+                eg=eg,
+                ee={"release_shared_cpu_sparse_request": lambda r: rel.append(("cpu", r))},
+                ei={"use_layerwise": True, "supports_layerwise_prefill_transfer_window": lambda: True},
+                make_src=False,
+            )
+            lc = NS(
+                _lmcache_engine=h.impl,
+                _connector_metadata=None,
+                _get_connector_metadata=lambda: lc._connector_metadata,
+                bind_connector_metadata=lambda m: setattr(lc, "_connector_metadata", m),
+                start_load_kv=lambda c: h.impl.start_load_kv(c),
+            )
+            h.impl._parent = lc
+            tb = [self._ar(0, 161)]
+            gbt = (NS(get_cpu_tensor=lambda: torch.from_numpy(tb[0])),)
+            ib = NS(
+                req_ids=["r0"],
+                num_reqs=1,
+                num_computed_tokens_cpu=np.array([16384], dtype=np.int32),
+                layerwise_prefill_block_tables=(gbt, gbt),
+            )
+            rn = NS(device="cpu", vllm_config=_vcfg(), ascend_config=NS(selected_kv_config=cfg), enable_dsa_cp=False)
+            rn.layerwise_prefill_p_node, rn.layerwise_prefill_bank_count = True, 2
+            rn.compilation_config = NS(static_forward_context=sfc)
+            rn.drafter, rn.selected_kv_runtime = NS(attn_layer_names=(ls[2],)), None
+            rn.query_start_loc, rn.input_batch = NS(np=np.array([0, 8], dtype=np.int32)), ib
+            wk = NS(vllm_config=rn.vllm_config, model_runner=rn, cache_config=NS())
+            fl = NS(
+                create_sparse_prefill_fixed_handle=_Fn(lambda p, c, hp: setattr(hp._obj, "value", 0xBEEF) or 0),
+                destroy_sparse_prefill_fused_handle=_Fn(),
+                launch_sparse_prefill_fused_plan=ctypes.c_void_p(0x1),
+            )
+            ml = NS(launch_sparse_prefill_bf16_mla_inplace=ctypes.c_void_p(0x2))
+
+            def _bp(tk, sc, out, h_, s, q, *a):
+                if track_pending:
+                    rn.selected_kv_runtime.selection_planner.pending.append(torch.zeros((2,), dtype=torch.int32))
+                out[1][: len(h_)].copy_(torch.tensor([[0, qv, qv, 0, 0, 0, 0, 0] for qv in q], dtype=torch.int32))
+
+            fops = NS(load_library=nop, dsa_prefill_queue=NS(batch_plan=_bp, mla_inplace_copy=nop))
+            mods = {
+                "vllm.distributed.kv_transfer": NS(get_kv_transfer_group=lambda: lc),
+                "vllm_ascend.utils": NS(
+                    AscendDeviceType=NS(A2=2, A3=1, _310P=0, A5=3), get_ascend_device_type=lambda: 1
+                ),
+                "lmcache_ascend": types.ModuleType("lmcache_ascend"),
+                "lmcache_ascend.v1": types.ModuleType("lmcache_ascend.v1"),
+                "lmcache_ascend.v1.npu_connector": types.ModuleType("lmcache_ascend.v1.npu_connector"),
+                "lmcache_ascend.v1.npu_connector.npu_connectors": NS(
+                    bind_incremental_copy_addresses=nop, BoundCopyPrefix=nop
+                ),
+                "lmcache_ascend.c_ops": NS(get_device_ptr=lambda p, _: p + 0x100000),
+            }
+            d = {"layers": ls, "kv_c": kvc, "rel": rel, "gc": h.gc, "eng": h.eng, "impl": h.impl, "lmc_c": lc}
+            d.update(tbl_box=tb, rn=rn, wk=wk, hook=h.hook, fl=fl, ml=ml, fops=fops, mods=mods)
+            return NS(**d)
+
+        def _run_step(
+            e: Any,
+            rid: str,
+            *,
+            bb: int = 0,
+            hold: bool = True,
+            fos: bool = False,
+            qd: int = 1,
+            sm: Any = None,
+            rel: bool = False,
+            wio: Any = None,
+            rio: Any = None,
+        ) -> Any:
+            rt, obj = e.rn.selected_kv_runtime, _mk_obj(0x9000 + bb, 16384)
+            self._set_batch(e.rn, e.tbl_box, [rid], [0, 8], self._ar(bb, bb + 130))
+            cm = self._cm(rid)
+            e.hook[0] = lambda _: (
+                wio is not None and wio.append(list(rt.source._metadata_stream.waited)),
+                rio is not None and rio.append(len(e.rel)),
+                self._send(e.gc, e.impl, rid, obj, 3),
+            )
+            am, tk = self._am(e.layers), torch.zeros((8, 1, 2048), dtype=torch.int32)
+            self._prep_cm(e.rn, e.lmc_c, cm, am)
+            with torch.npu.stream(sm) if sm is not None else nullcontext():
+                st = rt.source.step
+                pre_d = lambda: ev_cfg.update(done=not hold, fail_on_sync=fos)
+                self._fwd_pair(e.rn, e.impl, e.layers, e.kv_c, cm, am, tk, [0, qd], [16384 + qd], pre_draft=pre_d)
+            ev_cfg["done"], ev_cfg["fail_on_sync"] = True, False
+            if rel:
+                e.eng.release_shared_cpu_sparse_request(rid)
+                e.gc.release_layerwise_prefill_dma_cache(rid)
+            return st, st._completion, obj
+
+        return cfg, _CtrlEv, _build, _run_step
+
+    @contextmanager
+    def _init_rt(self, e: Any, avail: int = 2 << 30) -> Any:
+        ekw = {"VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE": True, "VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS": 2}
+        with (
+            patch.multiple(envs_ascend, **ekw),
+            patch.dict(sys.modules, e.mods),
+            patch.object(ctypes, "CDLL", side_effect=[e.fl, e.ml]),
+            patch.object(torch, "ops", e.fops),
+        ):
+            nret = skv.reserve_selected_kv_workspace(e.wk, avail)
+            skv.initialize_selected_kv(e.rn, None, e.kv_c)
+            yield nret
+
+    def _assert_retained(self, src: Any, impl: Any, cm: Any, rid: str, tb: np.ndarray) -> None:
+        self.assertRaisesRegex(RuntimeError, "retained", src.begin_runner_step, cm, (rid,), (16384,), (0, 8), (tb, tb))
+        self.assertRaisesRegex(RuntimeError, "retained", impl.start_load_kv, None)
+
+    def _assert_fail_closed_pinned(self, e: Any, st0: Any, ev0: Any, o0: Any) -> None:
+        ev0.done = True
+        self.assertFalse(st0.try_retire())
+        rt, src = e.rn.selected_kv_runtime, e.rn.selected_kv_runtime.source
+        self.assertTrue(src._failed and rt._failed)
+        self.assertEqual((o0.s, e.rel), ({"p": 1, "r": 1}, []))
+
+    def _attach_skip_hook(self, h: Any, o_sh: Any, toks: int, s_step: Any = None, s_skip: Any = None) -> None:
+        def _orig(_: Any) -> None:
+            if s_step is not None:
+                s_step.append(h.src.step)
+            if s_skip is not None:
+                s_skip.append(h.impl._selected_skip_group0_dma_req_ids)
+            for rm in h.cm_box[0].requests:
+                if rm.req_id in h.impl._selected_skip_group0_dma_req_ids:
+                    kw: dict[str, Any] = {
+                        "req_id": rm.req_id,
+                        "_shared_prefill_starts": [0],
+                        "_shared_prefill_ends": [toks],
+                    }
+                else:
+                    next(h.gc.batched_to_gpu([0], [toks], req_id=rm.req_id, kv_group=0))
+                    kw = {"req_id": rm.req_id}
+                h.eng._prepare_shared_prefill_sources([self._LayerSrc((o_sh,), i) for i in range(4)], 0, kw)
+
+        h.hook[0] = _orig
+
+    def test_vectorized_shared_layer_page_source(self) -> None:
+        def _homo(pb: int, toks: int, nl: int, raw_sz=None):
+            o = _mk_obj(pb, toks)
+            o.num_layers, o.valid, o.ls_calls = nl, True, []
+            o.layer_size = toks * skv.MAIN_ROW_BYTES if raw_sz is None else raw_sz
+            o._tokens_bytes = lambda: o.layer_size if o.layer_size > 0 else 4096 * skv.MAIN_ROW_BYTES
+            o.layer_size_bytes = lambda lid: (o.ls_calls.append(lid), o._tokens_bytes())[1]
+            return o
+
+        def _check_vec(nb: int) -> None:
+            nl, ptr_calls = 6, []
+            p0, p1, p2 = _homo(0x1000, 4096, nl), _homo(0x2000, 4096, nl), _homo(0x3000, 8192, nl)
+            pages0 = (p0, p1, p2)
+
+            def _get_dva(hp: int, bs: int) -> int:
+                ptr_calls.append((hp, bs))
+                return (1 << 63) | (hp + 0x100000)
+
+            def _orig_clean(_p, _g, kw_a: dict[str, Any], *_a, **_k) -> None:
+                if kw_a.get("_reuse_shared_dense_prefix"):
+                    kw_a["cached_chunk_dev_ptrs"].extend(
+                        [(1 << 63) | (o.layer_data_ptr(lid) + 0x100000) for o in pages0] for lid in range(nl)
+                    )
+
+            h = self._mk_src(nl, banks=nb, mc=256, dva=_get_dva, ee={"_prepare_shared_prefill_sources": _orig_clean})
+            cm = self._cm("r0")
+            h.cm_box[0] = cm
+            tbl0, tbl1 = self._ar(0, 129), self._ar(127, 256)
+            tbls = tuple(tbl0 if b % 2 == 0 else tbl1 for b in range(nb))
+
+            def _run(prep, reuse: bool, cdp=None, clr=()):
+                for o in clr:
+                    o.ls_calls.clear()
+                ptr_calls.clear()
+                kw: dict[str, Any] = {
+                    "req_id": "r0",
+                    "cached_chunk_dev_ptrs": cdp if cdp is not None else [],
+                    "_reuse_shared_dense_prefix": reuse,
+                }
+                h.hook[0] = lambda _: (
+                    next(h.gc.batched_to_gpu([0, 4096, 8192], [4096, 8192, 16384], req_id="r0", kv_group=0)),
+                    h.eng._prepare_shared_prefill_sources(prep, 0, kw),
+                )
+                h.src.begin_runner_step(cm, ("r0",), (16384,), (0, 16), tbls)
+                h.impl.start_load_kv(None)
+                return h.src.step
+
+            def _done_eq(st, refs):
+                for lid, n in enumerate(h.layers):
+                    self.assertTrue(torch.equal(st.page_bases(n).view(torch.uint64), refs[lid]))
+                st.finish(completion=torch.npu.Event())
+                h.src._prune_retired_steps()
+
+            st_v = _run([self._LayerSrc(pages0, i) for i in range(nl)], True, clr=pages0)
+            self.assertIsNotNone(st_v)
+            ab = min(nb, nl)
+            self.assertEqual((p0.ls_calls, p1.ls_calls, p2.ls_calls), ([0] * (ab + 1), [0] * ab, [0] * ab))
+            self.assertEqual((len(ptr_calls), p0.s), (1, {"p": 1, "r": 1}))
+            v_bases = [st_v.page_bases(n).view(torch.uint64).clone() for n in h.layers]
+            self.assertGreaterEqual(int(v_bases[0][0, 0].item()), 1 << 63)
+            _done_eq(st_v, v_bases)
+            self.assertEqual(p0.s, {"p": 0, "r": 0})
+            _done_eq(_run([tuple(pages0) for _ in range(nl)], True), v_bases)
+            p_mm = _homo(0x1000, 4096, nl, raw_sz=123456)
+            p_mm._tokens_bytes = lambda: 4096 * skv.MAIN_ROW_BYTES
+            h.src._dva_cache.clear()
+            st_m = _run(
+                [self._LayerSrc((p_mm, p1, p2), i) for i in range(nl)], False, cdp=[[0xDEAD] * 3 for _ in range(nl)]
+            )
+            self.assertEqual(len(ptr_calls), nl * 3)
+            _done_eq(st_m, v_bases)
+            ex = _homo(0x3000, 8192, nl)
+            st_s = _run([self._LayerSrc((p0, p1), i, suffix=(ex,)) for i in range(nl)], False)
+            self.assertEqual(ex.s, {"p": 1, "r": 1})
+            _done_eq(st_s, v_bases)
+            self.assertEqual(ex.s, {"p": 0, "r": 0})
+            cm_sh = self._cm("r_sh", ("r_ns", 0, False), "r_priv")
+            h.cm_box[0] = cm_sh
+            t_base = self._ar(0, 129, d2=False)
+            tbl_sh = np.vstack([t_base, t_base, self._ar(129, 256, d2=False).tolist() + [254, 255]])
+            pv = [self._LayerSrc(pages0, i) for i in range(nl)]
+
+            def _sh_hook(_):
+                for r in ("r_sh", "r_priv"):
+                    next(h.gc.batched_to_gpu([0, 4096, 8192], [4096, 8192, 16384], req_id=r, kv_group=0))
+                    kw: dict[str, Any] = {"req_id": r, "cached_chunk_dev_ptrs": [], "_reuse_shared_dense_prefix": True}
+                    h.eng._prepare_shared_prefill_sources(pv, 0, kw)
+
+            h.hook[0] = _sh_hook
+            h.src.begin_runner_step(cm_sh, ("r_sh", "r_ns", "r_priv"), (16384,) * 3, (0, 8, 16, 24), (tbl_sh,) * nb)
+            h.impl.start_load_kv(None)
+            st_sh = h.src.step
+            self.assertTrue(all(("r_sh", b) not in st_sh._req_bank for b in range(nb)))
+            self.assertIn("r_sh", st_sh._shared_reqs)
+            self.assertTrue(all(("r_sh", lid) in st_sh._populated_req_layers for lid in range(nl)))
+            self.assertTrue(torch.all(st_sh.page_bases("l0")[:129] == 0))
+            st_sh.finish(completion=torch.npu.Event())
+            h.src.close()
+
+        with _fake_npu():
+            _check_vec(2)
+            _check_vec(8)
+
+    def test_selective_zeroing_split_upload_and_coalesced_nonshared(self) -> None:
+        with _fake_npu():
+            o0 = _mk_obj(0x9000, 16384)
+            h = self._mk_src(4, mc=600)
+            h.cm_box[0] = self._cm("r0")
+            h.hook[0] = lambda _: self._send(h.gc, h.impl, "r0", o0, 4, sub=False)
+            bref = np.array(
+                [self._dva_grid(h.src._chunk_info(o0, lid)[1]).numpy() for lid in range(4)], dtype=np.uint64
+            )
+            for idx, mx in enumerate((512, 128, 516, 64, 64)):
+                b0 = (
+                    self._ar(mx - 128, mx + 1, d2=False)
+                    if mx >= 128
+                    else np.array([*range(mx), *([mx] * (129 - mx))], dtype=np.int32)
+                )
+                on = 128 if mx >= 128 else mx
+                h.src.begin_runner_step(h.cm_box[0], ("r0",), (16384,), (0, 16), (b0[None, :], b0.copy()[None, :]))
+                h.impl.start_load_kv(None)
+                st = h.src.step
+                slot = st._host_slot
+                self.assertEqual(slot, idx % 2)
+                sd = (((mx + 1) + 3) // 4) * 4
+                exp = torch.zeros((4, sd, 2), dtype=torch.int64)
+                u64 = exp.numpy().view(np.uint64)
+                for lid in range(4):
+                    u64[lid, b0[:on]] = bref[lid, :on]
+                self.assertTrue(torch.equal(h.src._step_host, exp))
+                self.assertTrue(bool(h.src._host_bases_ring[slot].view(-1)[4 * sd * 2 :].eq(0).all()))
+                st.finish(completion=torch.npu.Event())
+                h.src._prune_retired_steps()
+            h.src.close()
+            p_src = (self._sh_obj(0xA000, 16384, 6),)
+            h6 = self._mk_src(6, mc=256)
+            h6.cm_box[0] = self._cm("r0")
+            s6 = [self._LayerSrc(p_src, i) for i in range(6)]
+            h6.hook[0] = lambda _: (
+                next(h6.gc.batched_to_gpu([0], [16384], req_id="r0", kv_group=0)),
+                h6.eng._prepare_shared_prefill_sources(s6, 0, {"req_id": "r0"}),
+            )
+            t256 = self._ar(0, 129)
+            h6.src.begin_runner_step(h6.cm_box[0], ("r0",), (16384,), (0, 16), (t256, t256))
+            h6.impl.start_load_kv(None)
+            st6 = h6.src.step
+            self.assertIsNotNone(st6._init_ready_event)
+            self.assertIsNotNone(st6._shared_ready_event)
+            self.assertIsNot(st6._init_ready_event, st6._shared_ready_event)
+            self.assertIs(st6.ready("l0"), st6._init_ready_event)
+            self.assertIs(st6.ready("l1"), st6._init_ready_event)
+            for i in range(2, 6):
+                self.assertIs(st6.ready(f"l{i}"), st6._shared_ready_event)
+            st6.finish(completion=torch.npu.Event())
+            h6.src.close()
+            rids = ("req0", "req1", "req2")
+            gsrc = self._mk_src(4, mc=600)
+            gsrc.cm_box[0] = self._cm(*rids)
+            up, orec = [], gsrc.src._record_upload
+            gsrc.src._record_upload = lambda st, lid=None: (up.append(lid), orec(st, lid))[1]
+
+            def _st3(_):
+                gs = [self._send(gsrc.gc, gsrc.impl, r, o0, 0, sub=False) for r in rids]
+                for _ in range(2):
+                    for g in gs:
+                        g.send([o0])
+                gsrc.impl._gens = gs
+
+            gsrc.hook[0] = _st3
+            tbl3 = np.vstack([self._ar(i * 150, i * 150 + 129, d2=False) for i in range(3)])
+            gsrc.src.begin_runner_step(gsrc.cm_box[0], rids, (16384,) * 3, (0, 8, 16, 24), (tbl3, tbl3))
+            gsrc.impl.start_load_kv(None)
+            st3 = gsrc.src.step
+            self.assertEqual(up, [0, 1])
+            gsrc.impl._gens[0].send([o0])
+            gsrc.impl._gens[1].send([o0])
+            self.assertEqual(up, [0, 1])
+            self.assertRaisesRegex(RuntimeError, "DDR page_bases not uploaded", st3.page_bases, "l2")
+            gsrc.impl._gens[2].send([o0])
+            self.assertEqual((up, tuple(st3.page_bases("l2").shape)), ([0, 1, 2], (429, 2)))
+            self.assertIsNotNone(st3.ready("l2"))
+            for g in gsrc.impl._gens:
+                g.send([o0])
+            self.assertEqual(up, [0, 1, 2, 3])
+            st3.finish(completion=torch.npu.Event())
+            gsrc.src.close()
+
+    def test_pipelined_handoff_overlap_drain_and_interleaved_native(self) -> None:
+        _cfg, _CtrlEv, _build_env, _run_step = self._pipe_setup(track_pending=True)
+        with _fake_npu(), patch.object(torch.npu, "Event", _CtrlEv):
+            e, wio, rio = _build_env(), [], []
+            with self._init_rt(e):
+                rt, src = e.rn.selected_kv_runtime, e.rn.selected_kv_runtime.source
+                st0, ev0, o0 = _run_step(e, "r0", bb=0, fos=True, wio=wio, rio=rio)
+                self.assertEqual((o0.s, st0._host_slot, rt._cur_meta_slot), ({"p": 1, "r": 1}, 0, 0))
+                am0 = self._am(e.layers)
+                with skv.selected_kv_prepare_context(e.rn, SimpleNamespace(kv_connector_metadata=None), am0):
+                    self.assertIsNone(src.step)
+                with skv.selected_kv_forward(e.rn, SimpleNamespace(kv_connector_metadata=None), am0) as bfe:
+                    self.assertIsNone(bfe)
+                self.assertIsNone(src.step)
+                self.assertEqual(ev0.sync_calls, 0)
+                self.assertTrue(any(st is st0 for st, _, _ in rt._inflight_steps))
+                alt_s = torch.npu.Stream()
+                st1, ev1, o1 = _run_step(e, "r1", bb=10, fos=True, qd=8, sm=alt_s, wio=wio, rio=rio)
+                self.assertEqual(ev0.sync_calls, 0)
+                self.assertIn(ev0, alt_s.waited)
+                self.assertIn(ev0, wio[-1])
+                self.assertEqual((o0.s, st1._host_slot, rt._cur_meta_slot), ({"p": 1, "r": 1}, 1, 1))
+                self.assertEqual((len(src._unretired_steps), len(rt._inflight_steps)), (2, 1))
+                self.assertIs(rt._inflight_steps[0][0], st0)
+                saved_s0_pending = rt._inflight_steps[0][2]
+                self.assertGreaterEqual(len(saved_s0_pending), 2)
+                ev0.fail_on_sync = False
+                st2, ev2, o2 = _run_step(e, "req_d", bb=20, wio=wio, rio=rio)
+                self.assertEqual((ev0.sync_calls, ev1.sync_calls, saved_s0_pending, st2._host_slot), (1, 0, [], 0))
+                self.assertEqual((o0.s, o1.s, o2.s), ({"p": 0, "r": 0}, {"p": 1, "r": 1}, {"p": 1, "r": 1}))
+                e.eng.release_shared_cpu_sparse_request("req_d")
+                e.gc.release_layerwise_prefill_dma_cache("req_d")
+                self.assertEqual(e.rel, [])
+                ev1.done = True
+                st3, ev3, o3 = _run_step(e, "req_d", bb=30, fos=True, wio=wio, rio=rio)
+                self.assertEqual((ev2.sync_calls, rio[-1], o2.s), (1, 2, {"p": 0, "r": 0}))
+                self.assertEqual(e.rel, [("cpu", "req_d"), ("dma", "req_d")])
+                slot3 = rt._cur_meta_slot
+                snap3 = rt._host_meta_ring[slot3].clone()
+                am_nat = self._am(e.layers)
+                e.hook[0] = self._nop
+                self._prep_cm(e.rn, e.lmc_c, None, am_nat)
+                with skv.selected_kv_forward(e.rn, SimpleNamespace(kv_connector_metadata=None), am_nat) as bf:
+                    self.assertIsNone(bf)
+                self.assertEqual(ev3.sync_calls, 0)
+                self.assertTrue(any(st is st3 for st, _, _ in rt._inflight_steps))
+                self.assertTrue(torch.equal(rt._host_meta_ring[slot3], snap3))
+                _, ev4, o4 = _run_step(e, "r4", bb=40, wio=wio, rio=rio)
+                self.assertEqual(ev3.sync_calls, 0)
+                self.assertNotEqual(rt._cur_meta_slot, slot3)
+                self.assertTrue(torch.equal(rt._host_meta_ring[slot3], snap3))
+                ev3.fail_on_sync = False
+                ev3.done = ev4.done = True
+                skv.retire_selected_kv_if_idle(e.rn)
+                skv.close_selected_kv_worker(e.wk)
+                for obj in (o0, o1, o2, o3, o4):
+                    self.assertEqual(obj.s, {"p": 0, "r": 0})
+                self.assertTrue(rt._closed and src._closed)
+
+    def _run_mixed_shared_nonshared(self, *, ns_first: bool) -> None:
+        o_sh, o_ns = self._sh_obj(0x9000, 16384, 6), _mk_obj(0xD000, 16384)
+        h = self._mk_src(6, mc=300)
+        h.cm_box[0] = self._cm("r_sh", "r_ns")
+        ns_gens, seen_init, up_lids, oup = [], [], [], h.src._record_upload
+        h.src._record_upload = lambda st, lid=None: (up_lids.append(lid), oup(st, lid))[1]
+
+        def _hook(_):
+            if ns_first:
+                ns_gens.append(self._send(h.gc, h.impl, "r_ns", o_ns, 2, sub=False))
+                seen_init.append((h.src.step._initializing, list(up_lids)))
+            next(h.gc.batched_to_gpu([0], [16384], req_id="r_sh", kv_group=0))
+            h.eng._prepare_shared_prefill_sources([self._LayerSrc((o_sh,), i) for i in range(6)], 0, {"req_id": "r_sh"})
+            if not ns_first:
+                ns_gens.append(self._send(h.gc, h.impl, "r_ns", o_ns, 2, sub=False))
+
+        h.hook[0] = _hook
+        t6 = np.vstack([self._ar(0, 129, d2=False), self._ar(130, 259, d2=False)])
+        h.src.begin_runner_step(h.cm_box[0], ("r_sh", "r_ns"), (16384, 16384), (0, 8, 16), (t6, t6))
+        h.impl.start_load_kv(None)
+        st6 = h.src.step
+        if ns_first:
+            self.assertEqual((seen_init, st6._initializing), ([(True, [])], False))
+            self.assertIsNone(st6._shared_ready_event)
+        self.assertEqual(up_lids, [0, 1])
+        self.assertRaisesRegex(RuntimeError, "DDR page_bases not uploaded", st6.page_bases, "l2")
+        for lid in range(2, 6):
+            ns_gens[0].send([o_ns])
+            if lid == 2:
+                self.assertEqual(up_lids, [0, 1, 2])
+        self.assertEqual(up_lids, [0, 1, 2, 3, 4, 5])
+        for lid in range(6) if ns_first else (2,):
+            pb = st6.page_bases(f"l{lid}")
+            for off, oref in ((0, o_sh), (130, o_ns)):
+                self.assertTrue(torch.equal(pb[off : off + 128], self._dva_grid(oref.layer_data_ptr(lid) + 0x100000)))
+        st6.finish(completion=torch.npu.Event())
+        h.src.close()
+
+    def test_cross_step_drain_fail_closed_and_mixed_shared(self) -> None:
+        cfg, _CtrlEv, _build_env, _run_step = self._pipe_setup()
+        with patch.multiple(
+            envs_ascend, VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE=True, VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS=2
+        ):
+            for bad in ("VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD", "VLLM_ASCEND_DSA_USE_ADAPTER_CACHE"):
+                with patch.object(envs_ascend, bad, True, create=True):
+                    self.assertRaisesRegex(
+                        ValueError,
+                        r"Selected KV prefill cannot be combined with DSA (?:latent offload|adapter cache)",
+                        cfg.validate_deployment,
+                        _vcfg(),
+                    )
+        with _fake_npu(), patch.object(torch.npu, "Event", _CtrlEv):
+            e = _build_env()
+            with self._init_rt(e):
+                rt, src = e.rn.selected_kv_runtime, e.rn.selected_kv_runtime.source
+                for ck in ("sparse_decode", "non_sel_alone", "non_sel_with_extra"):
+                    e.rel.clear()
+                    s_t, ev_t, o_t = _run_step(e, "req_d", rel=True)
+                    self.assertEqual((e.rel, o_t.s), ([], {"p": 1, "r": 1}))
+                    seen: list[tuple[int, list[Any]]] = []
+                    if ck == "non_sel_with_extra":
+                        ox = _mk_obj(0xB000, 16384)
+                        t2 = np.vstack([self._ar(0, 161, d2=False), self._ar(161, 290, d2=False).tolist() + [289] * 32])
+                        self._set_batch(e.rn, e.tbl_box, ["req_d", "req_x"], [0, 4096, 4104], t2)
+                        cm_n = self._cm("req_d", "req_x")
+                        e.hook[0] = lambda _, s=seen, ev=ev_t, o=ox: (
+                            s.append((ev.sync_calls, list(e.rel))),
+                            self._send(e.gc, e.impl, "req_x", o, 3),
+                        )
+                        am_n = self._am(e.layers, nt=4104, bs=2)
+                        self._prep_cm(e.rn, e.lmc_c, cm_n, am_n)
+                        self.assertIsNotNone(src.step)
+                        tk3 = torch.zeros((4104, 1, 2048), dtype=torch.int32)
+                        self._fwd_pair(e.rn, e.impl, e.layers, e.kv_c, cm_n, am_n, tk3, [0, 1, 2], [20481, 16385])
+                    else:
+                        if ck == "non_sel_alone":
+                            self._set_batch(e.rn, e.tbl_box, ["req_d"], [0, 4096], self._ar(0, 161))
+                        cm_n = self._cm(("req_d", 16384, True, ck == "sparse_decode"))
+                        e.hook[0] = lambda _, s=seen, ev=ev_t: s.append((ev.sync_calls, list(e.rel)))
+                        self._prep_cm(e.rn, e.lmc_c, cm_n, self._am(e.layers, nt=8 if ck == "sparse_decode" else 4096))
+                        self.assertIsNone(src.step)
+                    self.assertEqual(
+                        (seen, o_t.s, s_t._closed),
+                        ([(1, [("cpu", "req_d"), ("dma", "req_d")])], {"p": 0, "r": 0}, True),
+                    )
+                e.rel.clear()
+                st0, ev0, o0 = _run_step(e, "req_d")
+                self.assertEqual(o0.s, {"p": 1, "r": 1})
+                self._set_batch(e.rn, e.tbl_box, ["r1"], [0, 8], self._ar(10, 140))
+                cm1, am1 = self._cm("r1"), self._am(e.layers)
+                e.hook[0] = lambda _: (_ for _ in ()).throw(RuntimeError("boom_in_orig_start"))
+                with self.assertRaisesRegex(RuntimeError, "boom_in_orig_start"):
+                    self._prep_cm(e.rn, e.lmc_c, cm1, am1)
+                self._assert_fail_closed_pinned(e, st0, ev0, o0)
+                self._assert_retained(src, e.impl, self._cm(("r_no", 0, False)), "r_no", e.tbl_box[0])
+                self.assertRaisesRegex(RuntimeError, "retains", rt.bind_step, None, (), (), (), am1)
+                skv.close_selected_kv_worker(e.wk)
+                self.assertEqual(o0.s, {"p": 1, "r": 1})
+            e2 = _build_env()
+            with self._init_rt(e2):
+                rt2 = e2.rn.selected_kv_runtime
+                rt2.source._failed = True
+                self.assertFalse(rt2._failed)
+                skv.abort_active_selected_kv_steps()
+                self.assertTrue(rt2._failed)
+                skv.close_selected_kv_worker(e2.wk)
+        with _fake_npu():
+            self._run_mixed_shared_nonshared(ns_first=False)
+
+    def test_fail_closed_budget_and_heterogeneous(self) -> None:
+        _cfg, _CtrlEv, _build_env, _run_step = self._pipe_setup()
+
+        with _fake_npu(), patch.object(torch.npu, "Event", _CtrlEv):
+            e = _build_env()
+            with self._init_rt(e):
+                rt, src = e.rn.selected_kv_runtime, e.rn.selected_kv_runtime.source
+                st0, ev0, o0 = _run_step(e, "r0", rel=True)
+                self.assertEqual((ev0.done, o0.s, e.rel), (False, {"p": 1, "r": 1}, []))
+                o1 = _mk_obj(0xB000, 16384)
+                self._set_batch(e.rn, e.tbl_box, ["r1"], [0, 8], self._ar(10, 140))
+                cm1, am1 = self._cm("r1"), self._am(e.layers)
+                e.hook[0] = lambda _: self._send(e.gc, e.impl, "r1", o1, 3)
+                self._prep_cm(e.rn, e.lmc_c, cm1, am1)
+                step1 = src.step
+                self.assertIsNotNone(step1)
+                self.assertIn(st0, src._unretired_steps)
+                self.assertTrue(any(st is st0 for st, _, _ in rt._inflight_steps))
+                self.assertEqual(e.rel, [])
+                with (
+                    self.assertRaisesRegex(RuntimeError, "fwd boom"),
+                    skv.selected_kv_forward(e.rn, SimpleNamespace(kv_connector_metadata=cm1), am1),
+                ):
+                    raise RuntimeError("fwd boom")
+                self._assert_fail_closed_pinned(e, st0, ev0, o0)
+                self.assertTrue(step1._failed)
+                self._assert_retained(src, e.impl, cm1, "r1", e.tbl_box[0])
+                skv.close_selected_kv_worker(e.wk)
+                self.assertEqual((o0.s, e.rel), ({"p": 1, "r": 1}, []))
+            for fail_mode in ("none", "st0"):
+                ef = _build_env()
+                with self._init_rt(ef):
+                    rt_f = ef.rn.selected_kv_runtime
+                    st0_f, ev0_f, o0_f = _run_step(ef, "r0", rel=False)
+                    self.assertTrue(st0_f._finished and not st0_f._closed and not ev0_f.done)
+                    rt_f._handoff_previous()
+                    rt_f.fail(None if fail_mode == "none" else st0_f)
+                    ef.eng.release_shared_cpu_sparse_request("r0")
+                    self._assert_fail_closed_pinned(ef, st0_f, ev0_f, o0_f)
+                    self.assertFalse(st0_f._closed)
+                    skv.close_selected_kv_worker(ef.wk)
+                    self.assertEqual(o0_f.s, {"p": 1, "r": 1})
+            exp_ws = (
+                4 * (8192 * (4096 + 8) + 524288 + 2 * 32 * 8 + (524288 // 32) + 8 * 524288 + 8 * 8 + min(8, 16384) * 8)
+                + 75 * 1024
+            )
+            self.assertEqual((exp_ws, psr.selected_workspace_bytes(16384, 8)), (153_499_136, exp_ws))
+            ew, pb_b, d1 = _build_env(), skv.PAGE_ROWS * skv.MAIN_ROW_BYTES, 16385
+            avail = skv.NATIVE_ALIGNMENT + d1 * pb_b + 1024
+            with self._init_rt(ew, avail=avail) as nret:
+                budget, eb = ew.rn._selected_kv_budget, skv.PAGE_BASES_ENTRY_BYTES * len(ew.layers)
+                self.assertEqual((budget.maximum_blocks, budget._fixed), (d1, exp_ws + 3 * eb))
+                self.assertEqual(avail - nret - skv.NATIVE_ALIGNMENT, exp_ws + (d1 + 3) * eb)
+                budget.validate(nret // pb_b)
+                rt_w, src_w = ew.rn.selected_kv_runtime, ew.rn.selected_kv_runtime.source
+                self._set_batch(ew.rn, ew.tbl_box, ["r1"], [0, 8], self._ar(0, 130))
+                cm_w, o_w = self._cm("r1"), _mk_obj(0xC000, 16384)
+                ew.hook[0] = lambda _: self._send(ew.gc, ew.impl, "r1", o_w, 3)
+                self._prep_cm(ew.rn, ew.lmc_c, cm_w, self._am(ew.layers))
+                am_bad = self._am(ew.layers, bs=skv.MAX_REQUESTS + 1)
+                self.assertRaisesRegex(
+                    ValueError, "Bad block_table", rt_w.bind_step, src_w.step, ("r1",), (16384,), (0, 8), am_bad
+                )
+                rt_w.fail(src_w.step)
+                skv.close_selected_kv_worker(ew.wk)
+        with _fake_npu():
+            oh = SimpleNamespace(layer_size=None, num_layers=6, valid=True, is_valid=lambda: True, is_pinned=False)
+            oh.layer_size_bytes = lambda i: (16384 + i * 128) * skv.MAIN_ROW_BYTES
+            oh.layer_data_ptr = lambda i: 0x9000_0000 + i * 0x10_0000
+            ch = [
+                [
+                    (1 << 63) | (oh.layer_data_ptr(0) + 0x10_0000)
+                    if i == 0
+                    else (1 << 63) | (oh.layer_data_ptr(i) + 0x20_0000)
+                ]
+                for i in range(6)
+            ]
+            hh = self._mk_src(
+                6,
+                mc=300,
+                dva=lambda p, _: (1 << 63) | (p + 0x10_0000),
+                ee={"_prepare_shared_prefill_sources": lambda _p, _g, kw, *_a: kw["cached_chunk_dev_ptrs"].extend(ch)},
+            )
+            hh.cm_box[0] = self._cm("r_het")
+            kwh: dict[str, Any] = {"req_id": "r_het", "cached_chunk_dev_ptrs": [], "_reuse_shared_dense_prefix": True}
+            hh.hook[0] = lambda _: (
+                kwh["cached_chunk_dev_ptrs"].clear(),
+                next(hh.gc.batched_to_gpu([0], [16384], req_id="r_het", kv_group=0)),
+                hh.eng._prepare_shared_prefill_sources([self._LayerSrc((oh,), i) for i in range(6)], 0, kwh),
+            )
+            th = self._ar(0, 129)
+            hh.src.begin_runner_step(hh.cm_box[0], ("r_het",), (16384,), (0, 8), (th, th))
+            hh.impl.start_load_kv(None)
+            sth = hh.src.step
+            for i in range(6):
+                pb, dva = sth.page_bases(f"l{i}"), ch[i][0]
+                self.assertEqual((pb.dtype, dva >> 63), (torch.uint64, 1))
+                self.assertTrue(torch.equal(pb[:128], self._dva_grid(dva, p_tok=16384 + i * 128)))
+            sth.finish(completion=torch.npu.Event())
+            hh.src.close()
+            self._run_mixed_shared_nonshared(ns_first=True)
+
+    def test_post_orig_start_exception_aborts_retrieve_and_save_steps(self) -> None:
+        with _fake_npu():
+            ab: list[tuple[str, tuple[Any, ...]]] = []
+            ei = {
+                "_abort_layerwise_retrieve_step": lambda rq: ab.append(("ret", tuple(r.req_id for r in rq))),
+                "_abort_save_step": lambda rq: ab.append(("save", tuple(r.req_id for r in rq))),
+            }
+            h = self._mk_src(
+                4,
+                eg={"batched_to_gpu": self._nop},
+                ee={"_should_use_shared_layerwise_retrieve": lambda _g: False},
+                ei=ei,
+            )
+            cm1 = self._cm(("r_post", 16384, True, False, 0))
+            h.cm_box[0] = cm1
+            t1 = self._ar(10, 139)
+            h.src.begin_runner_step(cm1, ("r_post",), (16384,), (0, 8), (t1, t1))
+            self.assertRaisesRegex(
+                RuntimeError, r"Selected KV initial layers .* unpopulated", h.impl.start_load_kv, None
+            )
+            self.assertEqual(ab, [("ret", ("r_post",)), ("save", ("r_post",))])
+            self.assertTrue(h.src._failed)
+            for fn in reversed(h.src._restorers):
+                fn()
+
+    def test_skip_group0_dma_eligibility_handshake_and_shared_ranges(self) -> None:
+        with _fake_npu():
+            o_sh, s_skip = self._sh_obj(0x9000, 16384, 4), []
+            h = self._mk_src(
+                4,
+                track_btg=True,
+                eg={"prepare_layerwise_prefill_group0_skip": self._nop},
+                ee={"_should_use_shared_layerwise_retrieve": lambda g: g == 0},
+                ei={"_selected_skip_group0_dma_req_ids": frozenset()},
+            )
+            self._attach_skip_hook(h, o_sh, 16384, s_skip=s_skip)
+            cm1 = self._cm(("r_skip", 16384, True, False, 0))
+            h.cm_box[0] = cm1
+            t1 = self._ar(10, 139)
+            h.src.begin_runner_step(cm1, ("r_skip",), (16384,), (0, 8), (t1, t1))
+            h.impl.start_load_kv(None)
+            self.assertEqual(
+                (s_skip[-1], h.btg, h.impl._selected_skip_group0_dma_req_ids), (frozenset({"r_skip"}), [], frozenset())
+            )
+            pbs = [h.src.step.page_bases(n).clone() for n in h.layers]
+            h.src.step.finish(completion=torch.npu.Event())
+            h.impl._layerwise_prefill_dma = False
+            h.src.begin_runner_step(cm1, ("r_skip",), (16384,), (0, 8), (t1, t1))
+            h.impl.start_load_kv(None)
+            self.assertEqual((s_skip[-1], h.btg), (frozenset(), ["r_skip"]))
+            for a, b in zip(pbs, [h.src.step.page_bases(n).clone() for n in h.layers]):
+                self.assertTrue(torch.equal(a, b))
+            h.src.step.finish(completion=torch.npu.Event())
+            h.impl._layerwise_prefill_dma = True
+            h.btg.clear()
+            del h.gc.prepare_layerwise_prefill_group0_skip
+            h.src.begin_runner_step(cm1, ("r_skip",), (16384,), (0, 8), (t1, t1))
+            h.impl.start_load_kv(None)
+            self.assertEqual((s_skip[-1], h.btg), (frozenset(), ["r_skip"]))
+            h.src.step.finish(completion=torch.npu.Event())
+            h.gc.prepare_layerwise_prefill_group0_skip = self._nop
+            cm_off = self._cm(("r_off", 0, False, False, 0))
+            h.cm_box[0] = cm_off
+            h.src.begin_runner_step(cm_off, ("r_off",), (16384,), (0, 8), (t1, t1))
+            self.assertIsNone(h.src.step)
+            h.impl.start_load_kv(None)
+            self.assertEqual(s_skip[-1], frozenset())
+            self._close_src(h.src)
+
+    def test_recompute_fallback_bs1_cancel_unused_and_next_step(self) -> None:
+        with _fake_npu():
+            pst, o_r0 = {"rc": 1}, self._sh_obj(0x9000, 16384, 4)
+            o_pas = SimpleNamespace(
+                layer_data_ptr=lambda lid: 0xA000 + lid * 0x100,
+                layer_size_bytes=lambda _t: 16384 * skv.MAIN_ROW_BYTES,
+                ref_count_down=lambda: pst.__setitem__("rc", pst["rc"] - 1),
+            )
+            mr: dict[str, tuple[int, int]] = {"req_a": (0, 16384)}
+            h = self._mk_src(
+                4,
+                eg={
+                    "batched_to_gpu": lambda *_a, **_k: iter([None]),
+                    "prepare_layerwise_prefill_group0_skip": self._nop,
+                },
+                ee={"_should_use_shared_layerwise_retrieve": lambda g: g == 0, "_recompute_fallback_req_ids": set()},
+            )
+            tbl, cap = self._ar(0, 130), []
+
+            def _orig_fb(_):
+                sc = h.src.step
+                cap.append(sc)
+                assert sc is not None
+                h.src._retain_objs(sc, [o_r0])
+                sc._deferred_cbs.append(lambda: (mr.__setitem__("req_a", (0, 0)), o_pas.ref_count_down()))
+                h.eng._recompute_fallback_req_ids.add("req_a")
+
+            h.hook[0] = _orig_fb
+            cm_fb = self._cm(("req_a", 16384, True, False, 0))
+            h.cm_box[0] = cm_fb
+            h.src.begin_runner_step(cm_fb, ("req_a",), (16384,), (0, 8), (tbl, tbl))
+            h.impl.start_load_kv(None)
+            self.assertEqual(len(cap), 1)
+            sfb = cap[0]
+            self.assertIsNotNone(sfb)
+            self.assertFalse(h.src._failed)
+            self.assertIsNone(h.src.step)
+            self.assertTrue(sfb._finished and sfb._closed)
+            self.assertEqual(
+                (h.src._unretired_steps, o_r0.s, pst["rc"], mr["req_a"]), ([], {"p": 0, "r": 0}, 0, (0, 0))
+            )
+            self.assertEqual(
+                (h.eng._recompute_fallback_req_ids, h.impl._selected_skip_group0_dma_req_ids), (set(), frozenset())
+            )
+            ok_box: list[Any] = []
+            cm_ok = self._cm(("req_ok", 16384, True, False, 0))
+            h.cm_box[0] = cm_ok
+            kw_ok: dict[str, Any] = {
+                "req_id": "req_ok",
+                "_shared_prefill_starts": [0],
+                "_shared_prefill_ends": [16384],
+            }
+            ok_src = [self._LayerSrc((o_r0,), i) for i in range(4)]
+            h.hook[0] = lambda _: (ok_box.append(h.src.step), h.eng._prepare_shared_prefill_sources(ok_src, 0, kw_ok))
+            h.src.begin_runner_step(cm_ok, ("req_ok",), (16384,), (0, 8), (tbl, tbl))
+            h.impl.start_load_kv(None)
+            self.assertEqual(len(ok_box), 1)
+            sok = ok_box[0]
+            self.assertIs(h.src.step, sok)
+            sok.finish(completion=torch.npu.Event())
+            self.assertTrue(sok.try_retire())
+            self._close_src(h.src)
+
+    def test_mixed_two_req_recompute_fallback_and_nonshared_upload(self) -> None:
+        with _fake_npu():
+            oa, ob = _mk_obj(0x9000, 16384), _mk_obj(0xB000, 16384)
+            gens, up_ev, sbox = {}, [], []
+            h = self._mk_src(
+                4,
+                eg={"prepare_layerwise_prefill_group0_skip": self._nop},
+                ee={"_should_use_shared_layerwise_retrieve": lambda _g: False, "_recompute_fallback_req_ids": set()},
+            )
+
+            def _orig(_):
+                sbox.append(h.src.step)
+                gens["a"], gens["b"] = (
+                    self._send(h.gc, h.impl, "req_a", oa, 3, sub=False),
+                    self._send(h.gc, h.impl, "req_b", ob, 2, sub=False),
+                )
+                h.eng._recompute_fallback_req_ids.add("req_a")
+
+            h.hook[0] = _orig
+            orec = h.src._record_upload
+            h.src._record_upload = lambda st, lid=None: (up_ev.append((st._host_slot, lid)), orec(st, lid))[1]
+            cm = self._cm(("req_a", 16384, True, False, 0), ("req_b", 16384, True, False, 0))
+            h.cm_box[0] = cm
+            tbl = np.vstack([self._ar(0, 130, d2=False), self._ar(140, 270, d2=False)])
+            h.src.begin_runner_step(cm, ("req_a", "req_b"), (16384, 16384), (0, 8, 16), (tbl, tbl))
+            self.assertEqual(up_ev, [])
+            h.impl.start_load_kv(None)
+            self.assertEqual(len(sbox), 1)
+            step = h.src.step
+            assert step is not None
+            self.assertEqual(step.selected_request_ids, frozenset({"req_b"}))
+            for idx in (0, 1):
+                self.assertNotIn(("req_a", idx), step._req_bank)
+                self.assertNotIn(("req_a", idx), step._bank_plans)
+            for bi in range(len(step.omitted_by_bank)):
+                for blk in range(0, 128):
+                    self.assertNotIn(blk, step.omitted_by_bank[bi])
+            self.assertEqual(up_ev, [(step._host_slot, 0), (step._host_slot, 1)])
+            up_ev.clear()
+            gens["a"].send([oa])
+            self.assertEqual(up_ev, [])
+            gens["b"].send([ob])
+            gens["b"].send([ob])
+            self.assertEqual(up_ev, [(step._host_slot, 2), (step._host_slot, 3)])
+            step.finish(completion=torch.npu.Event())
+            self.assertTrue(step.try_retire())
+            self._close_src(h.src)
+
+    def test_chunk_info_dva_cache_liveness_and_generation_invalidation(self) -> None:
+        src = object.__new__(lms.LMCacheSelectedKVSource)
+        src.gpu_connector, src.engine = SimpleNamespace(), SimpleNamespace(shared_cpu_cache_generation=1)
+        src._dva_cache, src._dva_cache_gen, ptr_calls, rb = {}, 1, [], skv.MAIN_ROW_BYTES
+        src._get_device_ptr_fn = lambda ptr, sz: (ptr_calls.append((ptr, sz)), ptr + 0x10000)[1]
+
+        def _o(t: int, p: int, al: Any):
+            return SimpleNamespace(
+                layer_size_bytes=lambda _l, k=t: rb * k, layer_data_ptr=lambda _l, ptr=p: ptr, parent_allocator=al
+            )
+
+        live = _o(2, 0x1000, SimpleNamespace(_mapping=SimpleNamespace(_closed=False)))
+        self.assertEqual(
+            (src._chunk_info(live, 0), src._chunk_info(live, 0), len(ptr_calls)), ((2, 0x11000), (2, 0x11000), 1)
+        )
+        unreg = _o(3, 0x2000, SimpleNamespace(_unregistered=False))
+        self.assertEqual(
+            (src._chunk_info(unreg, 0), src._chunk_info(unreg, 0), len(ptr_calls)), ((3, 0x12000), (3, 0x12000), 2)
+        )
+        src.engine.shared_cpu_cache_generation = 2
+        self.assertEqual(
+            (src._chunk_info(live, 0), src._dva_cache_gen, len(src._dva_cache), len(ptr_calls)), ((2, 0x11000), 2, 1, 3)
+        )
+        dm, du = (
+            _o(1, 0x3000, SimpleNamespace(_mapping=SimpleNamespace(_closed=True))),
+            _o(1, 0x4000, SimpleNamespace(_unregistered=True)),
+        )
+        na, sa = _o(1, 0x5000, None), _o(1, 0x6000, SimpleNamespace())
+        self.assertEqual(
+            [src._chunk_info(x, 0) for x in (dm, dm, du, na, sa, sa)],
+            [(1, 0x13000), (1, 0x13000), (1, 0x14000), (1, 0x15000), (1, 0x16000), (1, 0x16000)],
+        )
+        self.assertEqual((len(ptr_calls), len(src._dva_cache)), (9, 1))
+
+    def test_kv_both_full_resident_policy_deselects_for_dense_decode(self) -> None:
+        with _fake_npu():
+            htok, qtok = 131072, 1024
+            o_sh, s_st, s_sk, kv_cfg = self._sh_obj(0x9000, htok, 4), [], [], SimpleNamespace(kv_role="kv_both")
+            ei = {
+                "enable_sparse_attention": True,
+                "_dsa_kv_policy_threshold": 1000000,
+                "_dsa_scratch_capacity": 0,
+                "_selected_skip_group0_dma_req_ids": frozenset(),
+            }
+            h = self._mk_src(
+                4,
+                mc=2048,
+                track_btg=True,
+                eg={"prepare_layerwise_prefill_group0_skip": self._nop},
+                ee={"_should_use_shared_layerwise_retrieve": lambda g: g == 0},
+                ei=ei,
+            )
+            h.impl._parent = SimpleNamespace(_get_connector_metadata=lambda: h.cm_box[0], _kv_transfer_config=kv_cfg)
+            self._attach_skip_hook(h, o_sh, htok, s_step=s_st, s_skip=s_sk)
+            tbl = self._ar(10, 10 + (htok + qtok) // skv.PAGE_ROWS + 4)
+            try:
+                for rid, role, sa, th, sc, esel in (
+                    ("r_both_thresh", "kv_both", True, 1000000, 0, False),
+                    ("r_both_dense_attn", "kv_both", False, 0, 0, False),
+                    ("r_both_sel", "kv_both", True, 0, 2048, True),
+                    ("r_prod_sel", "kv_producer", True, 1000000, 0, True),
+                ):
+                    h.btg.clear()
+                    kv_cfg.kv_role, h.impl.enable_sparse_attention = role, sa
+                    h.impl._dsa_kv_policy_threshold, h.impl._dsa_scratch_capacity = th, sc
+                    cm = self._cm((rid, htok, True, False, 0, True))
+                    h.cm_box[0] = cm
+                    h.src.begin_runner_step(cm, (rid,), (htok,), (0, qtok), (tbl, tbl))
+                    h.impl.start_load_kv(None)
+                    if esel:
+                        self.assertIsNotNone(s_st[-1])
+                        self.assertEqual(
+                            (s_st[-1].selected_request_ids, s_sk[-1], h.btg), (frozenset({rid}), frozenset({rid}), [])
+                        )
+                        h.src.step.finish(completion=torch.npu.Event())
+                    else:
+                        self.assertIsNone(s_st[-1])
+                        self.assertIsNone(h.src.step)
+                        self.assertEqual((s_sk[-1], h.btg), (frozenset(), [rid]))
+            finally:
+                self._close_src(h.src)
+
+    def test_online_hardening_guards(self) -> None:
+        req_apc = SimpleNamespace(
+            block_allocation_mode="prefill_child",
+            save_spec=SimpleNamespace(can_save=True, skip_leading_tokens=8192),
+            load_spec=SimpleNamespace(can_load=True, lmcache_cached_tokens=16384, vllm_cached_tokens=256),
+        )
+        self.assertFalse(lms.classify_lmcache_request("r_apc", 16384, 128, req_apc).selected)
+
+        _cfg, _CtrlEv, _build_env, _run_step = self._pipe_setup()
+        with _fake_npu(), patch.object(torch.npu, "Event", _CtrlEv):
+            e = _build_env()
+            with self._init_rt(e):
+                rt = e.rn.selected_kv_runtime
+                st0, ev0, _ = _run_step(e, "r_fence", bb=0, hold=True, fos=False)
+                alt_s = torch.npu.Stream(device="cpu")
+                with torch.npu.stream(alt_s):
+                    got = rt.bind_step(None, (), (), (), self._am(e.layers))
+                self.assertIsNone(got)
+                self.assertIn(ev0, alt_s.waited)
+                ev0.done = True
+                skv.retire_selected_kv_if_idle(e.rn)
+                skv.close_selected_kv_worker(e.wk)
+
+            ef = _build_env()
+            with self._init_rt(ef):
+                rtf = ef.rn.selected_kv_runtime
+                _stf, evf, _ = _run_step(ef, "r_shut", bb=5, hold=True, fos=True)
+                rtf._handoff_previous()
+                rtf.fail(_stf)
+                rtf.device = SimpleNamespace(type="npu")
+                with patch.object(
+                    torch.npu, "synchronize", side_effect=RuntimeError("sync hung"), create=True
+                ) as mock_sync:
+                    skv.close_selected_kv_worker(ef.wk)
+                mock_sync.assert_called_once_with(rtf.device)
+                self.assertTrue(getattr(ef.eng, "_retain_unfenced_external_dma", False))
+                evf.fail_on_sync = False
+                evf.done = True
+
+            ef_ok = _build_env()
+            with self._init_rt(ef_ok):
+                rtf_ok = ef_ok.rn.selected_kv_runtime
+                _st_ok, ev_ok, _ = _run_step(ef_ok, "r_shut_ok", bb=5, hold=True, fos=True)
+                rtf_ok._handoff_previous()
+                rtf_ok.fail(_st_ok)
+                rtf_ok.device = SimpleNamespace(type="npu")
+                with patch.object(torch.npu, "synchronize", return_value=None, create=True) as mock_sync_ok:
+                    skv.close_selected_kv_worker(ef_ok.wk)
+                mock_sync_ok.assert_called_once_with(rtf_ok.device)
+                self.assertFalse(getattr(ef_ok.eng, "_retain_unfenced_external_dma", False))
+                ev_ok.fail_on_sync = False
+                ev_ok.done = True
+
+        with _fake_npu():
+            ei_skew = {
+                "enable_sparse_attention": True,
+                "_selected_skip_group0_dma_req_ids": frozenset(),
+                "_should_skip_group0_prefill_dma": None,
+            }
+            hs = self._mk_src(
+                4,
+                mc=256,
+                track_btg=True,
+                eg={"prepare_layerwise_prefill_group0_skip": self._nop},
+                ee={"_should_use_shared_layerwise_retrieve": lambda g: g == 0},
+                ei=ei_skew,
+            )
+            s_sk_skew: list[frozenset[str]] = []
+            hs.cm_box[0] = self._cm("r_skew")
+            self._attach_skip_hook(hs, self._sh_obj(0x9000, 16384, 4), 16384, s_skip=s_sk_skew)
+            ts = self._ar(0, 130)
+            hs.src.begin_runner_step(hs.cm_box[0], ("r_skew",), (16384,), (0, 8), (ts, ts))
+            hs.impl.start_load_kv(None)
+            self.assertEqual((s_sk_skew[-1], hs.impl._selected_skip_group0_dma_req_ids), (frozenset(), frozenset()))
+            hs.src.step.finish(completion=torch.npu.Event())
+            self._close_src(hs.src)
+
+            o0, o1 = _mk_obj(0x1000, 8192), _mk_obj(0x2000, 8192)
+            ptrs_seen: list[tuple[int, int]] = []
+
+            def _dva_tail(hp: int, bs: int) -> int:
+                ptrs_seen.append((hp, bs))
+                return (1 << 63) | (hp + 0x100000)
+
+            ht = self._mk_src(
+                4,
+                banks=2,
+                mc=256,
+                dva=_dva_tail,
+            )
+            ht.cm_box[0] = self._cm("r_tail")
+            cached_bad = [[(1 << 63) | (o0.layer_data_ptr(lid) + 0x100000), 0xDEAD] for lid in range(4)]
+            kw_t = {"req_id": "r_tail", "cached_chunk_dev_ptrs": cached_bad, "_reuse_shared_dense_prefix": True}
+            ht.hook[0] = lambda _: (
+                next(ht.gc.batched_to_gpu([0, 8192], [8192, 16384], req_id="r_tail", kv_group=0)),
+                ht.eng._prepare_shared_prefill_sources([self._LayerSrc((o0, o1), i) for i in range(4)], 0, kw_t),
+            )
+            tt = self._ar(0, 129)
+            ht.src.begin_runner_step(ht.cm_box[0], ("r_tail",), (16384,), (0, 8), (tt, tt))
+            ht.impl.start_load_kv(None)
+            st_t = ht.src.step
+            exp_tail = (1 << 63) | (o1.layer_data_ptr(0) + 0x100000)
+            self.assertIn(exp_tail, st_t.page_bases("l0")[:, 0].view(torch.uint64).tolist())
+            self.assertGreaterEqual(len(ptrs_seen), 2)
+            done_flag = [False]
+            ev_hold = SimpleNamespace(query=lambda: done_flag[0], synchronize=lambda: done_flag.__setitem__(0, True))
+            self.assertIsNotNone(st_t.connector_metadata)
+            self.assertFalse(st_t.finish(completion=ev_hold))
+            self.assertIsNotNone(st_t.connector_metadata)
+            done_flag[0] = True
+            self.assertTrue(st_t.try_retire())
+            self.assertIsNone(st_t.connector_metadata)
+            ht.src.begin_runner_step(ht.cm_box[0], ("r_tail",), (16384,), (0, 8), (tt, tt))
+            ht.impl.start_load_kv(None)
+            st_c = ht.src.step
+            self.assertIsNotNone(st_c.connector_metadata)
+            st_c.cancel_unused()
+            self.assertIsNone(st_c.connector_metadata)
+            ht.src.step = None
+            self._close_src(ht.src)
+
+            o0_3, o1_3, o2_3 = _mk_obj(0x1000, 8192), _mk_obj(0x2000, 8192), _mk_obj(0x3000, 8192)
+            ptrs_seen_3: list[tuple[int, int]] = []
+
+            def _dva_mid(hp: int, bs: int) -> int:
+                ptrs_seen_3.append((hp, bs))
+                return (1 << 63) | (hp + 0x100000)
+
+            h3 = self._mk_src(4, banks=2, mc=256, dva=_dva_mid)
+            h3.cm_box[0] = self._cm(("r_mid_tamper", 24576))
+            cached_mid_bad = [
+                [
+                    (1 << 63) | (o0_3.layer_data_ptr(lid) + 0x100000),
+                    0xDEAD,
+                    (1 << 63) | (o2_3.layer_data_ptr(lid) + 0x100000),
+                ]
+                for lid in range(4)
+            ]
+            kw_3 = {
+                "req_id": "r_mid_tamper",
+                "cached_chunk_dev_ptrs": cached_mid_bad,
+                "_reuse_shared_dense_prefix": True,
+            }
+            h3.hook[0] = lambda _: (
+                next(h3.gc.batched_to_gpu([0, 8192, 16384], [8192, 16384, 24576], req_id="r_mid_tamper", kv_group=0)),
+                h3.eng._prepare_shared_prefill_sources(
+                    [self._LayerSrc((o0_3, o1_3, o2_3), i) for i in range(4)], 0, kw_3
+                ),
+            )
+            tt3 = self._ar(0, 193)
+            h3.src.begin_runner_step(h3.cm_box[0], ("r_mid_tamper",), (24576,), (0, 8), (tt3, tt3))
+            h3.impl.start_load_kv(None)
+            st_3 = h3.src.step
+            exp_mid = (1 << 63) | (o1_3.layer_data_ptr(0) + 0x100000)
+            self.assertIn(exp_mid, st_3.page_bases("l0")[:, 0].view(torch.uint64).tolist())
+            self.assertGreaterEqual(len(ptrs_seen_3), 3)
+            st_3.finish(completion=torch.npu.Event())
+            h3.src.step = None
+            self._close_src(h3.src)
+
+            h_no = self._mk_src(2)
+            self.assertTrue(callable(getattr(h_no.gc, "synchronize_selected_group0_skip", None)))
+            h_no.src.device = SimpleNamespace(type="npu")
+            meta_sync_calls: list[str] = []
+            copy_sync_calls: list[str] = []
+            h_no.src._metadata_stream = SimpleNamespace(synchronize=lambda: meta_sync_calls.append("meta"))
+
+            class _FakeRt:
+                def __init__(self, source: Any, copy_stream: Any) -> None:
+                    self.source = source
+                    self._copy_stream = copy_stream
+
+            fake_rt = _FakeRt(
+                h_no.src,
+                SimpleNamespace(synchronize=lambda: copy_sync_calls.append("copy")),
+            )
+            skv._ACTIVE_RUNTIMES.add(fake_rt)
+            try:
+                with patch.object(torch.npu, "synchronize", create=True) as mock_npu_sync:
+                    h_no.gc.synchronize_selected_group0_skip()
+            finally:
+                skv._ACTIVE_RUNTIMES.discard(fake_rt)
+            self.assertEqual(meta_sync_calls, ["meta"])
+            self.assertEqual(copy_sync_calls, ["copy"])
+            mock_npu_sync.assert_called_once_with(h_no.src.device)
+            self._close_src(h_no.src, restore=False)
+            self.assertFalse(hasattr(h_no.gc, "synchronize_selected_group0_skip"))
+
+            orig_sync = lambda: "orig"
+            h_had = self._mk_src(2, eg={"synchronize_selected_group0_skip": orig_sync})
+            self.assertIsNot(h_had.gc.synchronize_selected_group0_skip, orig_sync)
+            self._close_src(h_had.src, restore=False)
+            self.assertIs(h_had.gc.synchronize_selected_group0_skip, orig_sync)
+
+    def test_nonvectorized_dva_tamper_and_skew_fallback_retention(self) -> None:
+        with _fake_npu():
+            nl = 4
+            o0, o1, o2 = _mk_obj(0x1000, 4096), _mk_obj(0x2000, 4096), _mk_obj(0x3000, 8192)
+            pages_src = (o0, o1, o2)
+            for o, toks in ((o0, 4096), (o1, 4096), (o2, 8192)):
+                o.num_layers = nl
+                o.valid = True
+                o.layer_size = toks * skv.MAIN_ROW_BYTES
+                o.layer_size_bytes = lambda _lid, sz=o.layer_size: sz
+
+            dva_calls: list[tuple[int, int]] = []
+
+            def _dva_fn(hp: int, bs: int) -> int:
+                dva_calls.append((hp, bs))
+                return (1 << 63) | (hp + 0x100000)
+
+            h = self._mk_src(nl, banks=2, mc=256, dva=_dva_fn)
+            tbl0, tbl1 = self._ar(0, 129), self._ar(127, 256)
+            cm_gold = self._cm(("r_gold", 16384))
+            h.cm_box[0] = cm_gold
+            h.hook[0] = lambda _: (
+                next(h.gc.batched_to_gpu([0, 4096, 8192], [4096, 8192, 16384], req_id="r_gold", kv_group=0)),
+                h.eng._prepare_shared_prefill_sources(
+                    [self._LayerSrc(pages_src, i) for i in range(nl)],
+                    0,
+                    {"req_id": "r_gold", "cached_chunk_dev_ptrs": [], "_reuse_shared_dense_prefix": False},
+                ),
+            )
+            h.src.begin_runner_step(cm_gold, ("r_gold",), (16384,), (0, 8), (tbl0, tbl1))
+            h.impl.start_load_kv(None)
+            st_gold = h.src.step
+            golden = [st_gold.page_bases(n).view(torch.uint64).clone() for n in h.layers]
+            st_gold.finish(completion=torch.npu.Event())
+            h.src._prune_retired_steps()
+
+            # 1a) Non-vectorized path (distinct MemoryObj instances per layer => objs[k] is not objs0[k])
+            h.src._dva_cache.clear()
+            dva_calls.clear()
+            nv_layers: list[tuple[Any, Any, Any]] = []
+            for lid in range(nl):
+                lo0 = _mk_obj(0x10000 * (lid + 1) + 0x1000, 4096)
+                lo1 = _mk_obj(0x10000 * (lid + 1) + 0x2000, 4096)
+                lo2 = _mk_obj(0x10000 * (lid + 1) + 0x3000, 8192)
+                for lo, toks in ((lo0, 4096), (lo1, 4096), (lo2, 8192)):
+                    lo.num_layers = nl
+                    lo.valid = True
+                    lo.layer_size = toks * skv.MAIN_ROW_BYTES
+                    lo.layer_size_bytes = lambda _lid, sz=lo.layer_size: sz
+                nv_layers.append((lo0, lo1, lo2))
+
+            cm_nv_gold = self._cm(("r_nv_gold", 16384))
+            h.cm_box[0] = cm_nv_gold
+            h.hook[0] = lambda _: (
+                next(h.gc.batched_to_gpu([0, 4096, 8192], [4096, 8192, 16384], req_id="r_nv_gold", kv_group=0)),
+                h.eng._prepare_shared_prefill_sources(
+                    [self._LayerSrc(nv_layers[i], i) for i in range(nl)],
+                    0,
+                    {"req_id": "r_nv_gold", "cached_chunk_dev_ptrs": [], "_reuse_shared_dense_prefix": False},
+                ),
+            )
+            h.src.begin_runner_step(cm_nv_gold, ("r_nv_gold",), (16384,), (0, 8), (tbl0, tbl1))
+            h.impl.start_load_kv(None)
+            st_nv_gold = h.src.step
+            nv_golden = [st_nv_gold.page_bases(n).view(torch.uint64).clone() for n in h.layers]
+            st_nv_gold.finish(completion=torch.npu.Event())
+            h.src._prune_retired_steps()
+
+            h.src._dva_cache.clear()
+            dva_calls.clear()
+            cached_nv = [[(1 << 63) | (o.layer_data_ptr(lid) + 0x100000) for o in nv_layers[lid]] for lid in range(nl)]
+            cached_nv[1][1] = 0xDEAD
+            cm_nv = self._cm(("r_nv", 16384))
+            h.cm_box[0] = cm_nv
+            h.hook[0] = lambda _: (
+                next(h.gc.batched_to_gpu([0, 4096, 8192], [4096, 8192, 16384], req_id="r_nv", kv_group=0)),
+                h.eng._prepare_shared_prefill_sources(
+                    [self._LayerSrc(nv_layers[i], i) for i in range(nl)],
+                    0,
+                    {"req_id": "r_nv", "cached_chunk_dev_ptrs": cached_nv, "_reuse_shared_dense_prefix": True},
+                ),
+            )
+            h.src.begin_runner_step(cm_nv, ("r_nv",), (16384,), (0, 8), (tbl0, tbl1))
+            h.impl.start_load_kv(None)
+            st_nv = h.src.step
+            for lid, n in enumerate(h.layers):
+                self.assertTrue(torch.equal(st_nv.page_bases(n).view(torch.uint64), nv_golden[lid]))
+            self.assertIn((nv_layers[1][1].layer_data_ptr(1), nv_layers[1][1].layer_size_bytes(1)), dva_calls)
+            st_nv.finish(completion=torch.npu.Event())
+            h.src._prune_retired_steps()
+
+            # 1b) Vectorized path (shared pages_src tuple => can_vectorize == True) with ptrs[1][1] = 0 out-of-range
+            h.src._dva_cache.clear()
+            dva_calls.clear()
+            cached_vec = [[(1 << 63) | (o.layer_data_ptr(lid) + 0x100000) for o in pages_src] for lid in range(nl)]
+            cached_vec[1][1] = 0
+            cm_vec = self._cm(("r_vec", 16384))
+            h.cm_box[0] = cm_vec
+            h.hook[0] = lambda _: (
+                next(h.gc.batched_to_gpu([0, 4096, 8192], [4096, 8192, 16384], req_id="r_vec", kv_group=0)),
+                h.eng._prepare_shared_prefill_sources(
+                    [self._LayerSrc(pages_src, i) for i in range(nl)],
+                    0,
+                    {"req_id": "r_vec", "cached_chunk_dev_ptrs": cached_vec, "_reuse_shared_dense_prefix": True},
+                ),
+            )
+            h.src.begin_runner_step(cm_vec, ("r_vec",), (16384,), (0, 8), (tbl0, tbl1))
+            h.impl.start_load_kv(None)
+            st_vec = h.src.step
+            for lid, n in enumerate(h.layers):
+                self.assertTrue(torch.equal(st_vec.page_bases(n).view(torch.uint64), golden[lid]))
+            self.assertIn((o1.layer_data_ptr(1), o1.layer_size_bytes(1)), dva_calls)
+            st_vec.finish(completion=torch.npu.Event())
+            h.src._prune_retired_steps()
+            self._close_src(h.src)
+
+            # 2) Rolling-upgrade skew: impl lacks _sync_recompute_fallback_from_engine
+            o_sk = self._sh_obj(0x9000, 16384, nl)
+            h_sk = self._mk_src(
+                nl,
+                eg={
+                    "batched_to_gpu": lambda *_a, **_k: iter([None]),
+                    "prepare_layerwise_prefill_group0_skip": self._nop,
+                },
+                ee={"_should_use_shared_layerwise_retrieve": lambda g: g == 0, "_recompute_fallback_req_ids": set()},
+            )
+            self.assertFalse(hasattr(h_sk.impl, "_sync_recompute_fallback_from_engine"))
+            tbl_sk = self._ar(0, 130)
+
+            def _orig_skew(_):
+                sc = h_sk.src.step
+                assert sc is not None
+                h_sk.src._retain_objs(sc, [o_sk])
+                h_sk.eng._recompute_fallback_req_ids.add("req_skew")
+
+            h_sk.hook[0] = _orig_skew
+            cm_sk = self._cm(("req_skew", 16384, True, False, 0))
+            h_sk.cm_box[0] = cm_sk
+            h_sk.src.begin_runner_step(cm_sk, ("req_skew",), (16384,), (0, 8), (tbl_sk, tbl_sk))
+            h_sk.impl.start_load_kv(None)
+            self.assertEqual(h_sk.eng._recompute_fallback_req_ids, set())
+            self.assertEqual(h_sk.impl._step_recompute_fallback_req_ids, {"req_skew"})
+
+            cm_next = self._cm(("req_next", 16384, True, False, 0))
+            h_sk.cm_box[0] = cm_next
+            kw_next: dict[str, Any] = {
+                "req_id": "req_next",
+                "_shared_prefill_starts": [0],
+                "_shared_prefill_ends": [16384],
+            }
+            next_src = [self._LayerSrc((o_sk,), i) for i in range(nl)]
+            h_sk.hook[0] = lambda _: h_sk.eng._prepare_shared_prefill_sources(next_src, 0, kw_next)
+            h_sk.src.begin_runner_step(cm_next, ("req_next",), (16384,), (0, 8), (tbl_sk, tbl_sk))
+            h_sk.impl.start_load_kv(None)
+            self.assertEqual(h_sk.impl._step_recompute_fallback_req_ids, set())
+            s_next = h_sk.src.step
+            self.assertIsNotNone(s_next)
+            s_next.finish(completion=torch.npu.Event())
+            self.assertTrue(s_next.try_retire())
+            self._close_src(h_sk.src)
+
+    def test_inference_mode_storer_overlap_guard_and_omit_token_handoff(self) -> None:
+        def _outer_gen_dec(fn: Any) -> Any:
+            def _wrapped(*args: Any, **kwargs: Any) -> Any:
+                inner = fn(*args, **kwargs)
+                yield from inner
+
+            return _wrapped
+
+        @_outer_gen_dec
+        @torch.inference_mode()
+        def _suspended_store_layer(starts: list[int]) -> Any:
+            yield starts
+            yield None
+
+        with _fake_npu():
+            # 1a) Positive path: kv_group==0 starts=[16384] >= omit_end_token=16384 passes,
+            #     kv_group==1 starts=[0] is ignored, and impl._selected_group0_omit_end_tokens is populated.
+            storers: dict[tuple[Any, ...], Any] = {}
+            seen_omit_maps: list[dict[str, int]] = []
+            h = self._mk_src(
+                4,
+                eg={"prepare_layerwise_prefill_group0_skip": self._nop},
+                ee={"_should_use_shared_layerwise_retrieve": lambda g: g == 0},
+                ei={"_layerwise_save_storers": storers},
+            )
+            o_pos = self._sh_obj(0x9000, 16384, 4)
+            tbl = self._ar(0, 130)
+            cm_pos = self._cm(("req_pos", 16384, True, False, 0))
+            h.cm_box[0] = cm_pos
+
+            def _orig_pos(_: Any) -> None:
+                seen_omit_maps.append(dict(h.impl._selected_group0_omit_end_tokens))
+                st_g0 = _suspended_store_layer([16384])
+                st_g1 = _suspended_store_layer([0])
+                next(st_g0)
+                next(st_g1)
+                storers[("req_pos", "normal_save", 0, 0, 20480)] = st_g0
+                storers[("req_pos", "normal_save", 1, 0, 20480)] = st_g1
+                h.eng._prepare_shared_prefill_sources(
+                    [self._LayerSrc((o_pos,), i) for i in range(4)],
+                    0,
+                    {"req_id": "req_pos", "_shared_prefill_starts": [0], "_shared_prefill_ends": [16384]},
+                )
+
+            h.hook[0] = _orig_pos
+            h.src.begin_runner_step(cm_pos, ("req_pos",), (16384,), (0, 8), (tbl, tbl))
+            h.impl.start_load_kv(None)
+            self.assertEqual(seen_omit_maps, [{"req_pos": 16384}])
+            for g in storers.values():
+                g.close()
+            storers.clear()
+            st_pos = h.src.step
+            self.assertIsNotNone(st_pos)
+            st_pos.finish(completion=torch.npu.Event())
+            h.src._prune_retired_steps()
+            self._close_src(h.src)
+
+            # 1b) Fail-closed path: kv_group==0 @torch.inference_mode() storer with starts=[16256] < 16384 raises,
+            #     invokes retrieve/save abort hooks, and clears _selected_group0_omit_end_tokens.
+            aborts: list[tuple[str, tuple[str, ...]]] = []
+            storers_ov: dict[tuple[Any, ...], Any] = {}
+            h_ov = self._mk_src(
+                4,
+                eg={"prepare_layerwise_prefill_group0_skip": self._nop},
+                ee={"_should_use_shared_layerwise_retrieve": lambda g: g == 0},
+                ei={
+                    "_layerwise_save_storers": storers_ov,
+                    "_abort_layerwise_retrieve_step": lambda rq: aborts.append(
+                        ("ret", tuple(str(r.req_id) for r in rq))
+                    ),
+                    "_abort_save_step": lambda rq: aborts.append(("save", tuple(str(r.req_id) for r in rq))),
+                },
+            )
+            o_ov = self._sh_obj(0x9000, 16384, 4)
+            cm_ov = self._cm(("req_ov", 16384, True, False, 0))
+            h_ov.cm_box[0] = cm_ov
+
+            def _orig_ov(_: Any) -> None:
+                st_bad = _suspended_store_layer([16256])
+                next(st_bad)
+                storers_ov[("req_ov", "normal_save", 0, 0, 20480)] = st_bad
+                h_ov.eng._prepare_shared_prefill_sources(
+                    [self._LayerSrc((o_ov,), i) for i in range(4)],
+                    0,
+                    {"req_id": "req_ov", "_shared_prefill_starts": [0], "_shared_prefill_ends": [16384]},
+                )
+
+            h_ov.hook[0] = _orig_ov
+            h_ov.src.begin_runner_step(cm_ov, ("req_ov",), (16384,), (0, 8), (tbl, tbl))
+            with self.assertRaisesRegex(RuntimeError, r"Save overlaps omitted: req_ov"):
+                h_ov.impl.start_load_kv(None)
+            self.assertEqual(aborts, [("ret", ("req_ov",)), ("save", ("req_ov",))])
+            self.assertEqual(h_ov.impl._selected_group0_omit_end_tokens, {})
+            for g in storers_ov.values():
+                g.close()
+            for fn in reversed(h_ov.src._restorers):
+                fn()
+
+            # 2) Rolling-upgrade skew: impl lacks _supports_selected_group0_omit_skip.
+            def _orig_prep(req: Any, _save_spec: Any, _kv_group: int, *_a: Any, **_kw: Any) -> tuple[Any, ...]:
+                toks = list(req.token_ids)
+                smap = torch.arange(len(toks), dtype=torch.int64)
+                ones = torch.ones(len(toks), dtype=torch.bool)
+                return (toks, smap, ones, 0, {"_prefill_metadata_cache": object()}, False)
+
+            h_rw = self._mk_src(
+                4,
+                mc=640,
+                eg={"prepare_layerwise_prefill_group0_skip": self._nop},
+                ee={
+                    "_should_use_shared_layerwise_retrieve": lambda g: g == 0,
+                    "_recompute_fallback_req_ids": set(),
+                },
+                ei={"_prepare_layerwise_store_inputs": _orig_prep, "kv_role": "kv_producer"},
+            )
+            self.assertFalse(bool(getattr(type(h_rw.impl), "_supports_selected_group0_omit_skip", False)))
+            self.assertIsNot(h_rw.impl._prepare_layerwise_store_inputs, _orig_prep)
+
+            o_rw = self._sh_obj(0x9000, 16384, 4)
+            cm_rw = self._cm(
+                ("req_rw", 16384, True, False, 0),
+                ("req_short", 16384, True, False, 0),
+                ("req_fb", 16384, True, False, 0),
+                ("req_fb_step", 16384, True, False, 0),
+            )
+            h_rw.cm_box[0] = cm_rw
+            tbl_rw = np.stack([np.arange(i * 130, (i + 1) * 130, dtype=np.int32) for i in range(4)])
+            captured: dict[str, Any] = {}
+
+            def _orig_rw(_: Any) -> None:
+                h_rw.eng._recompute_fallback_req_ids.add("req_fb")
+                for rid in ("req_rw", "req_short", "req_fb_step"):
+                    h_rw.eng._prepare_shared_prefill_sources(
+                        [self._LayerSrc((o_rw,), i) for i in range(4)],
+                        0,
+                        {"req_id": rid, "_shared_prefill_starts": [0], "_shared_prefill_ends": [16384]},
+                    )
+                req_rw = SimpleNamespace(
+                    req_id="req_rw",
+                    token_ids=list(range(20480)),
+                    is_sparse_decode=False,
+                    is_decode_window_save=False,
+                )
+                req_short = SimpleNamespace(
+                    req_id="req_short",
+                    token_ids=list(range(16384)),
+                    is_sparse_decode=False,
+                    is_decode_window_save=False,
+                )
+                req_fb = SimpleNamespace(
+                    req_id="req_fb",
+                    token_ids=list(range(20480)),
+                    is_sparse_decode=False,
+                    is_decode_window_save=False,
+                )
+                req_fb_step = SimpleNamespace(
+                    req_id="req_fb_step",
+                    token_ids=list(range(20480)),
+                    is_sparse_decode=False,
+                    is_decode_window_save=False,
+                )
+                captured["g0"] = h_rw.impl._prepare_layerwise_store_inputs(req_rw, None, 0)
+                captured["g1"] = h_rw.impl._prepare_layerwise_store_inputs(req_rw, None, 1)
+                captured["short"] = h_rw.impl._prepare_layerwise_store_inputs(req_short, None, 0)
+                captured["fb"] = h_rw.impl._prepare_layerwise_store_inputs(req_fb, None, 0)
+                h_rw.impl._step_recompute_fallback_req_ids = {"req_fb_step"}
+                captured["fb_step"] = h_rw.impl._prepare_layerwise_store_inputs(req_fb_step, None, 0)
+
+            h_rw.hook[0] = _orig_rw
+            h_rw.src.begin_runner_step(
+                cm_rw,
+                ("req_rw", "req_short", "req_fb", "req_fb_step"),
+                (16384, 16384, 16384, 16384),
+                (0, 8, 16, 24, 32),
+                (tbl_rw, tbl_rw),
+            )
+            h_rw.impl.start_load_kv(None)
+            toks_0, _smap_0, smask_0, skip_0, skw_0, _win_0 = captured["g0"]
+            self.assertEqual(len(toks_0), 20480)
+            self.assertEqual(skip_0, 16384)
+            self.assertFalse(bool(smask_0[:16384].any()))
+            self.assertTrue(bool(smask_0[16384:].all()))
+            self.assertEqual(skw_0["_prefill_skip_tokens"], 16384)
+            self.assertEqual(skw_0["_unverified_prefix_skip_tokens"], 16384)
+            self.assertEqual(captured["g1"][3], 0)
+            self.assertTrue(bool(captured["g1"][2][:16384].all()))
+            self.assertIsNone(captured["short"])
+            self.assertEqual(captured["fb"][3], 0)
+            self.assertTrue(bool(captured["fb"][2][:16384].all()))
+            self.assertEqual(captured["fb_step"][3], 0)
+            self.assertTrue(bool(captured["fb_step"][2][:16384].all()))
+
+            st_rw = h_rw.src.step
+            self.assertIsNotNone(st_rw)
+            st_rw.finish(completion=torch.npu.Event())
+            h_rw.src._prune_retired_steps()
+            self._close_src(h_rw.src)
+            self.assertIs(h_rw.impl._prepare_layerwise_store_inputs, _orig_prep)
+
+    def test_dsa_cp_multi_row_plan_topk_buf_causality_masking(self) -> None:
+        nop = self._nop
+        z = lambda k: torch.zeros((8, 128, 1, k), dtype=torch.bfloat16)
+        ow = {"l0": "l0", "l1": "l0"}
+        caches = {n: (z(512), z(64)) for n in ow}
+        built: list[torch.Tensor] = []
+        loads: list[tuple[Any, ...]] = []
+        pl = SimpleNamespace(
+            built=built,
+            loads=loads,
+            build=lambda t, h, s, q: (
+                built.append(t.clone()),
+                built.append(t),
+                (
+                    torch.zeros((len(h), 128), dtype=torch.int32),
+                    torch.tensor([[0, qv, qv, 0, 0, 0, 0, 0] for qv in q], dtype=torch.int32),
+                ),
+            )[2],
+            load_mla=lambda *a: loads.append(a),
+            release_quiescent=nop,
+            close_quiescent=nop,
+        )
+        vc = _vcfg(
+            par=SimpleNamespace(
+                tensor_parallel_size=4,
+                pipeline_parallel_size=1,
+                prefill_context_parallel_size=1,
+                decode_context_parallel_size=1,
+            ),
+            sched=SimpleNamespace(async_scheduling=True, max_num_batched_tokens=8192, max_num_seqs=8),
+        )
+        src = SimpleNamespace(step=None, _failed=False, close=nop)
+
+        def _ev():
+            return SimpleNamespace(record=nop, query=lambda: True, synchronize=nop)
+
+        st = SimpleNamespace(
+            requests=[
+                lms.SelectedRequest("r0", 16384, 134, True, 16384),
+                lms.SelectedRequest("r1", 16384, 3, True, 16384),
+            ],
+            _finished=False,
+            _closed=False,
+            page_bases=lambda n: torch.zeros((8, 2), dtype=torch.uint64),
+            ready=lambda n: torch.npu.Event(),
+            wait_main_slot_ready=nop,
+            prefetch_main=lambda n, fn: fn(),
+            wait_completion=nop,
+            finish=lambda *, completion=None, failed=False: setattr(st, "_finished", True),
+            try_retire=lambda: setattr(st, "_closed", True) or True,
+        )
+        src.step = st
+        with _fake_npu():
+            rt = psr.SelectedKVRuntime(
+                SimpleNamespace(device="cpu", vllm_config=vc),
+                owner_by_layer=ow,
+                main_caches=caches,
+                source=src,
+                planner=pl,
+                dsa_cp=True,
+            )
+            # TP=4, total=137, pad=512 (local_rows=128). Rank 1 owns [128, 137):
+            # r0 has q_off0=128, q0=6 at starts[0]=0; r1 has q1=3 at starts[1]=6.
+            cp_ctx = SimpleNamespace(local_start=128, local_end=137, local_end_with_pad=256, num_tokens_pad=512)
+            metas = {
+                ln: SimpleNamespace(
+                    block_table=torch.zeros((8, 160), dtype=torch.int32),
+                    num_actual_tokens=137,
+                    block_size=128,
+                    dsa_cp_context=cp_ctx,
+                )
+                for ln in ow
+            }
+            rt.bind_step(st, ("r0", "r1"), (16384, 16384), (0, 134, 137), metas)
+            self.assertEqual(
+                (rt._active_selected_indices, rt._query_offsets, rt.starts, rt.queries),
+                ((0, 1), [128, 0], [0, 6], [6, 3]),
+            )
+            h0, h1, limit0 = 16384, 16384, 16384 + 134
+            topk = torch.full((128, 1, skv.TOPK), -1, dtype=torch.int32)
+            for row in range(6):
+                topk[row, 0, :8] = torch.tensor(
+                    [0, h0 - 1, h0, h0 + 128, h0 + 128 + row, limit0 - 1, limit0, -2], dtype=torch.int32
+                )
+            for row in range(6, 9):
+                topk[row, 0, :7] = torch.tensor(
+                    [h0, h0 + 128, limit0 - 1, h1 - 1, h1, h1 + (row - 6), limit0], dtype=torch.int32
+                )
+            topk[9:12, 0, 0] = 777
+            topk_orig = topk.clone()
+            plan_buf_ptr = rt._plan_topk_buf.data_ptr()
+            rt.load("l0", topk, caches["l0"], metas["l0"])
+            rt.prefetch_next("l0", metas["l0"])
+            rt.load("l1", topk, caches["l1"], metas["l1"])
+            rt.finish_step()
+            rt.close()
+
+            self.assertTrue(torch.equal(topk, topk_orig))
+            self.assertEqual(built[1].data_ptr(), plan_buf_ptr)
+            plan_snap = built[0]
+            self.assertEqual(tuple(plan_snap.shape), (9, 1, skv.TOPK))
+            for row in range(6):
+                self.assertEqual(
+                    plan_snap[row, 0, :8].tolist(),
+                    [0, h0 - 1, -1, -1, -1, -1, limit0, -2],
+                )
+            for row in range(6, 9):
+                self.assertTrue(torch.equal(plan_snap[row], topk_orig[row]))
+
+    def test_dsa_cp_target_empty_to_draft_active_with_host_meta_ring(self) -> None:
+        nop = self._nop
+        z = lambda k: torch.zeros((8, 128, 1, k), dtype=torch.bfloat16)
+        ow = {"l0": "l0", "l1": "l0", "l2": "l2"}
+        caches = {n: (z(512), z(64)) for n in ow}
+        vc = _vcfg(
+            par=SimpleNamespace(
+                tensor_parallel_size=4,
+                pipeline_parallel_size=1,
+                prefill_context_parallel_size=1,
+                decode_context_parallel_size=1,
+            ),
+            sched=SimpleNamespace(async_scheduling=True, max_num_batched_tokens=8192, max_num_seqs=8),
+        )
+        built: list[torch.Tensor] = []
+        loads: list[Any] = []
+        pl = SimpleNamespace(
+            built=built,
+            loads=loads,
+            build=lambda t, h, s, q: (
+                built.append(t),
+                (
+                    torch.zeros((len(h), 128), dtype=torch.int32),
+                    torch.tensor([[0, qv, qv, 0, 0, 0, 0, 0] for qv in q], dtype=torch.int32),
+                ),
+            )[1],
+            load_mla=lambda *a: loads.append(a),
+            release_quiescent=nop,
+            close_quiescent=nop,
+        )
+        src = SimpleNamespace(step=None, _failed=False, close=nop)
+
+        def _mk_step():
+            s = SimpleNamespace(
+                requests=[
+                    lms.SelectedRequest("r0", 128, 4, False, 0),
+                    lms.SelectedRequest("r1", 16384, 4, True, 16384),
+                ],
+                _finished=False,
+                _closed=False,
+                page_bases=lambda n: torch.zeros((8, 2), dtype=torch.uint64),
+                ready=lambda n: torch.npu.Event(),
+                wait_main_slot_ready=nop,
+                prefetch_main=lambda n, fn: fn(),
+                wait_completion=nop,
+                finish=lambda *, completion=None, failed=False: setattr(s, "_finished", True),
+                try_retire=lambda: setattr(s, "_closed", True) or True,
+            )
+            return s
+
+        with _fake_npu():
+            rt = psr.SelectedKVRuntime(
+                SimpleNamespace(device="cpu", vllm_config=vc),
+                owner_by_layer=ow,
+                main_caches=caches,
+                source=src,
+                planner=pl,
+                draft_layer_names=("l2",),
+                dsa_cp=True,
+            )
+            cp_tgt = SimpleNamespace(local_start=2, local_end=4, local_end_with_pad=4, num_tokens_pad=8)
+            cp_dr = SimpleNamespace(local_start=1, local_end=2, local_end_with_pad=2, num_tokens_pad=4)
+            tgt_metas = {
+                ln: SimpleNamespace(
+                    block_table=torch.zeros((8, 160), dtype=torch.int32),
+                    num_actual_tokens=8,
+                    block_size=128,
+                    dsa_cp_context=cp_tgt,
+                )
+                for ln in ow
+            }
+            dr_metas = {
+                "l2": SimpleNamespace(
+                    block_table=torch.zeros((8, 160), dtype=torch.int32),
+                    num_actual_tokens=4,
+                    block_size=128,
+                    dsa_cp_context=cp_dr,
+                )
+            }
+            for step_idx in range(2):
+                src.step = st = _mk_step()
+                rt.bind_step(st, ("r0", "r1"), (128, 16384), (0, 4, 8), tgt_metas)
+                self.assertEqual((rt._active_selected_indices, rt.request_metadata), ((), None))
+                topk_tgt = torch.zeros((2, 1, skv.TOPK), dtype=torch.int32)
+                rt.load("l0", topk_tgt, caches["l0"], tgt_metas["l0"])
+                rt.prefetch_next("l0", tgt_metas["l0"])
+                rt.load("l1", topk_tgt, caches["l1"], tgt_metas["l1"])
+                self.assertEqual((len(built), len(loads)), (step_idx, step_idx))
+                rt.defer_to_draft_step()
+
+                rt.bind_draft_step(
+                    dr_metas,
+                    SimpleNamespace(query_start_loc_cpu=[0, 1, 4], seq_lens_cpu=[129, 16387]),
+                )
+                slot = step_idx % 2
+                self.assertEqual((rt._active_selected_indices, rt._cur_meta_slot), ((1,), slot))
+                self.assertIs(rt._host_meta, rt._host_meta_ring[slot])
+                self.assertEqual(rt.request_metadata.tolist(), [[1, 16384, 0, 1]])
+                self.assertEqual(rt._host_meta_ring[slot][1, :1].tolist(), [[1, 16384, 0, 1]])
+                self.assertIsNotNone(rt._meta_upload_events[slot])
+                rt.load("l2", torch.zeros((1, 1, skv.TOPK), dtype=torch.int32), caches["l2"], dr_metas["l2"])
+                rt.finish_step()
+                self.assertEqual((len(built), len(loads)), (step_idx + 1, step_idx + 1))
+                rt._retire_previous()
+                self.assertTrue(st._closed)
+            rt.close()
+
+    def test_dsa_cp_4rank_lockstep_inflight2_m2_vec_omit_clamp_and_admission_retirement(self) -> None:
+        cfg, _CtrlEv, _build_env, _run_step = self._pipe_setup()
+        ev_done = {"s0": False, "s1": False}
+        cur_step_key: list[str | None] = [None]
+
+        class _StepEv:
+            def __init__(self, key: str | None = None) -> None:
+                self._k = cur_step_key[0] if key is None else key
+                self.recorded_on: int | None = None
+
+            def record(self, stream=None) -> None:
+                self.recorded_on = int((stream or torch.npu.current_stream()).npu_stream)
+
+            def query(self) -> bool:
+                return True if self._k is None else bool(ev_done[self._k])
+
+            def synchronize(self) -> None:
+                if self._k is not None:
+                    ev_done[self._k] = True
+
+        ekw = {"VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE": True, "VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS": 2}
+        with _fake_npu(), patch.object(torch.npu, "Event", _StepEv), patch.multiple(envs_ascend, **ekw):
+            ranks = []
+            for rank in range(4):
+                e = _build_env()
+                for m in e.rn.compilation_config.static_forward_context.values():
+                    m.impl.enable_dsa_cp = True
+                    m.impl.tp_size = 4
+                e.rn.enable_dsa_cp = True
+                e.rn.vllm_config = _vcfg(
+                    par=SimpleNamespace(
+                        tensor_parallel_size=4,
+                        pipeline_parallel_size=1,
+                        prefill_context_parallel_size=1,
+                        decode_context_parallel_size=1,
+                    ),
+                    sched=SimpleNamespace(async_scheduling=True, max_num_batched_tokens=8192, max_num_seqs=8),
+                )
+                btg_calls: list[str] = []
+
+                def _btg(*_a: Any, _calls: list[str] = btg_calls, **k: Any) -> Any:
+                    _calls.append(str(k.get("req_id", "")))
+                    while True:
+                        yield
+
+                def _orig_prep(req: Any, _save_spec: Any, _kv_group: int, *_a: Any, **_kw: Any) -> tuple[Any, ...]:
+                    toks = list(req.token_ids)
+                    return (
+                        toks,
+                        torch.arange(len(toks), dtype=torch.int64),
+                        torch.ones(len(toks), dtype=torch.bool),
+                        0,
+                        {},
+                        False,
+                    )
+
+                e.gc.batched_to_gpu = _btg
+                e.gc.prepare_layerwise_prefill_group0_skip = self._nop
+                e.eng._should_use_shared_layerwise_retrieve = lambda g: g == 0
+                e.impl._should_skip_group0_prefill_dma = self._nop
+                e.impl._prepare_layerwise_store_inputs = _orig_prep
+                e.impl.kv_role = "kv_producer"
+                e.impl._layerwise_save_storers = {}
+                e.btg_calls = btg_calls
+
+                with (
+                    patch.dict(sys.modules, e.mods),
+                    patch.object(ctypes, "CDLL", side_effect=[e.fl, e.ml]),
+                    patch.object(torch, "ops", e.fops),
+                ):
+                    skv.reserve_selected_kv_workspace(e.wk, 2 << 30)
+                    skv.initialize_selected_kv(e.rn, None, e.kv_c)
+                ranks.append(e)
+
+            try:
+                # Step 0 (inflight slot 0): r_hit (16384 hist, 200 query) straddles Rank 0/1;
+                # r_miss (selected=False, 128 hist, 312 query) spans Rank 1..3. Total=512, TP=4 -> 128/rank.
+                o_sh0 = self._sh_obj(0x9000, 16384, 3)
+                o_sh0.ls_calls = []
+                o_sh0.layer_size_bytes = lambda lid, _o=o_sh0: (_o.ls_calls.append(lid), 16384 * skv.MAIN_ROW_BYTES)[1]
+                ptrs0 = tuple([o_sh0.layer_data_ptr(lid) + 0x100000] for lid in range(3))
+                tbl0 = np.stack([self._ar(0, 132, d2=False), self._ar(140, 272, d2=False)])
+                skip_maps, omit_maps, clamp_results = [], [], []
+                steps0 = []
+
+                for rank, e in enumerate(ranks):
+                    rt, src = e.rn.selected_kv_runtime, e.rn.selected_kv_runtime.source
+                    self._set_batch(e.rn, e.tbl_box, ["r_hit", "r_miss"], [0, 200, 512], tbl0)
+                    e.rn.input_batch.num_computed_tokens_cpu = np.array([16384, 128], dtype=np.int32)
+                    cm0 = self._cm(("r_hit", 16384, True, False, 0), ("r_miss", 128, True, False, 0))
+
+                    pages0 = (o_sh0,)
+
+                    def _hook0(_: Any, _e: Any = e, _r: int = rank, _p0: tuple[Any, ...] = pages0) -> None:
+                        skip_maps.append(frozenset(_e.impl._selected_skip_group0_dma_req_ids))
+                        omit_maps.append(dict(_e.impl._selected_group0_omit_end_tokens))
+                        _e.eng._prepare_shared_prefill_sources(
+                            [self._LayerSrc(_p0, i) for i in range(3)],
+                            0,
+                            {
+                                "req_id": "r_hit",
+                                "_shared_prefill_starts": [0],
+                                "_shared_prefill_ends": [16384],
+                                "cached_chunk_dev_ptrs": ptrs0,
+                                "_reuse_shared_dense_prefix": True,
+                            },
+                        )
+                        next(_e.gc.batched_to_gpu([0], [312], req_id="r_miss", kv_group=0))
+                        if _r == 0:
+                            req0 = SimpleNamespace(
+                                req_id="r_hit",
+                                token_ids=list(range(16384 + 200)),
+                                is_sparse_decode=False,
+                                is_decode_window_save=False,
+                            )
+                            clamp_results.append(_e.impl._prepare_layerwise_store_inputs(req0, None, 0))
+
+                    e.hook[0] = _hook0
+                    cp_ctx = SimpleNamespace(
+                        local_start=128 * rank,
+                        local_end=128 * (rank + 1),
+                        local_end_with_pad=128 * (rank + 1),
+                        num_tokens_pad=512,
+                    )
+                    am0 = {
+                        ln: SimpleNamespace(
+                            block_table=torch.zeros((8, 200), dtype=torch.int32),
+                            num_actual_tokens=512,
+                            block_size=128,
+                            dsa_cp_context=cp_ctx,
+                        )
+                        for ln in e.layers
+                    }
+                    self._prep_cm(e.rn, e.lmc_c, cm0, am0)
+                    st0 = src.step
+                    cur_step_key[0] = "s0"
+                    with skv.selected_kv_forward(
+                        e.rn, SimpleNamespace(kv_connector_metadata=cm0), am0, defer_finish=True
+                    ) as b:
+                        if rank in (0, 1):
+                            self.assertIn(0, rt._active_selected_indices)
+                        else:
+                            self.assertEqual(rt._active_selected_indices, ())
+                            self.assertIsNone(rt.request_metadata)
+                        tk = torch.zeros((128, 1, 2048), dtype=torch.int32)
+                        b.load(e.layers[0], tk, e.kv_c[e.layers[0]], am0[e.layers[0]])
+                        b.prefetch_next(e.layers[0], am0[e.layers[0]])
+                        b.load(e.layers[1], tk, e.kv_c[e.layers[1]], am0[e.layers[1]])
+                    # Total draft tokens = 2 -> Ranks 0,1 active (1 token each), Ranks 2,3 empty
+                    dr_ctx = SimpleNamespace(
+                        local_start=rank,
+                        local_end=min(rank + 1, 2),
+                        local_end_with_pad=rank + 1,
+                        num_tokens_pad=4,
+                    )
+                    dm0 = {
+                        e.layers[2]: SimpleNamespace(
+                            block_table=am0[e.layers[2]].block_table,
+                            num_actual_tokens=2,
+                            block_size=128,
+                            dsa_cp_context=dr_ctx,
+                        )
+                    }
+                    skv.bind_selected_kv_draft_metadata(
+                        e.rn, dm0, SimpleNamespace(query_start_loc_cpu=[0, 1, 2], seq_lens_cpu=[16385, 129])
+                    )
+                    with skv.selected_kv_draft_forward(e.rn):
+                        tk_d = torch.zeros((1, 1, 2048), dtype=torch.int32)
+                        dm0[e.layers[2]].selected_kv.load(e.layers[2], tk_d, e.kv_c[e.layers[2]], dm0[e.layers[2]])
+                    cur_step_key[0] = None
+                    self.assertTrue(st0._finished)
+                    self.assertFalse(st0._closed)
+                    steps0.append(st0)
+                    self.assertEqual(src.unretired_selected_request_ids(), frozenset({"r_hit"}))
+
+                self.assertEqual(skip_maps, [frozenset({"r_hit"})] * 4)
+                self.assertEqual(omit_maps, [{"r_hit": 16384}] * 4)
+                self.assertTrue(all(e.btg_calls == ["r_miss"] for e in ranks))
+                self.assertEqual(o_sh0.ls_calls, [0] * 12)  # 4 ranks * (1 row-dva check + 2 banks), no lid 1/2 calls
+                self.assertEqual(clamp_results[0][3], 16384)
+                self.assertFalse(bool(clamp_results[0][2][:16384].any()))
+
+                # Step 1 (inflight slot 1 while Step 0 still unretired!):
+                # r_s1 (16384 hist, 64 q) + r_ns1 (128 hist, 192 q), total=256, TP=4.
+                # Only Rank 0 owns r_s1; Ranks 1..3 have empty selected slice.
+                o_sh1 = self._sh_obj(0xB000, 16384, 3)
+                tbl1 = np.stack([self._ar(0, 130, d2=False), self._ar(140, 270, d2=False)])
+                steps1 = []
+                for rank, e in enumerate(ranks):
+                    rt, src = e.rn.selected_kv_runtime, e.rn.selected_kv_runtime.source
+                    self._set_batch(e.rn, e.tbl_box, ["r_s1", "r_ns1"], [0, 64, 256], tbl1)
+                    e.rn.input_batch.num_computed_tokens_cpu = np.array([16384, 128], dtype=np.int32)
+                    cm1 = self._cm(("r_s1", 16384, True, False, 0), ("r_ns1", 128, True, False, 0))
+                    e.hook[0] = lambda _arg, _e=e: (
+                        _e.eng._prepare_shared_prefill_sources(
+                            [self._LayerSrc((o_sh1,), i) for i in range(3)],
+                            0,
+                            {"req_id": "r_s1", "_shared_prefill_starts": [0], "_shared_prefill_ends": [16384]},
+                        ),
+                        next(_e.gc.batched_to_gpu([0], [192], req_id="r_ns1", kv_group=0)),
+                    )
+                    cp1 = SimpleNamespace(
+                        local_start=64 * rank,
+                        local_end=64 * (rank + 1),
+                        local_end_with_pad=64 * (rank + 1),
+                        num_tokens_pad=256,
+                    )
+                    am1 = {
+                        ln: SimpleNamespace(
+                            block_table=torch.zeros((8, 200), dtype=torch.int32),
+                            num_actual_tokens=256,
+                            block_size=128,
+                            dsa_cp_context=cp1,
+                        )
+                        for ln in e.layers
+                    }
+                    self._prep_cm(e.rn, e.lmc_c, cm1, am1)
+                    st1 = src.step
+                    self.assertEqual(steps0[rank]._host_slot, 0)
+                    self.assertEqual(st1._host_slot, 1)
+                    self.assertEqual(src.unretired_selected_request_ids(), frozenset({"r_hit", "r_s1"}))
+                    cur_step_key[0] = "s1"
+                    with skv.selected_kv_forward(
+                        e.rn, SimpleNamespace(kv_connector_metadata=cm1), am1, defer_finish=True
+                    ) as b:
+                        tk1 = torch.zeros((64, 1, 2048), dtype=torch.int32)
+                        b.load(e.layers[0], tk1, e.kv_c[e.layers[0]], am1[e.layers[0]])
+                        b.prefetch_next(e.layers[0], am1[e.layers[0]])
+                        b.load(e.layers[1], tk1, e.kv_c[e.layers[1]], am1[e.layers[1]])
+                    dr1 = SimpleNamespace(
+                        local_start=rank,
+                        local_end=min(rank + 1, 2),
+                        local_end_with_pad=rank + 1,
+                        num_tokens_pad=4,
+                    )
+                    dm1 = {
+                        e.layers[2]: SimpleNamespace(
+                            block_table=am1[e.layers[2]].block_table,
+                            num_actual_tokens=2,
+                            block_size=128,
+                            dsa_cp_context=dr1,
+                        )
+                    }
+                    skv.bind_selected_kv_draft_metadata(
+                        e.rn, dm1, SimpleNamespace(query_start_loc_cpu=[0, 1, 2], seq_lens_cpu=[16385, 129])
+                    )
+                    with skv.selected_kv_draft_forward(e.rn):
+                        dm1[e.layers[2]].selected_kv.load(
+                            e.layers[2],
+                            torch.zeros((1, 1, 2048), dtype=torch.int32),
+                            e.kv_c[e.layers[2]],
+                            dm1[e.layers[2]],
+                        )
+                    cur_step_key[0] = None
+                    self.assertTrue(st1._finished)
+                    self.assertFalse(st1._closed)
+                    steps1.append(st1)
+
+                # Retire Step 0 only -> Step 1 stays unretired
+                ev_done["s0"] = True
+                for rank, e in enumerate(ranks):
+                    e.eng.release_shared_cpu_sparse_request("r_hit")
+                    e.gc.release_layerwise_prefill_dma_cache("r_hit")
+                    self.assertEqual(
+                        e.rn.selected_kv_runtime.source.unretired_selected_request_ids(), frozenset({"r_s1"})
+                    )
+
+                # On Ranks 0..2 finish retiring Step 1 cleanly; on Rank 3 simulate quarantined failure
+                ev_done["s1"] = True
+                for rank in range(3):
+                    e = ranks[rank]
+                    e.eng.release_shared_cpu_sparse_request("r_s1")
+                    e.gc.release_layerwise_prefill_dma_cache("r_s1")
+                    self.assertEqual(e.rn.selected_kv_runtime.source.unretired_selected_request_ids(), frozenset())
+                    self.assertTrue(steps1[rank]._closed)
+                ranks[3].rn.selected_kv_runtime.fail(steps1[3])
+                self.assertTrue(ranks[3].rn.selected_kv_runtime.source._failed)
+                self.assertFalse(steps1[3]._closed)
+                self.assertEqual(
+                    ranks[3].rn.selected_kv_runtime.source.unretired_selected_request_ids(), frozenset({"r_s1"})
+                )
+            finally:
+                for rank, e in enumerate(ranks):
+                    src = e.rn.selected_kv_runtime.source
+                    try:
+                        if rank < 3:
+                            skv.close_selected_kv_worker(SimpleNamespace(model_runner=e.rn))
+                        else:
+                            self.assertRaisesRegex(RuntimeError, "retained", e.rn.selected_kv_runtime.close)
+                            self.assertRaisesRegex(RuntimeError, "retained", src.close)
+                    finally:
+                        for fn in reversed(src._restorers):
+                            fn()
+
+    def test_dsa_cp_unretired_retains_inflight_step0_when_step1_start_load_kv_raises(self) -> None:
+        _, _, _build_env, _ = self._pipe_setup()
+        ev_done = {"s0": False}
+        cur_step_key: list[str | None] = [None]
+
+        class _StepEv:
+            def __init__(self, key: str | None = None) -> None:
+                self._k = cur_step_key[0] if key is None else key
+                self.recorded_on: int | None = None
+
+            def record(self, stream=None) -> None:
+                self.recorded_on = int((stream or torch.npu.current_stream()).npu_stream)
+
+            def query(self) -> bool:
+                return True if self._k is None else bool(ev_done[self._k])
+
+            def synchronize(self) -> None:
+                if self._k is not None:
+                    ev_done[self._k] = True
+
+        ekw = {"VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE": True, "VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS": 2}
+        with _fake_npu(), patch.object(torch.npu, "Event", _StepEv), patch.multiple(envs_ascend, **ekw):
+            e = _build_env()
+            for m in e.rn.compilation_config.static_forward_context.values():
+                m.impl.enable_dsa_cp = True
+                m.impl.tp_size = 4
+            e.rn.enable_dsa_cp = True
+            e.rn.vllm_config = _vcfg(
+                par=SimpleNamespace(
+                    tensor_parallel_size=4,
+                    pipeline_parallel_size=1,
+                    prefill_context_parallel_size=1,
+                    decode_context_parallel_size=1,
+                ),
+                sched=SimpleNamespace(async_scheduling=True, max_num_batched_tokens=8192, max_num_seqs=8),
+            )
+            with (
+                patch.dict(sys.modules, e.mods),
+                patch.object(ctypes, "CDLL", side_effect=[e.fl, e.ml]),
+                patch.object(torch, "ops", e.fops),
+            ):
+                skv.reserve_selected_kv_workspace(e.wk, 2 << 30)
+                skv.initialize_selected_kv(e.rn, None, e.kv_c)
+
+            src = e.rn.selected_kv_runtime.source
+            try:
+                # Step 0 ("r_s0"): executed and still unclosed (completion query() == False).
+                o_sh0 = self._sh_obj(0x9000, 16384, 3)
+                tbl0 = np.stack([self._ar(0, 130, d2=False)])
+                self._set_batch(e.rn, e.tbl_box, ["r_s0"], [0, 128], tbl0)
+                cm0 = self._cm(("r_s0", 16384, True, False, 0))
+                e.hook[0] = lambda _arg: e.eng._prepare_shared_prefill_sources(
+                    [self._LayerSrc((o_sh0,), i) for i in range(3)],
+                    0,
+                    {"req_id": "r_s0", "_shared_prefill_starts": [0], "_shared_prefill_ends": [16384]},
+                )
+                cp_ctx = SimpleNamespace(local_start=0, local_end=32, local_end_with_pad=32, num_tokens_pad=128)
+                am0 = {
+                    ln: SimpleNamespace(
+                        block_table=torch.zeros((8, 200), dtype=torch.int32),
+                        num_actual_tokens=128,
+                        block_size=128,
+                        dsa_cp_context=cp_ctx,
+                    )
+                    for ln in e.layers
+                }
+                self._prep_cm(e.rn, e.lmc_c, cm0, am0)
+                st0 = src.step
+                cur_step_key[0] = "s0"
+                with skv.selected_kv_forward(
+                    e.rn, SimpleNamespace(kv_connector_metadata=cm0), am0, defer_finish=True
+                ) as b:
+                    tk0 = torch.zeros((32, 1, 2048), dtype=torch.int32)
+                    b.load(e.layers[0], tk0, e.kv_c[e.layers[0]], am0[e.layers[0]])
+                    b.prefetch_next(e.layers[0], am0[e.layers[0]])
+                    b.load(e.layers[1], tk0, e.kv_c[e.layers[1]], am0[e.layers[1]])
+                dm0 = {
+                    e.layers[2]: SimpleNamespace(
+                        block_table=am0[e.layers[2]].block_table,
+                        num_actual_tokens=4,
+                        block_size=128,
+                        dsa_cp_context=SimpleNamespace(
+                            local_start=0, local_end=1, local_end_with_pad=1, num_tokens_pad=4
+                        ),
+                    )
+                }
+                skv.bind_selected_kv_draft_metadata(
+                    e.rn, dm0, SimpleNamespace(query_start_loc_cpu=[0, 4], seq_lens_cpu=[16388])
+                )
+                with skv.selected_kv_draft_forward(e.rn):
+                    dm0[e.layers[2]].selected_kv.load(
+                        e.layers[2],
+                        torch.zeros((1, 1, 2048), dtype=torch.int32),
+                        e.kv_c[e.layers[2]],
+                        dm0[e.layers[2]],
+                    )
+                cur_step_key[0] = None
+                self.assertTrue(st0._finished)
+                self.assertFalse(st0._closed)
+                self.assertEqual(src.unretired_selected_request_ids(), frozenset({"r_s0"}))
+
+                # Step 1 ("r_s1"): raises in _start_load_kv -> source._failed becomes True,
+                # yet both unclosed Step 0 ("r_s0") and appended Step 1 ("r_s1") remain retained.
+                o_sh1 = self._sh_obj(0xB000, 16384, 3)
+                tbl1 = np.stack([self._ar(0, 130, d2=False)])
+                self._set_batch(e.rn, e.tbl_box, ["r_s1"], [0, 128], tbl1)
+                cm1 = self._cm(("r_s1", 16384, True, False, 0))
+
+                def _fail_hook(_arg: Any) -> None:
+                    e.eng._prepare_shared_prefill_sources(
+                        [self._LayerSrc((o_sh1,), i) for i in range(3)],
+                        0,
+                        {"req_id": "r_s1", "_shared_prefill_starts": [0], "_shared_prefill_ends": [16384]},
+                    )
+                    raise RuntimeError("injected _start_load_kv failure")
+
+                e.hook[0] = _fail_hook
+                with self.assertRaisesRegex(RuntimeError, "injected _start_load_kv failure"):
+                    self._prep_cm(e.rn, e.lmc_c, cm1, am0)
+                self.assertTrue(src._failed)
+                self.assertFalse(st0._closed)
+                self.assertEqual(src.unretired_selected_request_ids(), frozenset({"r_s0", "r_s1"}))
+            finally:
+                try:
+                    self.assertRaisesRegex(RuntimeError, "retained", src.close)
+                finally:
+                    for fn in reversed(src._restorers):
+                        fn()
 
 
 if __name__ == "__main__":

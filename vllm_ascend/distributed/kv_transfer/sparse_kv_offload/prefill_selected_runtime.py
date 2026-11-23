@@ -16,6 +16,7 @@ import vllm_ascend.core.selected_kv as skv
 from vllm_ascend.core.selected_kv import _check, _pages, _rcheck, _run_cleanup
 
 _LIBS = ("sparse_prefill_fused_fixed_launch", "dsa_bf16_mla_inplace")
+MAX_INFLIGHT_STEPS = 2
 
 
 def _i64(val: int | None) -> int:
@@ -58,7 +59,7 @@ def selected_workspace_bytes(q_cap: int, max_reqs: int, *, dsa_cp: bool = False,
     total_ints = (
         sum(prod(shape) for shape in (*scratch_shapes, *output_shapes)) + min(max_reqs, q_cap) * 8 + plan_topk_ints
     )
-    return 4 * total_ints
+    return 4 * total_ints + 75 * 1024
 
 
 class SelectedKVPlanner:
@@ -217,7 +218,15 @@ class SelectedKVRuntime:
         self.max_requests = max_reqs
 
         self._dev_meta: Tensor | None = torch.empty((2, max_reqs, 4), dtype=torch.int32, device=dev)
-        self._host_meta: Tensor | None = torch.empty((2, max_reqs, 4), dtype=torch.int32, pin_memory=dev.type != "cpu")
+        self._host_meta_ring: tuple[Tensor, ...] | None = tuple(
+            torch.empty((2, max_reqs, 4), dtype=torch.int32, pin_memory=dev.type != "cpu")
+            for _ in range(MAX_INFLIGHT_STEPS)
+        )
+        self._host_meta: Tensor | None = self._host_meta_ring[0]
+        self._meta_slot = 0
+        self._cur_meta_slot = 0
+        self._meta_upload_events: list[Any | None] = [None] * MAX_INFLIGHT_STEPS
+        self._inflight_steps: list[tuple[Any, Any, list[Any]]] = []
         self._plan_topk_buf: Tensor | None = (
             torch.empty((local_q_cap, 1, skv.TOPK), dtype=torch.int32, device=dev) if dsa_cp else None
         )
@@ -263,19 +272,27 @@ class SelectedKVRuntime:
             if getattr(meta, "selected_kv", None) is self:
                 meta.selected_kv = None
 
+    def _mark_failed(self) -> None:
+        self._failed = True
+        if self.source is not None and hasattr(self.source, "_failed"):
+            self.source._failed = True
+
     def fail(self, step: Any | None = None, err: BaseException | None = None) -> None:
         self._awaiting_draft = False
         self._active = False
-        self._failed = True
-        if step is None or getattr(step, "_finished", False):
+        self._mark_failed()
+        if step is None or getattr(step, "_closed", False):
             self._scrub_metas()
             return
 
         def finish_failed() -> None:
-            if step is self.source_step:
-                self.finish_step(failed=True)
-            else:
-                step.finish(failed=True)
+            try:
+                if step is self.source_step and not getattr(step, "_finished", False):
+                    self.finish_step(failed=True)
+                else:
+                    step.finish(failed=True)
+            finally:
+                self._scrub_metas()
 
         _run_cleanup(finish_failed, err)
 
@@ -311,7 +328,7 @@ class SelectedKVRuntime:
                 (layer_meta.num_actual_tokens, layer_meta.block_size, bt.ndim, bt.dtype)
                 == (qsl[-1], skv.PAGE_ROWS, 2, torch.int32)
                 and bt.device == self.device
-                and bt.shape[0] >= num_reqs
+                and num_reqs <= bt.shape[0] <= skv.MAX_REQUESTS
                 and bt.shape[1] >= max_cols
                 and bt.stride(1) == 1
                 and bt.stride(0) >= bt.shape[1]
@@ -392,10 +409,16 @@ class SelectedKVRuntime:
             meta_key = (stage, active_tuple, tuple(active_histories), tuple(sel_starts), tuple(sel_queries))
             if self.request_metadata is None or meta_key != self._meta_key:
                 num_sel = len(active_tuple)
-                host_view = cast(Tensor, self._host_meta)[stage, :num_sel]
+                slot = self._cur_meta_slot
+                host_ring = cast(tuple[Tensor, ...], self._host_meta_ring)
+                self._host_meta = host_ring[slot]
+                host_view = host_ring[slot][stage, :num_sel]
                 host_view.numpy()[:] = list(zip(active_tuple, active_histories, sel_starts, sel_queries))
                 dev_view = cast(Tensor, self._dev_meta)[stage, :num_sel]
                 self.request_metadata = dev_view.copy_(host_view, non_blocking=True)
+                meta_ev = torch.npu.Event()
+                meta_ev.record()
+                self._meta_upload_events[slot] = meta_ev
                 self._meta_key = meta_key
 
         self._metadata_by_layer.update(by_layer)
@@ -426,28 +449,93 @@ class SelectedKVRuntime:
             *caches,
         )
 
-    def _retire_previous(self) -> None:
+    def _check_not_failed(self) -> None:
+        if self._failed or bool(getattr(self.source, "_failed", False)):
+            self._mark_failed()
+            raise RuntimeError("Failed selected execution retains its workspace and cannot be reused")
+
+    def _stash_active_step(self) -> None:
         step = self.source_step
         if step is None:
             return
-        _rcheck(not self._failed, "Failed selected execution retains its workspace and cannot be reused")
+        self._check_not_failed()
         if self._awaiting_draft:
             self.fail(step)
             raise RuntimeError("Deferred selected draft pass did not complete before next step")
-        step.wait_completion()
-        _rcheck(step.try_retire(), "The previous selected source still has live readers")
-        self.selection_planner.release_quiescent()
+        pend = getattr(self.selection_planner, "pending", None)
+        saved_pending = list(pend) if isinstance(pend, list) and pend else []
+        if isinstance(pend, list):
+            pend.clear()
+        self._inflight_steps.append((step, self._compute_stream, saved_pending))
         self._scrub_metas()
         self._reset_step_state()
 
+    def _handoff_previous(self) -> None:
+        self._check_not_failed()
+        self._stash_active_step()
+        if not self._inflight_steps:
+            return
+        try:
+            remaining: list[tuple[Any, Any, list[Any]]] = []
+            retired_any = False
+            for st, sm, sp in self._inflight_steps:
+                if getattr(st, "_failed", False) or not getattr(st, "_finished", False):
+                    self._mark_failed()
+                    raise RuntimeError("Selected forward did not finish successfully")
+                if st.try_retire():
+                    sp.clear()
+                    retired_any = True
+                else:
+                    remaining.append((st, sm, sp))
+            while len(remaining) >= MAX_INFLIGHT_STEPS:
+                oldest_st, _, oldest_sp = remaining[0]
+                oldest_st.wait_completion()
+                _rcheck(oldest_st.try_retire(), "The previous selected source still has live readers")
+                oldest_sp.clear()
+                remaining.pop(0)
+                retired_any = True
+            self._inflight_steps = remaining
+            if retired_any:
+                self.selection_planner.release_quiescent()
+        except BaseException:
+            self._mark_failed()
+            raise
+
+    def _retire_previous(self) -> None:
+        if self.source_step is None and not self._inflight_steps:
+            return
+        self._check_not_failed()
+        self._stash_active_step()
+        try:
+            for st, _, sp in self._inflight_steps:
+                st.wait_completion()
+                _rcheck(st.try_retire(), "The previous selected source still has live readers")
+                sp.clear()
+            self._inflight_steps.clear()
+            self.selection_planner.release_quiescent()
+        except BaseException:
+            self._mark_failed()
+            raise
+
     def bind_step(self, step: Any | None, req_ids: Sequence[str], hists: Any, q_starts: Any, attn_meta: Any) -> Any:
         _rcheck(not self._closed, "Selected KV runtime is closed")
-        self._retire_previous()
+        self._handoff_previous()
+        cur_stream_obj: Any | None = None
+        if self._inflight_steps:
+            cur_stream_obj = torch.npu.current_stream()
+            cur_npu_stream = cur_stream_obj.npu_stream
+            for prev_st, prev_sm, _ in self._inflight_steps:
+                if prev_sm != cur_npu_stream:
+                    comp = getattr(prev_st, "_completion", None)
+                    if comp is not None and hasattr(comp, "record"):
+                        cur_stream_obj.wait_event(comp)
+                    else:
+                        prev_st.wait_completion()
         if step is None:
             if isinstance(attn_meta, Mapping):
                 self._scrub_metas(attn_meta.values())
             return None
-        _rcheck(not self._failed, "Failed selected execution retains its workspace and cannot be reused")
+        self._check_not_failed()
         self.source_step = step
         _check(isinstance(attn_meta, Mapping), "Selected prefill requires one eager, unsliced metadata batch")
 
@@ -475,11 +563,23 @@ class SelectedKVRuntime:
         )
         _check(hq_ok and hist_ok, "Invalid selected batch H/Q")
 
+        slot = self._meta_slot
+        self._meta_slot ^= 1
+        self._cur_meta_slot = slot
+        prev_meta_ev = self._meta_upload_events[slot]
+        if prev_meta_ev is not None:
+            prev_meta_ev.synchronize()
+            self._meta_upload_events[slot] = None
+
+        if cur_stream_obj is None:
+            cur_stream_obj = torch.npu.current_stream()
+        cur_npu_stream = cur_stream_obj.npu_stream
+
         self._scrub_metas(attn_meta[name] for name in self.draft_layer_names if name in attn_meta)
         self._selected_indices = sel_indices
         self._selected_histories = tuple(histories[idx] for idx in sel_indices)
         self._num_reqs = len(ids)
-        self._compute_stream = torch.npu.current_stream().npu_stream
+        self._compute_stream = cur_npu_stream
         seq_lens = [h + q for h, q in zip(histories, queries)]
         return self._apply_step_layout(self.target_layer_names, attn_meta, starts, seq_lens)
 
@@ -503,7 +603,8 @@ class SelectedKVRuntime:
         if not self._awaiting_draft:
             self._scrub_metas(draft_meta.values())
             return None
-        _rcheck(self._active and not self._failed and self.source_step is not None, "Bad draft bind")
+        self._check_not_failed()
+        _rcheck(self._active and self.source_step is not None, "Bad draft bind")
         _check(bool(self.draft_layer_names) and not (self._submitted_layers & self.draft_layer_names), "Dup draft")
 
         qsl_raw = getattr(common_meta, "query_start_loc_cpu", None)
@@ -552,9 +653,10 @@ class SelectedKVRuntime:
     def load(self, name: str, topk: Tensor, cache: Sequence[Tensor], metadata: Any) -> None:
         if int(metadata.num_actual_tokens) <= 0:
             return
+        self._check_not_failed()
         layer_ok = (
             self._active
-            and not (self._closed or self._failed)
+            and not self._closed
             and name not in self._submitted_layers
             and name in self.owner_by_layer
             and metadata is self._metadata_by_layer.get(name)
@@ -631,7 +733,8 @@ class SelectedKVRuntime:
     def prefetch_next(self, name: str, metadata: Any = None) -> None:
         if metadata is not None and int(metadata.num_actual_tokens) <= 0:
             return
-        _rcheck(self._active and not (self._closed or self._failed) and name in self._submitted_layers, "Bad prefetch")
+        self._check_not_failed()
+        _rcheck(self._active and not self._closed and name in self._submitted_layers, "Bad prefetch")
         nxt = self._next_follower.get(name)
         if nxt is None:
             return
@@ -671,7 +774,7 @@ class SelectedKVRuntime:
             return
         try:
             if not all_submitted:
-                self._failed = True
+                self._mark_failed()
                 step.finish(failed=True)
                 _rcheck(failed, "Selected execution did not successfully submit every layer")
                 return
@@ -680,7 +783,7 @@ class SelectedKVRuntime:
             comp_ev.record()
             step.finish(completion=comp_ev)
         except BaseException as err:
-            self._failed = True
+            self._mark_failed()
             if not getattr(step, "_finished", False):
                 _run_cleanup(lambda: step.finish(failed=True), err)
             raise
@@ -697,7 +800,10 @@ class SelectedKVRuntime:
         self.selection_planner.close_quiescent()
         skv._ACTIVE_RUNTIMES.discard(self)
         self._dev_meta = None
+        self._host_meta_ring = None
         self._host_meta = None
+        self._meta_upload_events = [None] * MAX_INFLIGHT_STEPS
         self._plan_topk_buf = None
         self.request_metadata = None
+        self._meta_key = None
         self._closed = True
