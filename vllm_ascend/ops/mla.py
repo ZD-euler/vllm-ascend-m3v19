@@ -469,11 +469,7 @@ def sfa_forward_full(
     context = get_forward_context()
     impl, attn_layer_name, kv_cache, metadata = _mla_runtime_state(layer_name)
     group = impl.shared_resident_plan
-    direct = (
-        getattr(context, "sfa_full_graph_active", False)
-        and group is not None and group.active
-        and not impl._staged_graph_content_diagnostic_enabled(attn_layer_name)
-    )
+    direct = getattr(context, "sfa_full_graph_active", False) and group is not None and group.active
     pending = []
     early = direct and getattr(impl, "_dcp_early_gather", False) and getattr(metadata, "sfa_dcp", None) is not None
     query_first = (
