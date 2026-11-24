@@ -90,7 +90,7 @@ def test_shared_snapshot_preserves_metadata_and_cycles():
     assert cpu_snapshot(value) == {"value": [1, 2], "cycle": {"__cycle__": "dict"}}
 
 
-def _prefill_harness(monkeypatch, enabled=True, tokens=4096, mtp=True, asynchronous=False):
+def _prefill_harness(monkeypatch, enabled=True, tokens=4096, mtp=True, asynchronous=False, production=False):
     """Run the actual sampling method with device/serving boundaries substituted."""
     path = Path(perf.__file__).with_name("model_runner_v1.py")
     tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -102,7 +102,7 @@ def _prefill_harness(monkeypatch, enabled=True, tokens=4096, mtp=True, asynchron
 
     def now():
         clock.calls += 1
-        if not enabled or tokens <= 2:
+        if not enabled or (tokens <= 2 and not production):
             _forbidden()
         return clock.now
 
@@ -132,6 +132,8 @@ def _prefill_harness(monkeypatch, enabled=True, tokens=4096, mtp=True, asynchron
         time=fake_time,
         _PREFILL_PERF_INTERVAL_SECONDS=perf._PREFILL_PERF_INTERVAL_SECONDS,
         _log_prefill_sample=perf._log_prefill_sample,
+        _sample_phase_times=perf._sample_phase_times,
+        _COLD_PERF_SLOW_SAMPLE_MS=perf._COLD_PERF_SLOW_SAMPLE_MS,
         envs_ascend=SimpleNamespace(VLLM_ASCEND_MTP_DRAFT_DEBUG=False),
         record_function_or_nullcontext=lambda *a: nullcontext(),
         nullcontext=nullcontext,
@@ -151,6 +153,7 @@ def _prefill_harness(monkeypatch, enabled=True, tokens=4096, mtp=True, asynchron
     runner = SimpleNamespace(
         kv_connector_output=None,
         execute_model_state=state,
+        _production_sample_perf=production,
         _prefill_sample_perf=enabled,
         _prefill_sample_perf_next=0.0,
         uniform_decode_query_len=2,
@@ -277,3 +280,11 @@ def test_prefill_gate_is_cached_for_tp0_producers(enabled, producer, rank):
     )
     exec(compile(ast.Module(body=[assignment], type_ignores=[]), str(path), "exec"), namespace)
     assert runner._prefill_sample_perf is (enabled and producer and rank == 0)
+
+
+def test_production_decode_retains_only_slow_host_phases(monkeypatch):
+    runner, invoke, _, _, records = _prefill_harness(monkeypatch, tokens=2, production=True)
+    invoke()
+    assert not records
+    assert runner._slow_sample_phases["mtp_proposal_readback_wall_ms"] == pytest.approx(340, abs=1)
+    assert runner._slow_sample_phases["connector_finalize_wall_ms"] == pytest.approx(50, abs=1)

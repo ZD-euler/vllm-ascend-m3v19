@@ -60,6 +60,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache im
     RESIDENT_COUNT_CACHELINE_INTS,
 )
 from vllm_ascend.serving_perf import (
+    cold_perf_detailed_enabled,
     cold_perf_enabled,
     forget_cold_perf_request,
     is_cold_perf_request,
@@ -115,6 +116,17 @@ def _cold_perf_watchdog_rank_and_timeout() -> tuple[int, int]:
     )
 
 
+def _report_worker_delay(worker, event, **fields):
+    # Independent per worker so a slow non-output TP rank stays visible.
+    if not cold_perf_detailed_enabled():
+        reports = worker.__dict__.setdefault("_slow_phase_reported_at", {})
+        now = time.monotonic()
+        if now - reports.get(event, -float("inf")) < 60:
+            return
+        reports[event] = now
+    log_cold_perf_process_event(event, worker_rank=getattr(worker, "rank", None), **fields)
+
+
 def _trace_first_cold_perf_execute(method):
     """Trace the first non-empty batch and every marked cold resume."""
 
@@ -142,12 +154,12 @@ def _trace_first_cold_perf_execute(method):
         previous_requests = getattr(
             self, "_cold_perf_last_execute_requests", frozenset()
         )
-        overlap = previous_requests.intersection(scheduled)
-        if previous_return is not None and overlap:
+        if previous_return is not None:
             gap_ms = (entry_started - previous_return) * 1000
-            if gap_ms >= _COLD_PERF_SLOW_EXECUTE_MS:
+            if gap_ms >= _COLD_PERF_SLOW_EXECUTE_MS and (overlap := set(previous_requests).intersection(scheduled)):
                 tp_rank, _ = _cold_perf_watchdog_rank_and_timeout()
-                log_cold_perf_process_event(
+                _report_worker_delay(
+                    self,
                     "decoder_submission_gap",
                     tp_rank=tp_rank,
                     gap_ms=round(gap_ms, 3),
@@ -157,8 +169,7 @@ def _trace_first_cold_perf_execute(method):
                     current_batch_size=len(scheduled),
                     process_cpu_ms=(
                         round(
-                            (entry_process_cpu_ns - previous_process_cpu_ns)
-                            / 1_000_000,
+                            (entry_process_cpu_ns - previous_process_cpu_ns) / 1_000_000,
                             3,
                         )
                         if previous_process_cpu_ns is not None
@@ -166,8 +177,7 @@ def _trace_first_cold_perf_execute(method):
                     ),
                     main_thread_cpu_ms=(
                         round(
-                            (entry_thread_cpu_ns - previous_thread_cpu_ns)
-                            / 1_000_000,
+                            (entry_thread_cpu_ns - previous_thread_cpu_ns) / 1_000_000,
                             3,
                         )
                         if previous_thread_cpu_ns is not None
@@ -182,28 +192,32 @@ def _trace_first_cold_perf_execute(method):
             elapsed_ms = (completed - entry_started) * 1000
             if scheduled and elapsed_ms >= _COLD_PERF_SLOW_EXECUTE_MS:
                 tp_rank, _ = _cold_perf_watchdog_rank_and_timeout()
-                log_cold_perf_process_event(
+                _report_worker_delay(
+                    self,
                     "decoder_execute_slow",
                     tp_rank=tp_rank,
                     elapsed_ms=round(elapsed_ms, 3),
                     batch_size=len(scheduled),
                     request_ids=list(scheduled[:8]),
                     process_cpu_ms=round(
-                        (completed_process_cpu_ns - entry_process_cpu_ns)
-                        / 1_000_000,
+                        (completed_process_cpu_ns - entry_process_cpu_ns) / 1_000_000,
                         3,
                     ),
                     main_thread_cpu_ms=round(
-                        (completed_thread_cpu_ns - entry_thread_cpu_ns)
-                        / 1_000_000,
+                        (completed_thread_cpu_ns - entry_thread_cpu_ns) / 1_000_000,
                         3,
                     ),
                 )
             self._cold_perf_last_execute_return = completed
             self._cold_perf_last_execute_process_cpu_ns = completed_process_cpu_ns
             self._cold_perf_last_execute_thread_cpu_ns = completed_thread_cpu_ns
-            self._cold_perf_last_execute_requests = frozenset(scheduled)
+            self._cold_perf_last_execute_requests = scheduled
 
+        if not cold_perf_detailed_enabled():
+            try:
+                return method(self, scheduler_output, *args, **kwargs)
+            finally:
+                record_finish()
         mark_cold_perf_connector_requests(
             getattr(scheduler_output, "kv_connector_metadata", None)
         )
@@ -912,7 +926,10 @@ class NPUWorker(WorkerBase):
                 )
             )
         )
-        rpc_started = time.perf_counter() if request_ids else 0.0
+        production = cold_perf_enabled() and not cold_perf_detailed_enabled()
+        if production:
+            self.model_runner._slow_sample_phases = None
+        rpc_started = time.perf_counter() if request_ids or production else 0.0
         diagnostic_active = bool(active_request_ids)
         watchdog_armed = False
         if diagnostic_active:
@@ -955,6 +972,19 @@ class NPUWorker(WorkerBase):
                     self._raise_if_remote_fill_restart_required()
                 raise
             self._raise_if_remote_fill_restart_required()
+            if production:
+                elapsed_ms = (time.perf_counter() - rpc_started) * 1000
+                if elapsed_ms >= _COLD_PERF_SLOW_EXECUTE_MS:
+                    phases = self.model_runner._slow_sample_phases or {}
+                    _report_worker_delay(
+                        self,
+                        "decoder_sample_rpc_slow",
+                        elapsed_ms=round(elapsed_ms, 3),
+                        request_ids=list(getattr(self, "_cold_perf_last_execute_requests", ()))[:8],
+                        dominant_phase=max(phases, key=phases.__getitem__).removesuffix("_wall_ms") if phases else None,
+                        **phases,
+                    )
+                return output
             if request_ids:
                 sample_return_ns = time.perf_counter_ns()
                 rpc_elapsed_ms = (time.perf_counter() - rpc_started) * 1000
@@ -1325,7 +1355,12 @@ class NPUWorker(WorkerBase):
         self.model_runner.reset_encoder_cache()
 
     def execute_dummy_batch(self) -> None:
+        started = time.perf_counter() if cold_perf_enabled() else None
         self.model_runner._dummy_run(num_tokens=self.model_runner.decode_token_per_req, uniform_decode=True)
+        if started is not None:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            if elapsed_ms >= _COLD_PERF_SLOW_EXECUTE_MS:
+                _report_worker_delay(self, "decoder_dummy_slow", elapsed_ms=round(elapsed_ms, 3))
 
     @startup_stage("dist_init")
     def _init_worker_distributed_environment(self) -> None:

@@ -54,6 +54,7 @@ def test_indexer_handoff_precedes_topk_publication_and_latent_attention(p_node, 
     namespace.update(
         self=NS(
             _layerwise_prefill_p_node=p_node,
+            dsa_cp_decoder=False,
             skip_topk=skip_topk,
             has_indexer=has_indexer,
             index_cache_enabled=True,

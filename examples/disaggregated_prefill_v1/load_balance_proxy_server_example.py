@@ -179,10 +179,10 @@ def _encode_json_payload(payload: Any) -> bytes:
 
 if __package__:
     from .remote_fill_placement import validate_remote_fill_placement
-    from .pd_serving_perf import serving_perf_enabled as _proxy_cold_perf_enabled
+    from .pd_serving_perf import serving_perf_detailed_enabled as _proxy_cold_perf_enabled
 else:
     from remote_fill_placement import validate_remote_fill_placement
-    from pd_serving_perf import serving_perf_enabled as _proxy_cold_perf_enabled
+    from pd_serving_perf import serving_perf_detailed_enabled as _proxy_cold_perf_enabled
 
 
 def _log_proxy_cold_perf_event(

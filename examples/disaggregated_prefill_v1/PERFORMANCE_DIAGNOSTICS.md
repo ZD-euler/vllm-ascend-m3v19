@@ -6,18 +6,51 @@ the environment of an already running process is not supported.
 
 | Value | Performance capability |
 | --- | --- |
-| Unset, empty, `0`, `false`, `no`, `off` | Optional performance timing disabled |
-| `1` | Host timing and request/transfer/graph-route correlation |
-| `detail` | Host timing plus additional per-layer detail where implemented |
+| Unset, empty, `0`, `false`, `no`, `off` | Optional timing disabled. PD failures still report the affected operation. |
+| `1` | Production anomalies, request transitions and recovery. |
+| `detail` | Full host tracing, routine statistics, graph operands and available per-layer details. |
 | `device` | Detail plus explicit NPU event timing where implemented |
 
 Values ignore surrounding whitespace and case. Other nonfalse values retain
 host timing behavior. Use the documented modes in deployments.
 
-`PD_SERVING_PERF` replaces `LMCACHE_COLD_START_PERF`; the old environment variable
-is no longer read. Update all four repositories together, rebuild the changed
-native extensions, and update every launcher or container environment. The
-standalone proxy and tokenizer use a device-independent local gate.
+`PD_SERVING_PERF` replaces `LMCACHE_COLD_START_PERF`. Set it explicitly on P
+and D. Leaving it unset preserves vLLM’s default frontend statistics. At `0`
+and `1` the vLLM launcher defaults Mooncake's native
+`MC_LOG_LEVEL` to `WARNING`. An explicit native setting takes precedence.
+Prometheus metrics and HTTP error access logs stay available. Custom access
+log configuration takes precedence over suppression of healthy metrics scrapes.
+
+On a generation engine with vLLM statistics enabled and one API frontend per
+engine, level `1` can report
+a stall while the worker is still executing. Search for `[DECODE_PROGRESS]`.
+Two consecutive windows of at least 10 seconds below 20 tokens/s for a single
+running request or 10 tokens/s per request for a larger batch trigger an alert.
+Each alert reports generated tokens, request-seconds, scheduler updates, output
+batches and last token age. Linux hosts also report CPU, memory and I/O pressure
+where available. Repeated alerts for an ongoing slowdown are limited to one per
+minute per DP. First tokens from prefill alone do not establish slow decode or
+decode recovery. The layerwise P-node marker disables this decoder monitor on P,
+including deployments where both roles use `kv_both`.
+
+Match slow worker, storage and guardian records by timestamp, rank, request ID
+and operation or transfer ID. `storage_operation_pending` identifies the oldest
+queued or executing read/prepare when it has been outstanding for 10 seconds.
+`storage_service_timing` splits its duration into queue time, the native call
+and remaining handler time, and names the longest. Linux reports the calling
+thread's major faults and involuntary switches when available.
+`storage_worker_load` identifies the phase that raised an exception. Failed
+checkpoint acknowledgements and failed RemoteFill commits are visible at ERROR
+and WARNING, respectively, at every performance logging level. A guardian
+failure reports its last heartbeat age and oldest outstanding RPC. A long native
+call locates the wait inside the SDK. Identifying a device or link fault requires
+corresponding runtime evidence.
+
+To see the last 40 diagnostic records from an affected decoder, run
+
+```bash
+rg 'DECODE_PROGRESS|SFA_ROUTE|REQUEST_LIFECYCLE|ENGINE_STEP_TIMING|CHECKPOINT_FAILED|LMCACHE_LOOKUP_ZERO|remote_fill_local_commit|storage_operation_pending|storage_service_timing|storage_worker_load|epoch failed' "$LOG" | tail -n 40
+```
 
 Existing log markers such as `[LMCACHE_COLD_PERF]` and `[ENGINE_STEP_TIMING]`,
 event names and fields are preserved for existing extraction tools. A

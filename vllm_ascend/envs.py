@@ -58,6 +58,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     # async output waits, with no added device events or synchronization.
     # Empty/0/false/no/off disable it (case-insensitive). Other nonfalse values
     # retain host timing semantics. Content/crash diagnostics remain separate.
+    # 0: operational errors; 1: production anomalies; detail/device: full host tracing.
     "PD_SERVING_PERF": lambda: os.getenv("PD_SERVING_PERF", "0").strip().lower(),
     # Explicit PD prefill-node marker and feature gate for the layerwise DSA
     # child pool. It is intentionally independent of kv_role/kv_rank.

@@ -174,6 +174,7 @@ from vllm_ascend.live_source_handoff import (
     LIVE_SOURCE_EVENT_HANDOFF_KEY,
 )
 from vllm_ascend.serving_perf import (
+    cold_perf_detailed_enabled,
     cold_perf_device_timing_enabled,
     cold_perf_enabled,
     is_cold_perf_request,
@@ -246,6 +247,7 @@ from vllm_ascend.worker.serving_perf import (
     _COLD_PERF_SLOW_SAMPLE_MS,
     _PREFILL_PERF_INTERVAL_SECONDS,
     _log_prefill_sample,
+    _sample_phase_times,
     _log_slow_sample_invocation,
     _record_sample_stage,
 )
@@ -849,6 +851,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         if vllm_config.kv_transfer_config is not None:
             self.is_kv_producer = vllm_config.kv_transfer_config.is_kv_producer
             self.is_kv_consumer = vllm_config.kv_transfer_config.is_kv_consumer
+        self._production_sample_perf = cold_perf_enabled() and not cold_perf_detailed_enabled()
         self._prefill_sample_perf = (
             cold_perf_enabled() and self.is_kv_producer and get_tp_group().rank_in_group == 0
         )
@@ -2376,7 +2379,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         ):
             scheduler_output = deepcopy(scheduler_output)
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        cold_perf_active = cold_perf_enabled()
+        cold_perf_active = cold_perf_detailed_enabled()
         if cold_perf_active:
             mark_cold_perf_connector_requests(
                 getattr(scheduler_output, "kv_connector_metadata", None)
@@ -3238,10 +3241,15 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         # Clear ephemeral state.
         self.execute_model_state = None
 
-        # Both P and D use kv_both: sample prefill shapes, never ordinary decode.
-        # Keep this independent of cold-resume marking and device-event timing.
+        # Reuse the same host phase boundaries for production decode and sampled prefill.
         prefill_marks = None
-        if self._prefill_sample_perf and (
+        production_decode = self._production_sample_perf and (
+            scheduler_output.total_num_scheduled_tokens
+            <= len(scheduler_output.num_scheduled_tokens) * self.uniform_decode_query_len
+        )
+        if production_decode:
+            prefill_marks = [time.perf_counter()]
+        elif self._prefill_sample_perf and (
             scheduler_output.total_num_scheduled_tokens
             > len(scheduler_output.num_scheduled_tokens) * self.uniform_decode_query_len
         ):
@@ -3718,7 +3726,11 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             )
             self._drain_cold_perf_npu_intervals()
         self._cold_perf_current_sample_npu_intervals = None
-        if prefill_marks is not None:
+        if production_decode:
+            ended = time.perf_counter()
+            if (ended - prefill_marks[0]) * 1000 >= _COLD_PERF_SLOW_SAMPLE_MS:
+                self._slow_sample_phases = _sample_phase_times(prefill_marks, ended)
+        elif prefill_marks is not None:
             _log_prefill_sample(scheduler_output, prefill_marks, self.use_async_scheduling)
         return output
 
@@ -5256,7 +5268,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                                 f"frontier_computed[{i}]"
                             )
                 if marker_failures:
-                    if cold_perf_enabled():
+                    if cold_perf_detailed_enabled():
                         log_cold_perf_event(
                             "decoder_cold_compact_graph_reject",
                             request_ids=request_ids,
@@ -5328,7 +5340,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 if not resume and int(computed[i]) < int(prompts[i]):
                     layout_failures.append(f"computed_prompt[{i}]")
             if layout_failures:
-                if cold_perf_enabled():
+                if cold_perf_detailed_enabled():
                     log_cold_perf_event(
                         "decoder_cold_compact_graph_reject",
                         request_ids=request_ids,

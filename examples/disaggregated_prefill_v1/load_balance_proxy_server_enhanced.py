@@ -57,10 +57,10 @@ logger = logging.getLogger(__name__)
 
 if __package__:
     from .remote_fill_placement import validate_remote_fill_placement
-    from .pd_serving_perf import serving_perf_enabled as _serving_perf_enabled
+    from .pd_serving_perf import serving_perf_detailed_enabled as _serving_perf_enabled
 else:
     from remote_fill_placement import validate_remote_fill_placement
-    from pd_serving_perf import serving_perf_enabled as _serving_perf_enabled
+    from pd_serving_perf import serving_perf_detailed_enabled as _serving_perf_enabled
 
 MAX_RECOMPUTE_RETRIES = 3
 _DECODER_PLACEMENT_DISCOVERY_TIMEOUT_SECONDS = 2.0
