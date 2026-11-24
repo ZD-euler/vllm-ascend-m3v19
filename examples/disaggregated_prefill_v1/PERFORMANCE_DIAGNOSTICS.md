@@ -14,12 +14,12 @@ the environment of an already running process is not supported.
 Values ignore surrounding whitespace and case. Other nonfalse values retain
 host timing behavior. Use the documented modes in deployments.
 
-`PD_SERVING_PERF` replaces `LMCACHE_COLD_START_PERF`. Set it explicitly on P
-and D. Leaving it unset preserves vLLM’s default frontend statistics. At `0`
-and `1` the vLLM launcher defaults Mooncake's native
-`MC_LOG_LEVEL` to `WARNING`. An explicit native setting takes precedence.
-Prometheus metrics and HTTP error access logs stay available. Custom access
-log configuration takes precedence over suppression of healthy metrics scrapes.
+`PD_SERVING_PERF` replaces `LMCACHE_COLD_START_PERF`. Set it on P and D.
+At every PD level, vLLM reports prompt and generation throughput at
+`VLLM_LOG_STATS_INTERVAL` when its native statistics are enabled.
+HTTP access logs, including successful `/health` and `/metrics` requests,
+follow the server's access-log settings. At PD levels `0` and `1`, the
+launcher defaults Mooncake's separate `MC_LOG_LEVEL` to `WARNING` unless set explicitly.
 
 On a generation engine with vLLM statistics enabled and one API frontend per
 engine, level `1` can report
