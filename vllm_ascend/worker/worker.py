@@ -18,7 +18,10 @@
 #
 
 import copy
+import faulthandler
 import gc
+import time
+from functools import wraps
 from types import NoneType
 
 import torch
@@ -56,6 +59,16 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache im
     INDEX_TOPK,
     RESIDENT_COUNT_CACHELINE_INTS,
 )
+from vllm_ascend.serving_perf import (
+    cold_perf_detailed_enabled,
+    cold_perf_enabled,
+    forget_cold_perf_request,
+    is_cold_perf_request,
+    log_cold_perf_event,
+    log_cold_perf_process_event,
+    mark_cold_perf_connector_requests,
+    mark_cold_perf_requests,
+)
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.utils import (
     AscendDeviceType,
@@ -84,6 +97,205 @@ _STAGED_SFA_GRAPH_MEMORY_MARGIN_RATIO = 1.1
 # Distinct supervisor-visible status for an unsafe armed RemoteFill DMA.
 # Deployment policy must restart the paired P+D serving group on this code.
 REMOTE_FILL_PAIRED_RESTART_EXIT_CODE = 86
+_COLD_PERF_STALL_SECONDS = 60
+_COLD_PERF_STALL_STAGGER_SECONDS = 5
+_COLD_PERF_SLOW_EXECUTE_MS = 500
+_COLD_PERF_REQUEST_IDS_ATTR = "_ascend_cold_perf_request_ids"
+_COLD_PERF_SAMPLE_RETURN_NS_ATTR = "_ascend_cold_perf_sample_return_ns"
+
+
+def _cold_perf_watchdog_rank_and_timeout() -> tuple[int, int]:
+    try:
+        tp_rank = int(get_tp_group().rank_in_group)
+    except Exception:
+        tp_rank = 0
+    return tp_rank, (
+        _COLD_PERF_STALL_SECONDS
+        + tp_rank * _COLD_PERF_STALL_STAGGER_SECONDS
+    )
+
+
+def _report_worker_delay(worker, event, **fields):
+    # Independent per worker so a slow non-output TP rank stays visible.
+    if not cold_perf_detailed_enabled():
+        reports = worker.__dict__.setdefault("_slow_phase_reported_at", {})
+        now = time.monotonic()
+        if now - reports.get(event, -float("inf")) < 60:
+            return
+        reports[event] = now
+    log_cold_perf_process_event(event, worker_rank=getattr(worker, "rank", None), **fields)
+
+
+def _trace_first_cold_perf_execute(method):
+    """Trace the first non-empty batch and every marked cold resume."""
+
+    @wraps(method)
+    def wrapped(self, scheduler_output, *args, **kwargs):
+        if not cold_perf_enabled():
+            return method(self, scheduler_output, *args, **kwargs)
+        entry_started = time.perf_counter()
+        entry_process_cpu_ns = time.process_time_ns()
+        entry_thread_cpu_ns = time.thread_time_ns()
+        scheduled = tuple(
+            str(req_id)
+            for req_id, count in getattr(
+                scheduler_output, "num_scheduled_tokens", {}
+            ).items()
+            if count
+        )
+        previous_return = getattr(self, "_cold_perf_last_execute_return", None)
+        previous_process_cpu_ns = getattr(
+            self, "_cold_perf_last_execute_process_cpu_ns", None
+        )
+        previous_thread_cpu_ns = getattr(
+            self, "_cold_perf_last_execute_thread_cpu_ns", None
+        )
+        previous_requests = getattr(
+            self, "_cold_perf_last_execute_requests", frozenset()
+        )
+        if previous_return is not None:
+            gap_ms = (entry_started - previous_return) * 1000
+            if gap_ms >= _COLD_PERF_SLOW_EXECUTE_MS and (overlap := set(previous_requests).intersection(scheduled)):
+                tp_rank, _ = _cold_perf_watchdog_rank_and_timeout()
+                _report_worker_delay(
+                    self,
+                    "decoder_submission_gap",
+                    tp_rank=tp_rank,
+                    gap_ms=round(gap_ms, 3),
+                    shared_request_count=len(overlap),
+                    shared_request_ids=sorted(overlap)[:8],
+                    previous_batch_size=len(previous_requests),
+                    current_batch_size=len(scheduled),
+                    process_cpu_ms=(
+                        round(
+                            (entry_process_cpu_ns - previous_process_cpu_ns) / 1_000_000,
+                            3,
+                        )
+                        if previous_process_cpu_ns is not None
+                        else None
+                    ),
+                    main_thread_cpu_ms=(
+                        round(
+                            (entry_thread_cpu_ns - previous_thread_cpu_ns) / 1_000_000,
+                            3,
+                        )
+                        if previous_thread_cpu_ns is not None
+                        else None
+                    ),
+                )
+
+        def record_finish() -> None:
+            completed = time.perf_counter()
+            completed_process_cpu_ns = time.process_time_ns()
+            completed_thread_cpu_ns = time.thread_time_ns()
+            elapsed_ms = (completed - entry_started) * 1000
+            if scheduled and elapsed_ms >= _COLD_PERF_SLOW_EXECUTE_MS:
+                tp_rank, _ = _cold_perf_watchdog_rank_and_timeout()
+                _report_worker_delay(
+                    self,
+                    "decoder_execute_slow",
+                    tp_rank=tp_rank,
+                    elapsed_ms=round(elapsed_ms, 3),
+                    batch_size=len(scheduled),
+                    request_ids=list(scheduled[:8]),
+                    process_cpu_ms=round(
+                        (completed_process_cpu_ns - entry_process_cpu_ns) / 1_000_000,
+                        3,
+                    ),
+                    main_thread_cpu_ms=round(
+                        (completed_thread_cpu_ns - entry_thread_cpu_ns) / 1_000_000,
+                        3,
+                    ),
+                )
+            self._cold_perf_last_execute_return = completed
+            self._cold_perf_last_execute_process_cpu_ns = completed_process_cpu_ns
+            self._cold_perf_last_execute_thread_cpu_ns = completed_thread_cpu_ns
+            self._cold_perf_last_execute_requests = scheduled
+
+        if not cold_perf_detailed_enabled():
+            try:
+                return method(self, scheduler_output, *args, **kwargs)
+            finally:
+                record_finish()
+        mark_cold_perf_connector_requests(
+            getattr(scheduler_output, "kv_connector_metadata", None)
+        )
+        if scheduled and not getattr(self, "_cold_perf_first_execute_marked", False):
+            self._cold_perf_first_execute_marked = True
+            mark_cold_perf_requests(scheduled)
+        request_ids = tuple(
+            req_id for req_id in scheduled if is_cold_perf_request(req_id)
+        )
+        if not request_ids:
+            try:
+                return method(self, scheduler_output, *args, **kwargs)
+            finally:
+                record_finish()
+
+        tp_rank, watchdog_timeout = _cold_perf_watchdog_rank_and_timeout()
+        log_cold_perf_event(
+            "decoder_execute_rpc_entry",
+            request_ids=request_ids,
+            once=True,
+            tp_rank=tp_rank,
+        )
+        log_cold_perf_event(
+            "decoder_execute_stall_watchdog_armed",
+            request_ids=request_ids,
+            once=True,
+            tp_rank=tp_rank,
+            timeout_seconds=watchdog_timeout,
+        )
+        watchdog_armed = False
+        try:
+            try:
+                faulthandler.dump_traceback_later(watchdog_timeout)
+                watchdog_armed = True
+            except Exception as exc:
+                log_cold_perf_event(
+                    "decoder_execute_stall_watchdog_error",
+                    request_ids=request_ids,
+                    once=True,
+                    operation="arm",
+                    error_type=type(exc).__name__,
+                )
+            output = method(self, scheduler_output, *args, **kwargs)
+            log_cold_perf_event(
+                "decoder_execute_rpc_return",
+                request_ids=request_ids,
+                once=True,
+                elapsed_ms=round(
+                    (time.perf_counter() - entry_started) * 1000, 3
+                ),
+                output_type=type(output).__name__,
+            )
+            return output
+        except BaseException as exc:
+            log_cold_perf_event(
+                "decoder_execute_rpc_error",
+                request_ids=request_ids,
+                once=True,
+                elapsed_ms=round(
+                    (time.perf_counter() - entry_started) * 1000, 3
+                ),
+                error_type=type(exc).__name__,
+            )
+            raise
+        finally:
+            if watchdog_armed:
+                try:
+                    faulthandler.cancel_dump_traceback_later()
+                except Exception as exc:
+                    log_cold_perf_event(
+                        "decoder_execute_stall_watchdog_error",
+                        request_ids=request_ids,
+                        once=True,
+                        operation="cancel",
+                        error_type=type(exc).__name__,
+                    )
+            record_finish()
+
+    return wrapped
 
 
 def _staged_sfa_graph_memory_reservation(estimate: int) -> int:
@@ -611,6 +823,7 @@ class NPUWorker(WorkerBase):
             # down the full executor instead of continuing with unsafe memory.
             raise SystemExit(REMOTE_FILL_PAIRED_RESTART_EXIT_CODE)
 
+    @_trace_first_cold_perf_execute
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -694,18 +907,145 @@ class NPUWorker(WorkerBase):
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        self._raise_if_remote_fill_restart_required()
-        try:
-            output = self.model_runner.sample_tokens(grammar_output)
-        except BaseException:
-            # A failed draft/sample must release the bound request metadata.
+        active_request_ids = tuple(
+            getattr(self.model_runner, "_cold_perf_current_req_ids", ()) or ()
+        )
+        request_ids = tuple(
+            dict.fromkeys(
+                active_request_ids
+                + tuple(
+                    getattr(
+                        self.model_runner,
+                        "_cold_perf_sample_trace_req_ids",
+                        (),
+                    )
+                    or ()
+                )
+            )
+        )
+        production = cold_perf_enabled() and not cold_perf_detailed_enabled()
+        if production:
+            self.model_runner._slow_sample_phases = None
+        rpc_started = time.perf_counter() if request_ids or production else 0.0
+        diagnostic_active = bool(active_request_ids)
+        watchdog_armed = False
+        if diagnostic_active:
+            tp_rank, watchdog_timeout = _cold_perf_watchdog_rank_and_timeout()
+            log_cold_perf_event(
+                "decoder_sample_rpc_entry",
+                request_ids=request_ids,
+                once=True,
+                tp_rank=tp_rank,
+            )
+            log_cold_perf_event(
+                "decoder_sample_stall_watchdog_armed",
+                request_ids=request_ids,
+                once=True,
+                tp_rank=tp_rank,
+                timeout_seconds=watchdog_timeout,
+            )
             try:
-                self.model_runner.abort_kv_connector_finalize()
-            finally:
-                self._raise_if_remote_fill_restart_required()
+                faulthandler.dump_traceback_later(watchdog_timeout)
+                watchdog_armed = True
+            except Exception as exc:
+                log_cold_perf_event(
+                    "decoder_sample_stall_watchdog_error",
+                    request_ids=request_ids,
+                    once=True,
+                    operation="arm",
+                    error_type=type(exc).__name__,
+                )
+        try:
+            self._raise_if_remote_fill_restart_required()
+            try:
+                output = self.model_runner.sample_tokens(grammar_output)
+            except BaseException:
+                # Speculative execution defers connector finalization until
+                # after the draft pass. A failed draft/sample must not leave
+                # request metadata bound for the next scheduler step.
+                try:
+                    self.model_runner.abort_kv_connector_finalize()
+                finally:
+                    self._raise_if_remote_fill_restart_required()
+                raise
+            self._raise_if_remote_fill_restart_required()
+            if production:
+                elapsed_ms = (time.perf_counter() - rpc_started) * 1000
+                if elapsed_ms >= _COLD_PERF_SLOW_EXECUTE_MS:
+                    phases = self.model_runner._slow_sample_phases or {}
+                    _report_worker_delay(
+                        self,
+                        "decoder_sample_rpc_slow",
+                        elapsed_ms=round(elapsed_ms, 3),
+                        request_ids=list(getattr(self, "_cold_perf_last_execute_requests", ()))[:8],
+                        dominant_phase=max(phases, key=phases.__getitem__).removesuffix("_wall_ms") if phases else None,
+                        **phases,
+                    )
+                return output
+            if request_ids:
+                sample_return_ns = time.perf_counter_ns()
+                rpc_elapsed_ms = (time.perf_counter() - rpc_started) * 1000
+                for diagnostic_output in (
+                    output,
+                    getattr(output, "_model_runner_output", None),
+                ):
+                    try:
+                        setattr(
+                            diagnostic_output,
+                            _COLD_PERF_REQUEST_IDS_ATTR,
+                            request_ids,
+                        )
+                        setattr(
+                            diagnostic_output,
+                            _COLD_PERF_SAMPLE_RETURN_NS_ATTR,
+                            sample_return_ns,
+                        )
+                    except (AttributeError, TypeError):
+                        pass
+                if diagnostic_active:
+                    log_cold_perf_event(
+                        "decoder_sample_rpc_return",
+                        request_ids=request_ids,
+                        once=True,
+                        elapsed_ms=round(rpc_elapsed_ms, 3),
+                        output_type=type(output).__name__,
+                    )
+                elif rpc_elapsed_ms >= _COLD_PERF_SLOW_EXECUTE_MS:
+                    log_cold_perf_event(
+                        "decoder_sample_rpc_slow",
+                        request_ids=request_ids,
+                        require_active=False,
+                        elapsed_ms=round(rpc_elapsed_ms, 3),
+                        output_type=type(output).__name__,
+                    )
+            return output
+        except BaseException as exc:
+            if request_ids:
+                log_cold_perf_event(
+                    "decoder_sample_rpc_error",
+                    request_ids=request_ids,
+                    once=True,
+                    require_active=diagnostic_active,
+                    elapsed_ms=round(
+                        (time.perf_counter() - rpc_started) * 1000, 3
+                    ),
+                    error_type=type(exc).__name__,
+                )
             raise
-        self._raise_if_remote_fill_restart_required()
-        return output
+        finally:
+            if watchdog_armed:
+                try:
+                    faulthandler.cancel_dump_traceback_later()
+                except Exception as exc:
+                    log_cold_perf_event(
+                        "decoder_sample_stall_watchdog_error",
+                        request_ids=request_ids,
+                        once=True,
+                        operation="cancel",
+                        error_type=type(exc).__name__,
+                    )
+            for request_id in active_request_ids:
+                forget_cold_perf_request(request_id)
 
     def load_model(self) -> None:
         if self.vllm_config.model_config.enable_sleep_mode:
@@ -972,7 +1312,12 @@ class NPUWorker(WorkerBase):
         self.model_runner.reset_encoder_cache()
 
     def execute_dummy_batch(self) -> None:
+        started = time.perf_counter() if cold_perf_enabled() else None
         self.model_runner._dummy_run(num_tokens=self.model_runner.decode_token_per_req, uniform_decode=True)
+        if started is not None:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            if elapsed_ms >= _COLD_PERF_SLOW_EXECUTE_MS:
+                _report_worker_delay(self, "decoder_dummy_slow", elapsed_ms=round(elapsed_ms, 3))
 
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""

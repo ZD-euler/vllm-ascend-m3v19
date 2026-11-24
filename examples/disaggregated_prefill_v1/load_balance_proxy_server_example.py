@@ -178,11 +178,11 @@ def _encode_json_payload(payload: Any) -> bytes:
 
 
 if __package__:
-    from .pd_serving_perf import serving_perf_enabled as _proxy_cold_perf_enabled
+    from .pd_serving_perf import serving_perf_detailed_enabled as _proxy_cold_perf_enabled
     from .profile_routes import ProfileRequest, profile_capabilities, profile_response_chunks, profile_route
     from .remote_fill_placement import validate_remote_fill_placement
 else:
-    from pd_serving_perf import serving_perf_enabled as _proxy_cold_perf_enabled
+    from pd_serving_perf import serving_perf_detailed_enabled as _proxy_cold_perf_enabled
     from profile_routes import ProfileRequest, profile_capabilities, profile_response_chunks, profile_route
     from remote_fill_placement import validate_remote_fill_placement
 

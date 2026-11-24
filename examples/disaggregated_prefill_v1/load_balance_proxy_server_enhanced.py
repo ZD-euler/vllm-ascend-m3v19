@@ -56,11 +56,11 @@ logger = logging.getLogger(__name__)
 
 
 if __package__:
-    from .pd_serving_perf import serving_perf_enabled as _serving_perf_enabled
+    from .pd_serving_perf import serving_perf_detailed_enabled as _serving_perf_enabled
     from .profile_routes import ProfileRequest, profile_capabilities, profile_response, profile_route
     from .remote_fill_placement import validate_remote_fill_placement
 else:
-    from pd_serving_perf import serving_perf_enabled as _serving_perf_enabled
+    from pd_serving_perf import serving_perf_detailed_enabled as _serving_perf_enabled
     from profile_routes import ProfileRequest, profile_capabilities, profile_response, profile_route
     from remote_fill_placement import validate_remote_fill_placement
 

@@ -40,6 +40,7 @@ def _strict_bool_env(name: str, default: bool = False) -> bool:
 # begin-env-vars-definition
 
 env_variables: dict[str, Callable[[], Any]] = {
+    "PD_SERVING_PERF": lambda: os.getenv("PD_SERVING_PERF", "0").strip().lower(),
     "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE": lambda: _strict_bool_env(
         "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE"
     ),
