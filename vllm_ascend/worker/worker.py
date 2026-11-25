@@ -18,7 +18,10 @@
 #
 
 import copy
+import faulthandler
 import gc
+import time
+from functools import wraps
 from types import NoneType
 
 import torch
@@ -31,7 +34,7 @@ from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.distributed import ensure_model_parallel_initialized, init_distributed_environment
 from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
 from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized, get_kv_transfer_group, has_kv_transfer_group
-from vllm.distributed.parallel_state import Handle, get_ep_group, get_pp_group, get_tp_group
+from vllm.distributed.parallel_state import Handle, get_dcp_group, get_ep_group, get_pp_group, get_tp_group
 from vllm.logger import logger
 from vllm.lora.request import LoRARequest
 from vllm.sequence import IntermediateTensors
@@ -52,10 +55,25 @@ from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
+from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache import (
+    INDEX_TOPK,
+    RESIDENT_COUNT_CACHELINE_INTS,
+)
+from vllm_ascend.serving_perf import (
+    cold_perf_detailed_enabled,
+    cold_perf_enabled,
+    forget_cold_perf_request,
+    is_cold_perf_request,
+    log_cold_perf_event,
+    log_cold_perf_process_event,
+    mark_cold_perf_connector_requests,
+    mark_cold_perf_requests,
+)
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.utils import (
     AscendDeviceType,
     check_ascend_device_type,
+    enable_custom_op,
     enable_sp,
     get_ascend_device_type,
     register_ascend_customop,
@@ -79,6 +97,205 @@ _STAGED_SFA_GRAPH_MEMORY_MARGIN_RATIO = 1.1
 # Distinct supervisor-visible status for an unsafe armed RemoteFill DMA.
 # Deployment policy must restart the paired P+D serving group on this code.
 REMOTE_FILL_PAIRED_RESTART_EXIT_CODE = 86
+_COLD_PERF_STALL_SECONDS = 60
+_COLD_PERF_STALL_STAGGER_SECONDS = 5
+_COLD_PERF_SLOW_EXECUTE_MS = 500
+_COLD_PERF_REQUEST_IDS_ATTR = "_ascend_cold_perf_request_ids"
+_COLD_PERF_SAMPLE_RETURN_NS_ATTR = "_ascend_cold_perf_sample_return_ns"
+
+
+def _cold_perf_watchdog_rank_and_timeout() -> tuple[int, int]:
+    try:
+        tp_rank = int(get_tp_group().rank_in_group)
+    except Exception:
+        tp_rank = 0
+    return tp_rank, (
+        _COLD_PERF_STALL_SECONDS
+        + tp_rank * _COLD_PERF_STALL_STAGGER_SECONDS
+    )
+
+
+def _report_worker_delay(worker, event, **fields):
+    # Independent per worker so a slow non-output TP rank stays visible.
+    if not cold_perf_detailed_enabled():
+        reports = worker.__dict__.setdefault("_slow_phase_reported_at", {})
+        now = time.monotonic()
+        if now - reports.get(event, -float("inf")) < 60:
+            return
+        reports[event] = now
+    log_cold_perf_process_event(event, worker_rank=getattr(worker, "rank", None), **fields)
+
+
+def _trace_first_cold_perf_execute(method):
+    """Trace the first non-empty batch and every marked cold resume."""
+
+    @wraps(method)
+    def wrapped(self, scheduler_output, *args, **kwargs):
+        if not cold_perf_enabled():
+            return method(self, scheduler_output, *args, **kwargs)
+        entry_started = time.perf_counter()
+        entry_process_cpu_ns = time.process_time_ns()
+        entry_thread_cpu_ns = time.thread_time_ns()
+        scheduled = tuple(
+            str(req_id)
+            for req_id, count in getattr(
+                scheduler_output, "num_scheduled_tokens", {}
+            ).items()
+            if count
+        )
+        previous_return = getattr(self, "_cold_perf_last_execute_return", None)
+        previous_process_cpu_ns = getattr(
+            self, "_cold_perf_last_execute_process_cpu_ns", None
+        )
+        previous_thread_cpu_ns = getattr(
+            self, "_cold_perf_last_execute_thread_cpu_ns", None
+        )
+        previous_requests = getattr(
+            self, "_cold_perf_last_execute_requests", frozenset()
+        )
+        if previous_return is not None:
+            gap_ms = (entry_started - previous_return) * 1000
+            if gap_ms >= _COLD_PERF_SLOW_EXECUTE_MS and (overlap := set(previous_requests).intersection(scheduled)):
+                tp_rank, _ = _cold_perf_watchdog_rank_and_timeout()
+                _report_worker_delay(
+                    self,
+                    "decoder_submission_gap",
+                    tp_rank=tp_rank,
+                    gap_ms=round(gap_ms, 3),
+                    shared_request_count=len(overlap),
+                    shared_request_ids=sorted(overlap)[:8],
+                    previous_batch_size=len(previous_requests),
+                    current_batch_size=len(scheduled),
+                    process_cpu_ms=(
+                        round(
+                            (entry_process_cpu_ns - previous_process_cpu_ns) / 1_000_000,
+                            3,
+                        )
+                        if previous_process_cpu_ns is not None
+                        else None
+                    ),
+                    main_thread_cpu_ms=(
+                        round(
+                            (entry_thread_cpu_ns - previous_thread_cpu_ns) / 1_000_000,
+                            3,
+                        )
+                        if previous_thread_cpu_ns is not None
+                        else None
+                    ),
+                )
+
+        def record_finish() -> None:
+            completed = time.perf_counter()
+            completed_process_cpu_ns = time.process_time_ns()
+            completed_thread_cpu_ns = time.thread_time_ns()
+            elapsed_ms = (completed - entry_started) * 1000
+            if scheduled and elapsed_ms >= _COLD_PERF_SLOW_EXECUTE_MS:
+                tp_rank, _ = _cold_perf_watchdog_rank_and_timeout()
+                _report_worker_delay(
+                    self,
+                    "decoder_execute_slow",
+                    tp_rank=tp_rank,
+                    elapsed_ms=round(elapsed_ms, 3),
+                    batch_size=len(scheduled),
+                    request_ids=list(scheduled[:8]),
+                    process_cpu_ms=round(
+                        (completed_process_cpu_ns - entry_process_cpu_ns) / 1_000_000,
+                        3,
+                    ),
+                    main_thread_cpu_ms=round(
+                        (completed_thread_cpu_ns - entry_thread_cpu_ns) / 1_000_000,
+                        3,
+                    ),
+                )
+            self._cold_perf_last_execute_return = completed
+            self._cold_perf_last_execute_process_cpu_ns = completed_process_cpu_ns
+            self._cold_perf_last_execute_thread_cpu_ns = completed_thread_cpu_ns
+            self._cold_perf_last_execute_requests = scheduled
+
+        if not cold_perf_detailed_enabled():
+            try:
+                return method(self, scheduler_output, *args, **kwargs)
+            finally:
+                record_finish()
+        mark_cold_perf_connector_requests(
+            getattr(scheduler_output, "kv_connector_metadata", None)
+        )
+        if scheduled and not getattr(self, "_cold_perf_first_execute_marked", False):
+            self._cold_perf_first_execute_marked = True
+            mark_cold_perf_requests(scheduled)
+        request_ids = tuple(
+            req_id for req_id in scheduled if is_cold_perf_request(req_id)
+        )
+        if not request_ids:
+            try:
+                return method(self, scheduler_output, *args, **kwargs)
+            finally:
+                record_finish()
+
+        tp_rank, watchdog_timeout = _cold_perf_watchdog_rank_and_timeout()
+        log_cold_perf_event(
+            "decoder_execute_rpc_entry",
+            request_ids=request_ids,
+            once=True,
+            tp_rank=tp_rank,
+        )
+        log_cold_perf_event(
+            "decoder_execute_stall_watchdog_armed",
+            request_ids=request_ids,
+            once=True,
+            tp_rank=tp_rank,
+            timeout_seconds=watchdog_timeout,
+        )
+        watchdog_armed = False
+        try:
+            try:
+                faulthandler.dump_traceback_later(watchdog_timeout)
+                watchdog_armed = True
+            except Exception as exc:
+                log_cold_perf_event(
+                    "decoder_execute_stall_watchdog_error",
+                    request_ids=request_ids,
+                    once=True,
+                    operation="arm",
+                    error_type=type(exc).__name__,
+                )
+            output = method(self, scheduler_output, *args, **kwargs)
+            log_cold_perf_event(
+                "decoder_execute_rpc_return",
+                request_ids=request_ids,
+                once=True,
+                elapsed_ms=round(
+                    (time.perf_counter() - entry_started) * 1000, 3
+                ),
+                output_type=type(output).__name__,
+            )
+            return output
+        except BaseException as exc:
+            log_cold_perf_event(
+                "decoder_execute_rpc_error",
+                request_ids=request_ids,
+                once=True,
+                elapsed_ms=round(
+                    (time.perf_counter() - entry_started) * 1000, 3
+                ),
+                error_type=type(exc).__name__,
+            )
+            raise
+        finally:
+            if watchdog_armed:
+                try:
+                    faulthandler.cancel_dump_traceback_later()
+                except Exception as exc:
+                    log_cold_perf_event(
+                        "decoder_execute_stall_watchdog_error",
+                        request_ids=request_ids,
+                        once=True,
+                        operation="cancel",
+                        error_type=type(exc).__name__,
+                    )
+            record_finish()
+
+    return wrapped
 
 
 def _staged_sfa_graph_memory_reservation(estimate: int) -> int:
@@ -260,6 +477,87 @@ class NPUWorker(WorkerBase):
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
+    def _configure_dsa_decoder_dcp(self) -> None:
+        """Select the split-cache backend before loading the model or opening storage."""
+        config = self.vllm_config
+        parallel = self.parallel_config
+        model = self.model_config
+        hf = model.hf_text_config
+        transfer = config.kv_transfer_config
+        dcp = parallel.decode_context_parallel_size
+        if (
+            dcp == 1 or not transfer.is_kv_consumer or not model.use_mla
+            or not hasattr(hf, "index_topk")
+            or not envs_ascend.VLLM_ASCEND_DSA_UNBUNDLE
+            or not envs_ascend.VLLM_ASCEND_DSA_TWO_GROUPS
+            or envs_ascend.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
+        ):
+            return
+        if (
+            self.use_v2_model_runner or get_ascend_device_type() != AscendDeviceType.A2
+            or dcp not in (2, 4, 8) or dcp != parallel.tensor_parallel_size
+            or dcp != parallel.local_world_size or parallel.pipeline_parallel_size != 1
+            or parallel.prefill_context_parallel_size != 1
+            or parallel.enable_dbo or parallel.enable_elastic_ep
+        ):
+            raise ValueError("Decoder DCP requires V1 on A2, local DCP=TP and PP=PCP=1 without DBO or elastic EP")
+        spec = self.speculative_config
+        if spec is not None and (
+            spec.method not in ("mtp", "deepseek_mtp") or spec.num_speculative_tokens != 1
+            or spec.draft_tensor_parallel_size != dcp
+            or spec.parallel_drafting or spec.disable_padded_drafter_batch
+            or model.uses_mrope or model.uses_xdrope_dim
+            or spec.draft_model_config.uses_mrope or spec.draft_model_config.uses_xdrope_dim
+        ):
+            raise ValueError("Decoder DCP supports one padded MTP draft token with matching TP and ordinary RoPE")
+        eager = model.enforce_eager and self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+        full_graph = (
+            not model.enforce_eager and envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH
+            and staged_sfa_graph_configured(config)
+        )
+        if not (eager or full_graph):
+            raise ValueError("Decoder DCP requires eager execution or a full SFA graph")
+        if envs_ascend.VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP and (
+            not full_graph or not envs_ascend.VLLM_ASCEND_SFA_SHARED_RESIDENT_PLAN
+        ):
+            raise ValueError("Decoder DCP retrieval overlap requires full SFA graphs with shared resident plans")
+        if envs_ascend.VLLM_ASCEND_SFA_ASYNC_MTP_PREP and (not full_graph or spec is None):
+            raise ValueError("Decoder DCP async MTP preparation requires full SFA graphs and one MTP draft token")
+        if parallel.data_parallel_size > 1 and parallel.distributed_executor_backend == "external_launcher":
+            raise ValueError("Decoder DCP requires internal DP execution")
+        if (
+            self.cache_config.block_size != 128 or parallel.cp_kv_cache_interleave_size != 128
+            or self.cache_dtype not in (torch.float16, torch.bfloat16) or self.cache_dtype != model.dtype
+            or (hf.kv_lora_rank, hf.qk_rope_head_dim, hf.index_head_dim, hf.index_topk) != (512, 64, 128, INDEX_TOPK)
+            or not envs_ascend.VLLM_ASCEND_DSA_SHARED_POOL
+            or envs_ascend.VLLM_ASCEND_DSA_SHRINK_LATENT != 2
+            or not envs_ascend.VLLM_ASCEND_DSA_RESIDENT_CACHE
+            or envs_ascend.VLLM_ASCEND_DSA_DISABLE_INDEX_LMCACHE
+            or envs_ascend.VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD
+            or envs_ascend.VLLM_ASCEND_DSA_USE_ADAPTER_CACHE
+            or (config.additional_config or {}).get("enable_dsa_cp", False) or enable_sp(config)
+        ):
+            raise ValueError("Decoder DCP requires the two-group resident SFA layout with 128-token interleave")
+        if not enable_custom_op() or not all(
+            hasattr(torch.ops._C_ascend, name) for name in (
+                "npu_sparse_flash_attention_dcp", "npu_dsa_resident_dcp_union_", "npu_dsa_resident_dcp_plan_"
+            )
+        ):
+            raise ValueError("Rebuild vllm-ascend with the decoder DCP custom operators")
+
+        from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+
+        connector = KVConnectorFactory.get_connector_class(transfer)
+        probe = getattr(connector, "get_dsa_compact_startup_policy", None)
+        policy = probe(config) if callable(probe) else None
+        if (
+            not isinstance(policy, tuple) or len(policy) != 2
+            or any(type(value) is not int for value in policy)
+            or policy[0] != INDEX_TOPK * (1 + config.num_speculative_tokens) or policy[1] < 0
+        ):
+            raise ValueError("Decoder DCP requires an LMCache receiver with a valid compact startup policy")
+        config._dsa_decoder_dcp_policy = policy
+
     def _init_device(self):
         device = torch.device(f"npu:{self.local_rank}")
         torch.npu.set_device(device)
@@ -275,6 +573,18 @@ class NPUWorker(WorkerBase):
 
         gc.collect()
         torch.npu.empty_cache()
+
+        transfer = self.vllm_config.kv_transfer_config
+        if transfer is not None and transfer.kv_connector == "LMCacheAscendConnectorV1Dynamic":
+            self._configure_dsa_decoder_dcp()
+            try:
+                from lmcache.v1.rpc.storage_bootstrap import early_bootstrap_decoder_storage
+            except ModuleNotFoundError as exc:
+                if exc.name != "lmcache.v1.rpc.storage_bootstrap":
+                    raise
+                self._decoder_storage_bootstrap = None
+            else:
+                self._decoder_storage_bootstrap = early_bootstrap_decoder_storage(self)
 
         # take current memory snapshot
         self.init_snapshot = MemorySnapshot()
@@ -315,7 +625,13 @@ class NPUWorker(WorkerBase):
         # binding cpu
         if get_ascend_config().enable_cpu_binding:
             try:
-                bind_cpus(self.local_rank)
+                # Early storage bootstrap has already mapped/registered the
+                # shared slab. Its NUMA placement belongs to the storage owner;
+                # migratepages on an ACL TID would target the worker's whole mm.
+                bind_cpus(
+                    self.local_rank,
+                    migrate_memory=getattr(self, "_decoder_storage_bootstrap", None) is None,
+                )
             except Exception as e:
                 logger.warning(f"Bind cpus failed in rank{self.local_rank}: {e} Skip binding cpu.")
         return device
@@ -343,6 +659,26 @@ class NPUWorker(WorkerBase):
 
                 runner_cls = AsyncSFAModelRunner
             self.model_runner = runner_cls(self.vllm_config, self.device)
+
+    def _profile_dsa_decoder_dcp(self) -> None:
+        from vllm_ascend.ops.triton.sfa_dcp import execute_sfa_dcp
+
+        rows = self.scheduler_config.max_num_batched_tokens
+        heads = self.model_config.get_num_attention_heads(self.parallel_config)
+        block = self.cache_config.block_size
+        options = dict(dtype=self.cache_dtype, device=self.device)
+        query = torch.empty((rows, heads, 512), **options)
+        rope = torch.empty((rows, heads, 64), **options)
+        cache = (torch.empty((1, block, 1, 512), **options), torch.empty((1, block, 1, 64), **options))
+        indices = torch.full((rows, 1, INDEX_TOPK), -1, dtype=torch.int32, device=self.device)
+        counts = indices.new_zeros((rows, RESIDENT_COUNT_CACHELINE_INTS))
+        # Empty selections still exercise both collectives and the native
+        # workspace at maximum query capacity without live KV allocations.
+        execute_sfa_dcp(
+            query, rope, cache, indices, counts, indices.new_zeros((1, 1)),
+            indices.new_full((1,), rows), indices.new_zeros((1,)), 1.0, get_dcp_group(),
+        )
+        torch.npu.synchronize()
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
@@ -397,6 +733,16 @@ class NPUWorker(WorkerBase):
             )
 
         free_gpu_memory = profile_result.after_profile.free_memory
+        dcp_memory_reservation = 0
+        if isinstance(getattr(self.vllm_config, "_dsa_decoder_dcp_policy", None), tuple):
+            # The normal model profile has no attention metadata or KV cache.
+            # Warm and charge the actual counted SFA workspace and collectives
+            # in addition to its model activation peak.
+            with memory_profiling(profile_result.after_profile) as dcp_profile:
+                self._profile_dsa_decoder_dcp()
+            dcp_memory_reservation = max(0, dcp_profile.torch_peak_increase) + max(0, dcp_profile.non_torch_increase)
+            free_gpu_memory = dcp_profile.after_profile.free_memory
+            logger.info("Reserved %.2f GiB for decoder DCP attention and collectives", GiB(dcp_memory_reservation))
         assert self.init_snapshot.free_memory > free_gpu_memory, (
             "Error in memory profiling. "
             f"Initial free memory {GiB(self.init_snapshot.free_memory)} GiB, "
@@ -410,6 +756,7 @@ class NPUWorker(WorkerBase):
             self.requested_memory
             - profile_result.non_kv_cache_memory
             - graph_memory_reservation
+            - dcp_memory_reservation
         )
 
         # DSA latent KV offload (GLM5.1): reserve fixed scratch + decode-latent
@@ -487,6 +834,7 @@ class NPUWorker(WorkerBase):
             # down the full executor instead of continuing with unsafe memory.
             raise SystemExit(REMOTE_FILL_PAIRED_RESTART_EXIT_CODE)
 
+    @_trace_first_cold_perf_execute
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -570,18 +918,145 @@ class NPUWorker(WorkerBase):
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        self._raise_if_remote_fill_restart_required()
-        try:
-            output = self.model_runner.sample_tokens(grammar_output)
-        except BaseException:
-            # A failed draft/sample must release the bound request metadata.
+        active_request_ids = tuple(
+            getattr(self.model_runner, "_cold_perf_current_req_ids", ()) or ()
+        )
+        request_ids = tuple(
+            dict.fromkeys(
+                active_request_ids
+                + tuple(
+                    getattr(
+                        self.model_runner,
+                        "_cold_perf_sample_trace_req_ids",
+                        (),
+                    )
+                    or ()
+                )
+            )
+        )
+        production = cold_perf_enabled() and not cold_perf_detailed_enabled()
+        if production:
+            self.model_runner._slow_sample_phases = None
+        rpc_started = time.perf_counter() if request_ids or production else 0.0
+        diagnostic_active = bool(active_request_ids)
+        watchdog_armed = False
+        if diagnostic_active:
+            tp_rank, watchdog_timeout = _cold_perf_watchdog_rank_and_timeout()
+            log_cold_perf_event(
+                "decoder_sample_rpc_entry",
+                request_ids=request_ids,
+                once=True,
+                tp_rank=tp_rank,
+            )
+            log_cold_perf_event(
+                "decoder_sample_stall_watchdog_armed",
+                request_ids=request_ids,
+                once=True,
+                tp_rank=tp_rank,
+                timeout_seconds=watchdog_timeout,
+            )
             try:
-                self.model_runner.abort_kv_connector_finalize()
-            finally:
-                self._raise_if_remote_fill_restart_required()
+                faulthandler.dump_traceback_later(watchdog_timeout)
+                watchdog_armed = True
+            except Exception as exc:
+                log_cold_perf_event(
+                    "decoder_sample_stall_watchdog_error",
+                    request_ids=request_ids,
+                    once=True,
+                    operation="arm",
+                    error_type=type(exc).__name__,
+                )
+        try:
+            self._raise_if_remote_fill_restart_required()
+            try:
+                output = self.model_runner.sample_tokens(grammar_output)
+            except BaseException:
+                # Speculative execution defers connector finalization until
+                # after the draft pass. A failed draft/sample must not leave
+                # request metadata bound for the next scheduler step.
+                try:
+                    self.model_runner.abort_kv_connector_finalize()
+                finally:
+                    self._raise_if_remote_fill_restart_required()
+                raise
+            self._raise_if_remote_fill_restart_required()
+            if production:
+                elapsed_ms = (time.perf_counter() - rpc_started) * 1000
+                if elapsed_ms >= _COLD_PERF_SLOW_EXECUTE_MS:
+                    phases = self.model_runner._slow_sample_phases or {}
+                    _report_worker_delay(
+                        self,
+                        "decoder_sample_rpc_slow",
+                        elapsed_ms=round(elapsed_ms, 3),
+                        request_ids=list(getattr(self, "_cold_perf_last_execute_requests", ()))[:8],
+                        dominant_phase=max(phases, key=phases.__getitem__).removesuffix("_wall_ms") if phases else None,
+                        **phases,
+                    )
+                return output
+            if request_ids:
+                sample_return_ns = time.perf_counter_ns()
+                rpc_elapsed_ms = (time.perf_counter() - rpc_started) * 1000
+                for diagnostic_output in (
+                    output,
+                    getattr(output, "_model_runner_output", None),
+                ):
+                    try:
+                        setattr(
+                            diagnostic_output,
+                            _COLD_PERF_REQUEST_IDS_ATTR,
+                            request_ids,
+                        )
+                        setattr(
+                            diagnostic_output,
+                            _COLD_PERF_SAMPLE_RETURN_NS_ATTR,
+                            sample_return_ns,
+                        )
+                    except (AttributeError, TypeError):
+                        pass
+                if diagnostic_active:
+                    log_cold_perf_event(
+                        "decoder_sample_rpc_return",
+                        request_ids=request_ids,
+                        once=True,
+                        elapsed_ms=round(rpc_elapsed_ms, 3),
+                        output_type=type(output).__name__,
+                    )
+                elif rpc_elapsed_ms >= _COLD_PERF_SLOW_EXECUTE_MS:
+                    log_cold_perf_event(
+                        "decoder_sample_rpc_slow",
+                        request_ids=request_ids,
+                        require_active=False,
+                        elapsed_ms=round(rpc_elapsed_ms, 3),
+                        output_type=type(output).__name__,
+                    )
+            return output
+        except BaseException as exc:
+            if request_ids:
+                log_cold_perf_event(
+                    "decoder_sample_rpc_error",
+                    request_ids=request_ids,
+                    once=True,
+                    require_active=diagnostic_active,
+                    elapsed_ms=round(
+                        (time.perf_counter() - rpc_started) * 1000, 3
+                    ),
+                    error_type=type(exc).__name__,
+                )
             raise
-        self._raise_if_remote_fill_restart_required()
-        return output
+        finally:
+            if watchdog_armed:
+                try:
+                    faulthandler.cancel_dump_traceback_later()
+                except Exception as exc:
+                    log_cold_perf_event(
+                        "decoder_sample_stall_watchdog_error",
+                        request_ids=request_ids,
+                        once=True,
+                        operation="cancel",
+                        error_type=type(exc).__name__,
+                    )
+            for request_id in active_request_ids:
+                forget_cold_perf_request(request_id)
 
     def load_model(self) -> None:
         if self.vllm_config.model_config.enable_sleep_mode:
@@ -609,7 +1084,9 @@ class NPUWorker(WorkerBase):
         ):
             return
         ep_group = get_ep_group()
-        ep_group.barrier()
+        from vllm_ascend.worker.sfa_agreement import initialize_single_agreement
+
+        initialize_single_agreement(self.model_runner, ep_group)
 
     def compile_or_warm_up_model(self) -> float:
         self._wait_for_decoder_ep_startup()
@@ -640,10 +1117,61 @@ class NPUWorker(WorkerBase):
         # may cause performance degradation at runtime.
         if get_ascend_device_type() != AscendDeviceType.A5:
             self._warm_up_atb()
+        if not getattr(self, "use_v2_model_runner", False):
+            from vllm_ascend.ops.triton.decode_warmup import warmup_decode_kernels
+
+            warmup_decode_kernels(self.model_runner)
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
+        single = getattr(self.model_runner, "_sfa_single_agreement", None)
+        # A supervised cohort selects independent mode or this fallback after
+        # capture qualification. Never activate both live protocols.
+        if single is not None and getattr(self, "dp_guardian", None) is None:
+            single.activate(self.model_runner._sfa_full_graph.entries)
         return self.vllm_config.compilation_config.compilation_time
+
+    def independent_dp_contract(self) -> dict:
+        """Validate the loaded/captured path before the supervisor activates it."""
+        from vllm_ascend.worker.sfa_independent import execution_contract
+
+        self._independent_dp_contract = execution_contract(self.model_runner)
+        return self._independent_dp_contract
+
+    def activate_independent_dp(self, enabled: bool) -> None:
+        """Select a startup-agreed mode; no live switch back to DP votes is allowed."""
+        from vllm.distributed import get_tp_group
+
+        from vllm_ascend.worker.sfa_independent import IndependentDP
+
+        if getattr(self.model_runner, "_sfa_independent", None) is not None:
+            raise RuntimeError("Independent DP execution is already active")
+        if enabled:
+            contract = self._independent_dp_contract
+            if not contract.get("digest") or getattr(self, "dp_guardian", None) is None:
+                raise RuntimeError("Independent DP has no qualified supervised contract")
+            self.model_runner._sfa_independent = IndependentDP(
+                get_tp_group(),
+                self.parallel_config.data_parallel_size,
+                contract["capacity"],
+            )
+            self.model_runner._sfa_single_agreement = None
+        else:
+            single = getattr(self.model_runner, "_sfa_single_agreement", None)
+            if single is not None:
+                single.activate(self.model_runner._sfa_full_graph.entries)
+            self.dp_guardian.close()
+            self.dp_guardian = None
+
+    def drain_independent_dp(self) -> None:
+        """Drain existing resource owners only after group-wide model quiescence."""
+        from vllm.distributed.kv_transfer import ensure_kv_transfer_shutdown
+
+        self.release_sfa_graph_resources()
+        ensure_kv_transfer_shutdown()
+        storage = getattr(self, "_decoder_storage_bootstrap", None)
+        if storage is not None:
+            storage.close()
 
     def _warm_up_atb(self):
         x = torch.rand((2, 4), dtype=torch.float16).npu()
@@ -795,7 +1323,12 @@ class NPUWorker(WorkerBase):
         self.model_runner.reset_encoder_cache()
 
     def execute_dummy_batch(self) -> None:
+        started = time.perf_counter() if cold_perf_enabled() else None
         self.model_runner._dummy_run(num_tokens=self.model_runner.decode_token_per_req, uniform_decode=True)
+        if started is not None:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            if elapsed_ms >= _COLD_PERF_SLOW_EXECUTE_MS:
+                _report_worker_delay(self, "decoder_dummy_slow", elapsed_ms=round(elapsed_ms, 3))
 
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""
@@ -871,11 +1404,22 @@ class NPUWorker(WorkerBase):
     def shutdown(self) -> None:
         from vllm_ascend.core.selected_kv import close_selected_kv_worker
 
+        graph_released = False
+        super_shutdown_ok = False
         try:
             close_selected_kv_worker(self)
         finally:
-            self.release_sfa_graph_resources()
-            super().shutdown()
+            try:
+                self.release_sfa_graph_resources()
+                graph_released = True
+            finally:
+                try:
+                    super().shutdown()
+                    super_shutdown_ok = True
+                finally:
+                    storage = getattr(self, "_decoder_storage_bootstrap", None)
+                    if storage is not None and graph_released and super_shutdown_ok:
+                        storage.close()
 
     def check_health(self) -> None:
         self._raise_if_remote_fill_restart_required()

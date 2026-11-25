@@ -365,6 +365,10 @@ class BalanceScheduler(Scheduler):
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
 
+                if num_computed_tokens < getattr(request, "min_kv_prefix_tokens", 0):
+                    self._finish_kv_admission_error(request, num_computed_tokens)
+                    continue
+
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
@@ -427,6 +431,21 @@ class BalanceScheduler(Scheduler):
                 # creates a mismatch between the number
                 # of local and remote blocks.
                 effective_lookahead_tokens = 0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
+                dsa_compact_external_load = False
+                if self._dsa_dcp and load_kv_async:
+                    compact_load = getattr(self.connector, "is_dsa_cold_compact_load", None)
+                    restore_extent = getattr(self.connector, "get_dsa_cold_load_num_tokens", None)
+                    if not callable(compact_load) or not callable(restore_extent):
+                        raise RuntimeError("DCP requires connector load layout and restore extent")
+                    dsa_compact_external_load = compact_load(request_id)
+                    effective_lookahead_tokens = max(
+                        effective_lookahead_tokens,
+                        restore_extent(request_id) - num_new_local_computed_tokens - num_external_computed_tokens,
+                    )
+                if self._dsa_dcp and self._reject_impossible_initial_dsa_request(
+                    request, compact_external_load=dsa_compact_external_load,
+                ):
+                    continue
 
                 # Determine if we need to allocate cross-attention blocks.
                 num_encoder_tokens = 0
@@ -442,6 +461,7 @@ class BalanceScheduler(Scheduler):
                     num_external_computed_tokens=num_external_computed_tokens,
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
+                    dsa_compact_external_load=dsa_compact_external_load,
                 )
 
                 if new_blocks is None:
@@ -478,6 +498,8 @@ class BalanceScheduler(Scheduler):
                     # into the WAITING_FOR_REMOTE_KV state.
                     skipped_waiting_requests.prepend_request(request)
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    if self._dsa_dcp:
+                        request.num_computed_tokens = num_computed_tokens
                     continue
 
                 self.running.append(request)

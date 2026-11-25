@@ -25,7 +25,7 @@ import re
 import torch
 from torch import nn
 from vllm.config import CacheConfig, get_current_vllm_config
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_dcp_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.mla import MLAModules, MultiHeadLatentAttentionWrapper
@@ -36,7 +36,13 @@ from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
 from vllm_ascend import envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-from vllm_ascend.utils import is_vl_model, parse_layer_idx, vllm_version_is
+from vllm_ascend.utils import (
+    enable_dsa_cp_decoder,
+    is_vl_model,
+    parse_layer_idx,
+    sfa_full_graph_enabled,
+    vllm_version_is,
+)
 
 
 class IndexerWrapper(nn.Module):
@@ -164,6 +170,7 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
         # Model profiling compiles before KV allocation. Select the operator
         # from startup configuration, never from a late-created cache tensor.
         self.use_retrieval_overlap = bool(envs_ascend.VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP)
+        self.use_full_graph_sfa = self.use_cross_layer_sfa and sfa_full_graph_enabled(vllm_config)
 
         compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -187,7 +194,15 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
             need_gather_q_kv = _EXTRA_CTX.flash_comm_v1_enabled
             output = torch.empty(hidden_states.shape, dtype=hidden_states.dtype, device=hidden_states.device)
 
-        if self.use_cross_layer_sfa:
+        if self.use_full_graph_sfa:
+            impl = self.mla_attn.impl
+            group = impl.shared_resident_plan
+            torch.ops.vllm.sfa_forward_full(
+                hidden_states, need_gather_q_kv, output, self.prefix, self.next_layer_name,
+                group.reads if group is not None and impl.skip_topk else [],
+                group.writes if group is not None and not impl.skip_topk else [],
+            )
+        elif self.use_cross_layer_sfa:
             impl = self.mla_attn.impl
             group = impl.shared_resident_plan
             pre_op = torch.ops.vllm.sfa_forward_pre_shared if group is not None else torch.ops.vllm.sfa_forward_pre
@@ -349,9 +364,13 @@ def sfa_forward_pre_fake(
     request_capacity: int,
     scratch_capacity: int,
 ) -> StagedSFABridge:
+    query_capacity = token_capacity
+    if enable_dsa_cp_decoder():
+        tp = get_tensor_model_parallel_world_size()
+        query_capacity = (token_capacity + tp - 1) // tp
     return (
-        hidden_states.new_empty((token_capacity, local_num_heads, kv_lora_rank)),
-        hidden_states.new_empty((token_capacity, local_num_heads, qk_rope_head_dim)),
+        hidden_states.new_empty((query_capacity, local_num_heads, kv_lora_rank)),
+        hidden_states.new_empty((query_capacity, local_num_heads, qk_rope_head_dim)),
         torch.empty(
             (token_capacity, 1, index_topk),
             dtype=torch.int32,
@@ -431,6 +450,94 @@ def sfa_forward_pre_shared_fake(
         request_capacity,
         scratch_capacity,
     )
+
+
+def sfa_forward_full(
+    hidden_states: torch.Tensor,
+    need_gather_q_kv: bool,
+    output: torch.Tensor,
+    layer_name: str,
+    next_layer_name: str,
+    resident_reads: list[torch.Tensor],
+    resident_writes: list[torch.Tensor],
+) -> None:
+    """Keep planner aliases internal while declaring shared state mutations.
+
+    The same pre/retrieve/post routines retain fallback, capture and overlap
+    ordering. Only a full graph with an active shared plan bypasses the bridge.
+    """
+    context = get_forward_context()
+    impl, attn_layer_name, kv_cache, metadata = _mla_runtime_state(layer_name)
+    group = impl.shared_resident_plan
+    direct = getattr(context, "sfa_full_graph_active", False) and group is not None and group.active
+    pending = []
+    early = direct and getattr(impl, "_dcp_early_gather", False) and getattr(metadata, "sfa_dcp", None) is not None
+    query_first = (
+        early and getattr(impl, "_dcp_query_first", False) and impl.skip_topk
+        and not impl.has_indexer and not impl.dsa_cp_decoder
+        and getattr(context, "staged_sfa_graph_key", None) is not None
+    )
+    incoming_edge = None
+    if early and impl.skip_topk:
+        incoming, _ = impl._shared_retrieval_edges()
+        incoming_edge = incoming.get(attn_layer_name) if query_first else None
+        if incoming_edge is not None and not incoming_edge.pending_capture_launch:
+            raise RuntimeError("Q-first DCP consumer has no pending incoming retrieval")
+        # The opt-in reorder exposes current-KV work even on prefetched layers.
+        early = query_first or attn_layer_name not in incoming
+
+    def join_incoming():
+        if incoming_edge is not None and incoming_edge.pending_capture_launch:
+            incoming_edge.join()
+
+    def query_ready(query, rope):
+        from vllm_ascend.ops.triton.sfa_dcp import start_sfa_dcp_query_gather
+
+        if pending:
+            raise RuntimeError("DCP query gather submitted twice in one attention call")
+        pending.append(start_sfa_dcp_query_gather(query, rope, get_dcp_group()))
+        join_incoming()
+
+    try:
+        query, rope, topk, selected, counts, slots = impl.cross_layer_graph_pre(
+            attn_layer_name, hidden_states, kv_cache, metadata, need_gather_q_kv, output,
+            resident_reads=resident_reads or None, resident_writes=resident_writes or None,
+            copy_bridge=not direct, **({"query_ready": query_ready} if early else {}),
+            **({"query_first": True} if query_first else {}),
+        )
+        impl.cross_layer_lmcache_retrieve(
+            attn_layer_name, next_layer_name, selected, counts, slots, metadata, context,
+        )
+        _, outgoing = impl._shared_retrieval_edges()
+        edge = outgoing.get(attn_layer_name)
+        prefetch = None
+        if edge is not None:
+            capacity = edge.transfer.request_capacity
+            prefetch = (edge, selected[:capacity], counts[:capacity], slots[:capacity], edge.destinations)
+        impl.cross_layer_graph_post(
+            attn_layer_name, query, rope, topk, kv_cache, metadata, output, prefetch=prefetch,
+            **({"query_gather": pending[0]} if pending else {}),
+        )
+    finally:
+        try:
+            join_incoming()
+        finally:
+            if pending:
+                # Usually already joined before SFA. Also protect packet lifetime
+                # if planning/retrieval fails after asynchronous submission.
+                pending[0].wait()
+
+
+def sfa_forward_full_fake(
+    hidden_states: torch.Tensor,
+    need_gather_q_kv: bool,
+    output: torch.Tensor,
+    layer_name: str,
+    next_layer_name: str,
+    resident_reads: list[torch.Tensor],
+    resident_writes: list[torch.Tensor],
+) -> None:
+    return
 
 
 def sfa_lmcache_retrieve(
@@ -536,6 +643,13 @@ def sfa_forward_post_fake(
     return
 
 
+direct_register_custom_op(
+    op_name="sfa_forward_full",
+    op_func=sfa_forward_full,
+    mutates_args=["output", "resident_writes"],
+    fake_impl=sfa_forward_full_fake,
+    dispatch_key="PrivateUse1",
+)
 direct_register_custom_op(
     op_name="sfa_forward_pre",
     op_func=sfa_forward_pre,

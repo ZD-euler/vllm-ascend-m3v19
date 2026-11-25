@@ -40,11 +40,13 @@ from vllm_ascend.utils import (
     COMPRESSED_TENSORS_METHOD,
     AscendDeviceType,
     check_kv_extra_config,
+    dsa_cp_decoder_configured,
     flashcomm2_enable,
     get_ascend_device_type,
     is_moe_model,
     refresh_block_size,
     staged_sfa_graph_configured,
+    sfa_full_graph_enabled,
     update_aclgraph_sizes,
     update_cudagraph_capture_sizes,
     is_310p,
@@ -252,6 +254,10 @@ class NPUPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+        # Read before AscendCompilationConfig expands its default-true field.
+        sfa_npugraph_ex_requested = bool(
+            vllm_config.additional_config.get("ascend_compilation_config", {}).get("enable_npugraph_ex", False)
+        )
         from vllm_ascend.quantization.utils import maybe_auto_detect_quantization
 
         if vllm_config.model_config is not None:
@@ -366,6 +372,13 @@ class NPUPlatform(Platform):
             vllm_config.parallel_config.tensor_parallel_size > 1
             and not vllm_config.model_config.enforce_eager
             and enable_sp(vllm_config)
+            # Decoder staged SFA pads communication operands, not graph rows.
+            # Its sizes and capacity limits are validated by update_aclgraph_sizes below.
+            and not (
+                staged_sfa_graph_configured(vllm_config)
+                and (not vllm_config.additional_config.get("enable_dsa_cp", True)
+                     or dsa_cp_decoder_configured(vllm_config))
+            )
         ):
             original_sizes = compilation_config.cudagraph_capture_sizes
             sp_aclgraph_sizes = vllm_config.update_sizes_for_sequence_parallelism(original_sizes)
@@ -418,7 +431,15 @@ class NPUPlatform(Platform):
             if mla_split_op not in compilation_config.splitting_ops:
                 compilation_config.splitting_ops.append(mla_split_op)
             update_aclgraph_sizes(vllm_config)
-            ascend_config.ascend_compilation_config.enable_npugraph_ex = False
+            full_sfa = cross_layer_sfa and sfa_full_graph_enabled(vllm_config)
+            ascend_config.ascend_compilation_config.enable_npugraph_ex = full_sfa and sfa_npugraph_ex_requested
+            if full_sfa:
+                # Spawned workers must see the effective choice, not a default
+                # inserted above. Normalization must be idempotent.
+                vllm_config.additional_config["ascend_compilation_config"]["enable_npugraph_ex"] = (
+                    ascend_config.ascend_compilation_config.enable_npugraph_ex
+                )
+                logger.info_once("Full SFA npugraph_ex optimization: %s", sfa_npugraph_ex_requested)
         elif (
             compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
             or compilation_config.cudagraph_mode == CUDAGraphMode.FULL
@@ -570,6 +591,22 @@ class NPUPlatform(Platform):
                 "fused mc2 op cannot be used with hierarchy communication."
                 "Please disable VLLM_ASCEND_ENABLE_FUSED_MC2 by setting it to 0."
             )
+
+        requested = envs_ascend.VLLM_ASCEND_SFA_INDEPENDENT_DP
+        reason = ""
+        if requested:
+            from vllm_ascend.worker.sfa_independent import topology_reason
+
+            reason = topology_reason(vllm_config)
+        lease = envs_ascend.VLLM_ASCEND_SFA_GUARD_TIMEOUT_S
+        vllm_config._sfa_independent_options = dict(
+            requested=requested,
+            single=envs_ascend.VLLM_ASCEND_SFA_SINGLE_AGREEMENT,
+            eligible=not reason,
+            reason=reason,
+            lease=lease,
+            valid_lease=math.isfinite(lease) and 2 <= lease <= 86400,
+        )
 
     @classmethod
     def import_kernels(cls) -> None:

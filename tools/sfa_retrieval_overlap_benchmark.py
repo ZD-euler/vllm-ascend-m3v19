@@ -15,7 +15,8 @@ import torch
 import torch_npu
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from vllm_ascend.compilation.sfa_retrieval_overlap import CaptureProbe, RetrievalEdge
+from tests.sfa_capture_probe import CaptureProbe
+from vllm_ascend.compilation.sfa_retrieval_overlap import RetrievalEdge
 
 
 class Workload:

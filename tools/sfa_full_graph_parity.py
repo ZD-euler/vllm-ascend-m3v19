@@ -192,7 +192,7 @@ def parse_devices(devices: str) -> tuple[int, ...]:
     return indices
 
 
-def child_environment(mode: str, devices: str) -> dict[str, str]:
+def child_environment(mode: str, devices: str, *, flashcomm1: bool = False) -> dict[str, str]:
     """Use local fresh CPU caches, never a running server's remote/shared store."""
     environment = {
         k: v for k, v in os.environ.items() if not k.startswith(("LMCACHE_", "VLLM_")) and k != "MOONCAKE_CONFIG_PATH"
@@ -225,7 +225,7 @@ def child_environment(mode: str, devices: str) -> dict[str, str]:
             "VLLM_ASCEND_MTP_DRAFT_DEBUG": "0",
             "VLLM_ASCEND_MTP_DW_DIAG": "0",
             "VLLM_ASCEND_MTP_DW_DEEP_DIAG": "0",
-            "VLLM_ASCEND_ENABLE_FLASHCOMM1": "0",
+            "VLLM_ASCEND_ENABLE_FLASHCOMM1": str(int(flashcomm1)),
             "VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE": "0",
         }
     )
@@ -269,6 +269,11 @@ def engine_options(args: argparse.Namespace) -> dict:
             "kv_connector_module_path": "lmcache_ascend.integration.vllm.lmcache_ascend_connector_v1",
         },
         additional_config={
+            **(
+                {"enable_flashcomm1": True, "enable_dsa_cp": getattr(args, "dsa_cp", False)}
+                if getattr(args, "flashcomm1", False) or getattr(args, "dsa_cp", False)
+                else {}
+            ),
             "sfa_parity": {
                 "mode": args.child,
                 "reference": args.reference,
@@ -277,7 +282,7 @@ def engine_options(args: argparse.Namespace) -> dict:
                 "rtol": args.rtol,
                 "trace_residual": getattr(args, "trace_residual", False),
                 "compare_output": compare_output,
-            }
+            },
         },
     )
 
@@ -443,6 +448,8 @@ def run_pair(
     rtol: float = 1e-2,
     trace_residual: bool = False,
     compare_output: bool = False,
+    flashcomm1: bool = False,
+    dsa_cp: bool = False,
 ) -> None:
     """Start two sequential fresh engines, sharing weights across selected NPUs."""
     if not Path(model, "config.json").is_file():
@@ -450,7 +457,11 @@ def run_pair(
     if any(not math.isfinite(value) or value < 0 for value in (atol, rtol)):
         raise ValueError("Tolerances must be finite and nonnegative")
     tp_size = len(parse_devices(devices))
-    print("[SFA_PARITY] scope=target_decode; prefill computes ONCE; graph imports target+MTP checkpoints", flush=True)
+    print(
+        f"[SFA_PARITY] scope=target_decode; flashcomm1={flashcomm1 or dsa_cp}; dsa_cp={dsa_cp}; "
+        "prefill computes ONCE; graph imports target+MTP checkpoints",
+        flush=True,
+    )
     if compare_output:
         print(
             f"[SFA_OUTPUT] unrestricted greedy target + real MTP proposals; generate {OUTPUT_TOKENS} tokens", flush=True
@@ -477,8 +488,12 @@ def run_pair(
                     str(rtol),
                     *(["--trace-residual"] if trace_residual else []),
                     *(["--compare-output"] if compare_output else []),
+                    *(["--flashcomm1"] if flashcomm1 else []),
+                    *(["--dsa-cp"] if dsa_cp else []),
                 ],
-                env=child_environment("graph" if mode == "preflight" else mode, devices),
+                env=child_environment(
+                    "graph" if mode == "preflight" else mode, devices, flashcomm1=flashcomm1 or dsa_cp
+                ),
                 check=True,
             )
         eager = json.loads(Path(directory, "eager-summary.json").read_text())
@@ -523,6 +538,12 @@ def main() -> None:
     parser.add_argument("--rtol", type=float, default=1e-2)
     parser.add_argument("--trace-residual", action="store_true", help="Add residual-path probes for mismatch diagnosis")
     parser.add_argument(
+        "--flashcomm1", action="store_true", help="Test FC1-only eager/graph parity with DSA-CP disabled"
+    )
+    parser.add_argument(
+        "--dsa-cp", action="store_true", help="Test decoder DSA-CP eager/graph parity; implies FlashComm1"
+    )
+    parser.add_argument(
         "--compare-output",
         action="store_true",
         help="Finish both greedy generations, compare tokens/text and report absolute stage statistics",
@@ -544,6 +565,8 @@ def main() -> None:
             rtol=args.rtol,
             trace_residual=args.trace_residual,
             compare_output=args.compare_output,
+            flashcomm1=args.flashcomm1,
+            dsa_cp=args.dsa_cp,
         )
 
 

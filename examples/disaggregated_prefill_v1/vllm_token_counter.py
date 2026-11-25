@@ -42,9 +42,9 @@ logger = logging.getLogger(__name__)
 
 
 if __package__:
-    from .pd_serving_perf import serving_perf_enabled as _serving_perf_enabled
+    from .pd_serving_perf import serving_perf_detailed_enabled as _serving_perf_enabled
 else:
-    from pd_serving_perf import serving_perf_enabled as _serving_perf_enabled
+    from pd_serving_perf import serving_perf_detailed_enabled as _serving_perf_enabled
 
 
 def _check_vllm_available():

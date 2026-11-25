@@ -2,7 +2,7 @@
 import copy
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -56,21 +56,24 @@ from vllm_ascend.compilation.acl_graph import (
     update_full_graph_params,
 )
 from vllm_ascend.ops.triton.spec_decode.utils import (
+    PREPARE_INPUTS_BLOCK_SIZE as _PREPARE_INPUTS_BLOCK_SIZE,
+)
+from vllm_ascend.ops.triton.spec_decode.utils import (
     pack_mtp_tokens_positions_kernel,
+    prepare_dcp_mtp_draft_kernel,
     prepare_inputs_padded_kernel,
     prepare_next_mtp_tokens_kernel,
 )
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 from vllm_ascend.utils import (
+    enable_dsa_cp,
+    enable_dsa_cp_decoder,
     enable_sp,
     lmhead_tp_enable,
     shared_expert_dp_enabled,
     staged_sfa_graph_capture_sizes,
     staged_sfa_graph_configured,
 )
-
-# Currently we will fix block size to a small one since `num_reqs` can't be too large
-_PREPARE_INPUTS_BLOCK_SIZE = 4
 
 
 @dataclass
@@ -98,16 +101,18 @@ def _maybe_eager_context(vllm_config):
 
 
 # split hidden states along dimension of sequence
-def split_inputs_tp_to_sp(hidden_states, out):
+def split_inputs_tp_to_sp(hidden_states, out=None):
     # tp and sp share the same group
     group = get_tp_group()
 
     world_size = group.world_size
-    rank = group.rank
+    rank = group.rank_in_group
 
     num_tokens = hidden_states.shape[0]
     # the size per rank after padded
     padded_num_tokens_per_rank = (num_tokens + world_size - 1) // world_size
+    if out is None:
+        out = hidden_states.new_zeros((padded_num_tokens_per_rank, *hidden_states.shape[1:]))
     # compute the start and end of slice
     start = padded_num_tokens_per_rank * rank
     end = padded_num_tokens_per_rank * (rank + 1)
@@ -137,6 +142,7 @@ class SpecDecodeBaseProposer(EagleProposer):
         self.dcp_size = self.runner.dcp_size
         self.pcp_rank = self.runner.pcp_rank
         self.dcp_rank = self.runner.dcp_rank
+        dsa_decoder_dcp = getattr(self.runner, "dsa_decoder_dcp", False)
 
         self.full_indices = range(
             self.runner.max_num_tokens * self.pcp_size * self.dcp_size
@@ -172,7 +178,7 @@ class SpecDecodeBaseProposer(EagleProposer):
         )
         self.use_cuda_graph = self.runner._use_aclgraph() and (
             not self.speculative_config.enforce_eager or staged_mtp_graph_requested
-        )
+        ) and not getattr(self.runner, "dsa_decoder_dcp", False)
         if self.method == "mtp":
             self.use_cuda_graph = (
                 self.use_cuda_graph
@@ -207,9 +213,7 @@ class SpecDecodeBaseProposer(EagleProposer):
             torch.zeros(slot_mapping_lens, dtype=torch.int32, device=device, pin_memory=self.runner.pin_memory)
             for _ in range(self.num_speculative_tokens)
         ]
-        # Multi-step MTP must keep one stable slot buffer per draft step for
-        # each physical KV group.  Allocate the second set only when it can be
-        # used so the common MTP=1 path pays no memory or copy overhead.
+        # Multi-step MTP and DCP draft masking need private Group-1 slots.
         self.indexer_slot_mapping_group = (
             [
                 torch.zeros(
@@ -220,9 +224,14 @@ class SpecDecodeBaseProposer(EagleProposer):
                 )
                 for _ in range(self.num_speculative_tokens)
             ]
-            if getattr(self.runner, "dsa_two_groups", False) is True and self.num_speculative_tokens > 1
+            if getattr(self.runner, "dsa_two_groups", False) is True and (
+                self.num_speculative_tokens > 1 or dsa_decoder_dcp
+            )
             else []
         )
+        if dsa_decoder_dcp:
+            self._dcp_draft_positions = torch.empty(self.max_num_tokens, dtype=torch.int32, device=device)
+            self._dcp_draft_lengths = torch.empty(self.runner.max_num_reqs, dtype=torch.int32, device=device)
         self._staged_mtp_metadata_arenas: list[_DraftStepMetadataArena] = []
         self._staged_mtp_arena_capacity = 0
         self._mtp_draft_diag_proposal_id = 0
@@ -852,6 +861,46 @@ class SpecDecodeBaseProposer(EagleProposer):
             if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and not _EXTRA_CTX.capturing:
                 self._update_full_graph_params(forward_context, num_tokens, multi_steps_attn_metadata)
 
+    def _prepare_dcp_draft_metadata(
+        self, common: AscendCommonAttentionMetadata, num_tokens: int, num_input_tokens: int,
+        rejected: torch.Tensor | None,
+    ) -> None:
+        dcp = common.sfa_dcp
+        assert dcp is not None and common.indexer_slot_mapping is not None
+        requests = common.num_reqs
+        layout = dcp.layout
+        positions = self._get_positions(num_input_tokens)
+        slots0 = self.slot_mapping_group[0][:num_input_tokens]
+        slots1 = self.indexer_slot_mapping_group[0][:num_input_tokens]
+        causal_positions = self._dcp_draft_positions[:num_input_tokens]
+        local_lengths = self._dcp_draft_lengths[:requests]
+        prepare_dcp_mtp_draft_kernel[(min(requests, get_vectorcore_num()),)](
+            common.query_start_loc, common.seq_lens, rejected, layout.live_origins, positions,
+            common.slot_mapping, common.indexer_slot_mapping, causal_positions, slots0, slots1,
+            local_lengths, requests, WORLD=layout.world_size, RANK=layout.rank,
+            BLOCK_SIZE=self.runner.block_size, TILE=64,
+        )
+        if num_input_tokens > num_tokens:
+            positions[num_tokens:].zero_()
+            slots0[num_tokens:].fill_(PADDING_SLOT_ID)
+            slots1[num_tokens:].fill_(PADDING_SLOT_ID)
+        common.positions, common.slot_mapping, common.indexer_slot_mapping = positions, slots0, slots1
+        planner_counts = (
+            self.runner._dsa_dcp_planner_counts if dcp.compact_rows is not None else self.runner._dsa_dcp_counts
+        )
+        layout = replace(
+            layout, live_origins=layout.live_origins[:requests],
+            selected_counts=planner_counts[:requests * self.runner.decode_threshold],
+        )
+        # Target and draft run in order on the same stream. Only the planner
+        # workspace is reused, while draft visibility and slots stay private.
+        common.sfa_dcp = replace(
+            dcp, layout=layout, positions=causal_positions, local_seq_lens=local_lengths,
+            topk=self.runner._dsa_dcp_topk[:num_input_tokens],
+            counts=self.runner._dsa_dcp_counts[:num_input_tokens], last_plan=None,
+            mask_indexer_writes=rejected is not None,
+        )
+
     def _propose(
         self,
         # [num_tokens]
@@ -899,7 +948,7 @@ class SpecDecodeBaseProposer(EagleProposer):
             num_prefill_reqs=num_prefill_reqs,
             num_decode_reqs=num_decode_reqs,
         )
-        if self.pcp_size * self.dcp_size > 1:
+        if self.pcp_size * self.dcp_size > 1 and self.runner.use_cp:
             assert long_seq_args is not None
             query_lens_d, ori_token_indices_to_sample = long_seq_args
         assert self.runner is not None
@@ -993,10 +1042,19 @@ class SpecDecodeBaseProposer(EagleProposer):
         # only tensor which will be used in current FIA.
         # Strictly speaking, `query_start_loc`, `seq_lens` should also have
         # their memory allocated separately for each step just like `slot_mapping`.
-        slot_mapping_lens = common_attn_metadata.slot_mapping.shape[0]
-        self.slot_mapping_group[0][:slot_mapping_lens].copy_(common_attn_metadata.slot_mapping[:slot_mapping_lens])
-        self.slot_mapping_group[0][slot_mapping_lens:].fill_(-1)
-        common_attn_metadata.slot_mapping = self.slot_mapping_group[0]
+        if getattr(self.runner, "dsa_decoder_dcp", False):
+            if getattr(common_attn_metadata, "sfa_dcp", None) is None:
+                raise RuntimeError("Decoder DCP draft is missing the target cache layout")
+            # Q1 can pass the target's common metadata directly to _propose.
+            common_attn_metadata = copy.copy(common_attn_metadata)
+            self._prepare_dcp_draft_metadata(
+                common_attn_metadata, num_tokens, num_input_tokens, num_rejected_tokens_gpu,
+            )
+        else:
+            slot_mapping_lens = common_attn_metadata.slot_mapping.shape[0]
+            self.slot_mapping_group[0][:slot_mapping_lens].copy_(common_attn_metadata.slot_mapping[:slot_mapping_lens])
+            self.slot_mapping_group[0][slot_mapping_lens:].fill_(-1)
+            common_attn_metadata.slot_mapping = self.slot_mapping_group[0]
         if self.num_speculative_tokens > 1:
             indexer_block_table, indexer_slot_mapping = self._validate_independent_group1_metadata(common_attn_metadata)
         else:
@@ -1428,7 +1486,9 @@ class SpecDecodeBaseProposer(EagleProposer):
             packed = (
                 HAS_TRITON and getattr(self, "_fixed_mtp_pipeline_ready", False)
                 and self.method == "mtp" and self.num_speculative_tokens == 1
-                and self.pcp_size == self.dcp_size == 1 and not self.uses_mrope and not self.uses_xdrope_dim
+                and self.pcp_size == 1
+                and (self.dcp_size == 1 or (getattr(self.runner, "dsa_decoder_dcp", False) and not self.runner.use_cp))
+                and not self.uses_mrope and not self.uses_xdrope_dim
                 and not self.vllm_config.model_config.uses_mrope
                 and token_indices_to_sample.data_ptr() == self.token_indices_to_sample.data_ptr()
                 and target_positions.ndim == target_token_ids.ndim == 1
@@ -1452,7 +1512,7 @@ class SpecDecodeBaseProposer(EagleProposer):
             # update pcp related params
             ori_token_indices_to_sample = None
             query_lens_d = None
-            if self.pcp_size * self.dcp_size > 1:
+            if self.pcp_size * self.dcp_size > 1 and self.runner.use_cp:
                 assert long_seq_metadata is not None
                 cad.prefill_context_parallel_metadata = long_seq_metadata
                 ori_token_indices_to_sample = token_indices_to_sample.clone()
@@ -1849,7 +1909,9 @@ class SpecDecodeBaseProposer(EagleProposer):
             fixed = getattr(self.runner, "_fixed_mtp_metadata", None) if spec_decode_metadata is not None else None
             fixed_q2 = (
                 fixed is not None and getattr(self, "_fixed_mtp_pipeline_ready", False) and self.use_async_scheduling
-                and self.pcp_size == self.dcp_size == 1 and not self.needs_extra_input_slots
+                and self.pcp_size == 1
+                and (self.dcp_size == 1 or (getattr(self.runner, "dsa_decoder_dcp", False) and not self.runner.use_cp))
+                and not self.needs_extra_input_slots
                 and sampled_token_ids.stride() == (sampled_token_ids.shape[1], 1)
                 and common_attn_metadata.num_reqs == num_reqs
                 and common_attn_metadata.num_actual_tokens == 2 * num_reqs and common_attn_metadata.max_query_len == 2
@@ -2182,6 +2244,7 @@ class SpecDecodeBaseProposer(EagleProposer):
                 "resident_state_generations_cpu",
                 None,
             ),
+            sfa_dcp=getattr(common_attn_metadata, "sfa_dcp", None),
             positions=common_attn_metadata.positions,
             attn_state=self.runner.attn_state,
             decode_token_per_req=self.runner.decode_token_per_req,
@@ -2287,6 +2350,9 @@ class SpecDecodeBaseProposer(EagleProposer):
             return hidden_states, positions
         if self.method == "mtp":
             if _EXTRA_CTX.flash_comm_v1_enabled:
+                if not enable_dsa_cp() or enable_dsa_cp_decoder():
+                    # Target states and positions are already replicated, not partial sums.
+                    return split_inputs_tp_to_sp(hidden_states), split_inputs_tp_to_sp(positions)
                 hidden_states = torch.ops.vllm.maybe_pad_and_reduce(hidden_states)
                 positions = positions.unsqueeze(-1)
                 positions = torch.ops.vllm.maybe_pad_and_reduce(positions)
@@ -2303,7 +2369,7 @@ class SpecDecodeBaseProposer(EagleProposer):
         hidden_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         if self.method == "mtp":
-            if self.enable_shared_expert_dp:
+            if _EXTRA_CTX.flash_comm_v1_enabled:
                 last_hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
                     last_hidden_states.contiguous(), True
                 )

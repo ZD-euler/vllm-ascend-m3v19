@@ -10,7 +10,7 @@ graph capture. The hot path only invokes custom NPU operators.
 """
 
 from dataclasses import dataclass, field
-from functools import lru_cache
+from functools import lru_cache, partial
 
 import torch
 
@@ -26,17 +26,30 @@ MAX_RESIDENT_SHARDS_PER_ROW = 4
 
 
 @lru_cache(maxsize=1)
-def configure_resident_kernels() -> None:
+def configure_resident_kernels() -> bool:
     """Select serving kernels once before capture, never in the decode path."""
     from vllm_ascend import envs
 
+    query_membership = envs.VLLM_ASCEND_DSA_RESIDENT_QUERY_MEMBERSHIP
     try:
         configure = torch.ops._C_ascend.configure_dsa_resident_exact_kernels
     except AttributeError as exc:
         raise RuntimeError(
             "Rebuild the vLLM-Ascend serving extension to select resident kernels"
         ) from exc
+    if query_membership and not (
+        hasattr(torch.ops._C_ascend, "npu_dsa_resident_membership_union_")
+        and hasattr(torch.ops._C_ascend, "npu_dsa_resident_membership_plan_")
+    ):
+        raise RuntimeError("Rebuild the vLLM-Ascend serving extension to use resident query membership")
     configure(envs.VLLM_ASCEND_DSA_RESIDENT_EXACT_KERNELS)
+    configure_dcp = getattr(torch.ops._C_ascend, "configure_dsa_resident_dcp_free_slots", None)
+    free_slots = envs.VLLM_ASCEND_DSA_DCP_FREE_SLOT_FIRST
+    if configure_dcp is not None:
+        configure_dcp(free_slots)
+    elif free_slots:
+        raise RuntimeError("Rebuild the vLLM-Ascend serving extension to use DCP free-slot-first residency")
+    return query_membership
 
 
 def resident_shard_count(
@@ -98,6 +111,16 @@ class SortedResidentWorkspace:
     miss_tokens: torch.Tensor
     miss_counts: torch.Tensor
     target_slots: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class ResidentDcpLayout:
+    """Rank-local live origins and cacheline-separated SFA row counts."""
+
+    world_size: int
+    rank: int
+    live_origins: torch.Tensor
+    selected_counts: torch.Tensor
 
 
 @dataclass
@@ -283,14 +306,25 @@ def prepare_resident_sharded_union_(
     workspace: SortedResidentWorkspace,
     *,
     mtp: int,
+    query_membership: bool = False,
+    dcp: ResidentDcpLayout | None = None,
 ) -> None:
     """Create sorted shards and intersect them with resident state."""
     resident_shard_count(mtp)
     try:
-        op = torch.ops._C_ascend.npu_dsa_resident_sharded_union_
+        if dcp is not None:
+            op = partial(
+                torch.ops._C_ascend.npu_dsa_resident_dcp_union_,
+                dcp_size=dcp.world_size,
+                dcp_rank=dcp.rank,
+            )
+        elif query_membership:
+            op = torch.ops._C_ascend.npu_dsa_resident_membership_union_
+        else:
+            op = torch.ops._C_ascend.npu_dsa_resident_sharded_union_
     except AttributeError as error:
         raise RuntimeError(
-            "vllm_ascend_C does not expose npu_dsa_resident_sharded_union_; rebuild the extension"
+            "vllm_ascend_C does not expose the selected resident union; rebuild the extension"
         ) from error
     op(
         topk_indices,
@@ -439,10 +473,24 @@ def prepare_sorted_resident_cache_fused_(
     workspace: SortedResidentWorkspace,
     *,
     block_size: int,
+    query_membership: bool = False,
+    dcp: ResidentDcpLayout | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the production fused state update and top-k remap."""
     try:
-        op = torch.ops._C_ascend.npu_dsa_resident_sorted_plan_
+        if dcp is not None:
+            op = partial(
+                torch.ops._C_ascend.npu_dsa_resident_dcp_plan_,
+                fused_remap=True,
+                live_origins=dcp.live_origins,
+                selected_counts=dcp.selected_counts,
+                dcp_size=dcp.world_size,
+                dcp_rank=dcp.rank,
+            )
+        elif query_membership:
+            op = torch.ops._C_ascend.npu_dsa_resident_membership_plan_
+        else:
+            op = torch.ops._C_ascend.npu_dsa_resident_sorted_plan_
     except AttributeError as error:
         raise RuntimeError(
             "vllm_ascend_C does not expose the fused sorted resident planner; rebuild the extension"

@@ -37,7 +37,7 @@ native loading where needed.
 - Native two-plane main KV: BF16 or FP16 with 512 non-RoPE and 64 RoPE elements
   per row, 128-token pages and indexer TopK width 2048.
 - At most 16,384 scheduled tokens and 256 requests per step. Selected histories
-  must be at least 16,384 tokens and total sequence length (history plus query)
+  must be at least 49,152 tokens and total sequence length (history plus query)
   must not exceed 1,048,576 tokens; request selection also depends on
   query/history geometry and source-cache availability. Fixed planner output
   workspace scales with `max_num_seqs` up to `min(1,048,576, 2048 * local_q_cap)`
@@ -52,7 +52,8 @@ native loading where needed.
   with per-rank local-query TopK planning, causal masking of current-step tokens
   when a request straddles a TP rank boundary, and Group-0 dense DMA skipping
   when all cached history pages are owned by ondemand-selected. FlashComm2
-  (`VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE > 0`), the DSA-CP `o_proj` TP path
+  (`VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE > 0`), decoder DSA-CP
+  (`enable_dsa_cp_decoder`), the DSA-CP `o_proj` TP path
   (`enable_dsa_cp_with_o_proj_tp`), VL first-layer CP layouts, encoder-decoder
   models, sleep mode, DBO and the v2 model runner are unsupported.
 - DSA latent offload must be disabled; it bypasses the attention path that

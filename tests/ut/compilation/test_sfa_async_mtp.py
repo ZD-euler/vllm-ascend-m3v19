@@ -4,12 +4,13 @@
 
 import ast
 import sys
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -28,6 +29,8 @@ class Kernel:
     def __init__(self, events):
         self.tl = HostTL()
         self.tl.static_range = range
+        self.tl.minimum = lambda a, b: torch.minimum(torch.as_tensor(a), torch.as_tensor(b))
+        self.tl.maximum = lambda a, b: torch.maximum(torch.as_tensor(a), torch.as_tensor(b))
         self.body = extract(KERNEL, "prepare_async_mtp_kernel", {"tl": self.tl})
         self.events = events
 
@@ -35,7 +38,7 @@ class Kernel:
         def launch(*args, **kwargs):
             self.events.append("kernel")
             ptrs = [Pointer(t) for t in args[:9]]
-            for name in ("slots_c8", "table_c8"):
+            for name in ("slots_c8", "table_c8", "live_origins", "seq_local"):
                 if name in kwargs:
                     kwargs[name] = Pointer(kwargs[name])
             self.tl.programs = grid[0]
@@ -58,7 +61,7 @@ def setup():
     events = []
     context = SimpleNamespace(staged_sfa_graph_dummy_run=False)
     source = ROOT.parent / "vllm/vllm/v1/worker/gpu_model_runner.py"
-    getter = extract(source, "_get_valid_sampled_token_count", {})
+    getter = extract(source, "_get_valid_sampled_token_count", {"record_function_or_nullcontext": nullcontext})
 
     class Base:
         _get_valid_sampled_token_count = getter
@@ -123,12 +126,14 @@ def setup():
         return positions.clone(), -positions.clone()
 
     ns = dict(
+        __file__=str(RUNNER),
         np=np,
         logger=SimpleNamespace(info=lambda *args: None),
         torch=torch,
         copy=copy,
         contextmanager=contextmanager,
         ExitStack=ExitStack,
+        record_function_or_nullcontext=nullcontext,
         dataclass=dataclass,
         Any=Any,
         NPUModelRunner=Base,
@@ -140,7 +145,9 @@ def setup():
         npu_content_diagnostics_enabled=lambda: False,
         _decode_window_save_window_size=lambda: 0,
         staged_sfa_metadata_sparse_route=lambda m, ids: (m.reason, m.frontiers, m.cold),
-        StagedSFARouteReason=SimpleNamespace(ELIGIBLE="eligible"),
+        StagedSFARouteReason=SimpleNamespace(
+            ELIGIBLE="eligible", DENSE_PREFIX_HIT="dense_prefix_hit", MIXED_CONNECTOR_LOAD="mixed_connector_load",
+        ),
         AscendAttentionState=SimpleNamespace(SpecDecoding="decode"),
         prepare_async_mtp_kernel=Kernel(events),
         prepare_async_mtp_tokens_kernel=AsyncMTPTokenKernel(events),
@@ -236,6 +243,7 @@ def setup():
     runner._staged_sfa_impls = (("l0", object()), ("l1", object()))
     runner._staged_sfa_layer_names = ("l0", "l1")
     runner._async_pending = runner._async_built = None
+    runner._async_validated_route = None
     runner._async_epoch = runner._async_counts_epoch = 1
     runner._async_counts = torch.tensor([1, 2, 1], dtype=torch.int64)
     runner._async_bases = torch.from_numpy(bases.copy())
@@ -586,6 +594,7 @@ def test_cpu_sampling_constraints_keep_original_preparation(setup, field):
 @pytest.mark.parametrize("unsupported", ["none", "triton", "async", "mtp", "pp", "cp"])
 def test_startup_contract_rejects_unsupported_modes(setup, unsupported):
     r, _, _, _, ns = setup
+    ns["logger"].info = Mock()
     r.vllm_config, r.device = object(), torch.device("cpu")
     r.max_num_reqs, r.use_async_scheduling, r._fixed_mtp_metadata = 3, True, ()
     r.parallel_config = SimpleNamespace(pipeline_parallel_size=1)
@@ -602,9 +611,11 @@ def test_startup_contract_rejects_unsupported_modes(setup, unsupported):
     if unsupported == "none":
         r.__init__()
         assert r._async_bases.shape == (3,)
+        ns["logger"].info.assert_called_once_with("[SFA async MTP] enabled: source=%s", str(RUNNER))
     else:
         with pytest.raises(ValueError, match="requires"):
             r.__init__()
+        ns["logger"].info.assert_not_called()
 
 
 def test_non_target_indexer_metadata_does_not_disable_async_entry(setup):
@@ -654,6 +665,76 @@ def test_unpadded_draft_lengths_and_padded_target_lengths(setup):
     assert events.index("replay") < events.index("sync")
 
 
+def _set_residency(r, scheduled, ns, residency):
+    frontiers = (0, 0, 0) if residency == "resident" else (4096, 0, 4096)
+    r._async_snapshot.frontiers = r._async_snapshot.boundary = frontiers
+    boundary = tuple(value for value in frontiers for _ in range(2)) + (0, 0)
+    r.item.decode_remap_boundary_buffer._values = r._async_snapshot.boundary_values = boundary
+    scheduled.kv_connector_metadata.frontiers = frontiers
+    scheduled.kv_connector_metadata.reason = "dense_prefix_hit" if residency == "resident" else "mixed_connector_load"
+    ns["get_forward_context"]().staged_sfa_route.frontiers = frontiers
+
+
+def _dcp_snapshot(r, scheduled, bases, origins, world=4, rank=1):
+    n = r.input_batch.num_reqs
+    r._async_snapshot.bases[:] = bases
+    r.input_batch.num_computed_tokens_cpu[:] = bases
+    r._async_bases.copy_(torch.as_tensor(bases))
+    scheduled.scheduled_cached_reqs.num_computed_tokens = (np.asarray(bases) + 2).tolist()
+    r._dsa_dcp_live_origins = np.array(origins, dtype=np.int32)
+    scheduled.dsa_dcp_compact_req_ids = {req for req, origin in zip(r.input_batch.req_ids, origins) if origin}
+    r.item.sfa_dcp = r._async_snapshot.common.sfa_dcp = SimpleNamespace(
+        layout=SimpleNamespace(world_size=world, rank=rank, live_origins=torch.tensor(origins, dtype=torch.int32)),
+        local_seq_lens=torch.full((n + 2,), -77, dtype=torch.int32),
+    )
+
+
+@pytest.mark.parametrize("change", ["none", "origin", "capacity"])
+@pytest.mark.parametrize("residency", ["resident", "mixed"])
+@pytest.mark.parametrize("world,rank", [(4, 1), (8, 0), (8, 7)])
+def test_async_dcp_reconciles_rank_local_slots_before_replay(setup, change, residency, world, rank):
+    r, s, shape, events, ns = setup
+    bases = np.array([8190, 8318, 8446], dtype=np.int32)
+    _set_residency(r, s, ns, residency)
+    origins = [0, 0, 0] if residency == "resident" else [4096, 0, 4096]
+    _dcp_snapshot(r, s, bases, origins, world, rank)
+    group0, group1 = r.input_batch.block_table.block_tables
+    group0.num_blocks_per_row[:3] = (bases + 3) // 128 // world + np.asarray(origins) // 128 + 1
+    group1.block_size, group1.kernel_sizes = 128, [128]
+    if change == "origin":
+        s.dsa_dcp_compact_req_ids.add("r1")
+    elif change == "capacity":
+        # Remove the last column needed by the two-token acceptance case.
+        group0.num_blocks_per_row[0] -= 1
+    r._update_states(s)
+    if change != "none":
+        assert r._async_pending is None and events == ["sync", "state_update"]
+        return
+    assert r._async_pending is s and events == []
+    r._prepare_inputs(s, np.array([2, 2, 2]))
+    metadata, common = r._build_attention_metadata(**shape)
+    assert metadata["l0"].sfa_dcp is common.sfa_dcp
+    dcp = common.sfa_dcp
+    r._model_forward()
+    assert events.index("kernel") < events.index("replay") < events.index("sync")
+    current = bases + np.array([1, 2, 1])
+    positions = np.repeat(current, 2) + np.tile([0, 1], 3)
+    assert r.positions.gpu.tolist() == [*positions, 0, 0]
+    for i, (position, origin) in enumerate(zip(positions, np.repeat(r._dsa_dcp_live_origins, 2))):
+        stripe, offset = divmod(position, 128)
+        expected = (
+            int(group0.table[i // 2, origin // 128 + stripe // world]) * 128 + offset
+            if stripe % world == rank else -1
+        )
+        assert r.item.slot_mapping[i] == expected
+        assert r.item.indexer_slot_mapping[i] == int(group1.table[i // 2, stripe]) * 128 + offset
+    expected_lengths = [
+        int(origin) + (end // (128 * world)) * 128 + min(128, max(0, end % (128 * world) - 128 * rank))
+        for origin, end in zip(r._dsa_dcp_live_origins, current + 2)
+    ]
+    assert dcp.local_seq_lens.tolist() == [*expected_lengths, 0, 0]
+
+
 def test_uniform_graph_cpu_lengths_may_alias_runner_buffer(setup):
     r, s, shape, _, ns = setup
     r.item.seq_lens = r.seq_lens.gpu
@@ -668,12 +749,27 @@ def test_uniform_graph_cpu_lengths_may_alias_runner_buffer(setup):
     assert common.seq_lens_cpu.tolist() == [5003, 5104, 5203, 0]
 
 
-def test_kernel_warmup_is_after_capture_and_uses_private_outputs(setup, monkeypatch):
-    r, _, _, events, _ = setup
+@pytest.mark.parametrize("dcp", [False, True])
+@pytest.mark.parametrize("mixed", [False, True])
+def test_kernel_warmup_is_after_capture_and_uses_private_outputs(setup, monkeypatch, dcp, mixed):
+    r, _, _, events, ns = setup
     r.max_num_reqs, r.device = 3, torch.device("cpu")
     r._sfa_full_graph = SimpleNamespace(entries=[r._async_snapshot.key])
     r._async_bases = torch.zeros(4, dtype=torch.int32)
     r.max_num_reqs = 4
+    r.dsa_decoder_dcp, r.dcp_size, r.dcp_rank = dcp, 4, 1
+    r.ascend_config = SimpleNamespace(indexer_c8_shared_block_factor=2 if mixed else 1)
+    original = ns["prepare_async_mtp_kernel"]
+
+    class CheckedKernel:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                assert kwargs.get("MIXED_C8", False) == mixed
+                assert ("live_origins" in kwargs) == dcp
+                original[grid](*args, **kwargs)
+            return launch
+
+    ns["prepare_async_mtp_kernel"] = CheckedKernel()
     r.drafter = SimpleNamespace(warmup_next_mtp_tokens=lambda: events.append("next_token_warmup"))
     for group in r.input_batch.block_table.block_tables:
         group.block_table = SimpleNamespace(gpu=group.table)
@@ -741,8 +837,12 @@ def test_deferred_update_matches_actual_vllm_request_bookkeeping(setup, monkeypa
         assert vars(r.requests[rid]) == vars(baseline.requests[rid])
 
 
-def test_many_rejections_never_accumulate_position_drift(setup):
-    r, s, shape, events, _ = setup
+@pytest.mark.parametrize("residency", ["sparse", "resident", "mixed"])
+def test_many_rejections_never_accumulate_position_drift(setup, residency):
+    r, s, shape, events, ns = setup
+    if residency != "sparse":
+        _set_residency(r, s, ns, residency)
+    ns["logger"].info = Mock()
     expected = r._async_snapshot.bases.copy()
     for step in range(60):
         counts = torch.tensor([1 + step % 2, 1, 2], dtype=torch.int64)
@@ -759,6 +859,10 @@ def test_many_rejections_never_accumulate_position_drift(setup):
         assert r._async_bases.tolist() == expected.tolist()
         assert events.index("replay") < events.index("sync")
     assert r.async_mtp_replays == 60
+    ns["logger"].info.assert_called_once_with(
+        "[SFA async MTP] first launch-before-reconcile batch: requests=%d connector_route=%s",
+        3, s.kv_connector_metadata.reason,
+    )
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -782,30 +886,41 @@ def test_runner_selection_happens_only_at_worker_startup(monkeypatch, enabled):
 
 
 @pytest.mark.parametrize("mixed", [False, True])
-def test_actual_npu_metadata_kernel_matches_cpu_slots_and_padding(monkeypatch, mixed):
+@pytest.mark.parametrize("world", [1, 4])
+def test_actual_npu_metadata_kernel_matches_cpu_slots_and_padding(monkeypatch, mixed, world):
     pytest.importorskip("torch_npu")
     pytest.importorskip("triton")
     if not torch.npu.is_available():
         pytest.skip("Requires NPU")
     module = load_module(KERNEL, "async_mtp_metadata_npu", monkeypatch)
     held = []
-    index_block = 128 if mixed else 64
-    for n, capacity in ((1, 8), (3, 8), (4, 8), (16, 32)):
+    for n, capacity in ((1, 8), (3, 8), (4, 8), (14, 28), (16, 32), (32, 64), (33, 80)):
         common_capacity = capacity // 2
-        bases = torch.arange(n, dtype=torch.int32) * 127 + 4095
+        # Include the reported startup specialization: 14 rows, 28 output tokens,
+        # and the actual unequal block-table strides of a 1M context deployment.
+        strides = (8192, 8208) if n == 14 else (128, 128)
+        index_block = 128 if mixed or n == 14 else 64
+        bases = torch.zeros(n, dtype=torch.int32) if n == 14 else torch.arange(n, dtype=torch.int32) * 127 + 4095
         actual_base = bases.to("npu")
         seq_common = torch.full((common_capacity,), -77, dtype=torch.int32, device="npu")
         seq_target = torch.full((common_capacity + 1,), -77, dtype=torch.int32, device="npu")
         positions = torch.full((capacity,), -77, dtype=torch.int64, device="npu")
         tables = [
-            torch.arange(common_capacity * 128, dtype=torch.int32).view(common_capacity, 128) + shift
-            for shift in (100, 900)
+            torch.arange(common_capacity * stride, dtype=torch.int32).view(common_capacity, stride) + shift
+            for stride, shift in zip(strides, (100, 900))
         ]
         device_tables = [t.to("npu") for t in tables]
         physical_table = (tables[1] * 3 + 7).npu() if mixed else None
         slots = [torch.full((capacity,), -77, dtype=torch.int32, device="npu") for _ in range(3 if mixed else 2)]
+        rank = world - 1
+        origins = torch.where(torch.arange(common_capacity, dtype=torch.int32) % 2 == 0, 4096, 0)
+        layout = {}
+        if world > 1:
+            seq_local = torch.empty_like(seq_target)
+            layout = dict(live_origins=origins.npu(), seq_local=seq_local, local_capacity=seq_local.numel(),
+                          DCP_WORLD=world, DCP_RANK=rank)
         for step in range(4):
-            counts = (torch.arange(n) + step) % 2 + 1
+            counts = torch.ones(n, dtype=torch.int64) if n == 14 and step == 0 else (torch.arange(n) + step) % 2 + 1
             module.prepare_async_mtp_kernel[((common_capacity + 32) // 32,)](
                 actual_base,
                 counts.to("npu"),
@@ -818,13 +933,13 @@ def test_actual_npu_metadata_kernel_matches_cpu_slots_and_padding(monkeypatch, m
                 capacity,
                 common_capacity,
                 common_capacity + 1,
-                128,
-                128,
+                *strides,
                 128,
                 index_block,
                 BLOCK=32,
+                **layout,
                 **(
-                    {"slots_c8": slots[2], "MIXED_C8": True, "table_c8": physical_table, "stride_c8": 128}
+                    {"slots_c8": slots[2], "MIXED_C8": True, "table_c8": physical_table, "stride_c8": strides[1]}
                     if mixed
                     else {}
                 ),
@@ -834,9 +949,14 @@ def test_actual_npu_metadata_kernel_matches_cpu_slots_and_padding(monkeypatch, m
                 ((bases[:, None].long() + torch.arange(2)).flatten(), torch.zeros(capacity - 2 * n, dtype=torch.int64))
             )
             expected_slots = []
-            for table, block in zip(tables, (128, index_block)):
+            for group, (table, block) in enumerate(zip(tables, (128, index_block))):
                 p = expected_pos[: 2 * n]
-                slot = table[torch.arange(n).repeat_interleave(2), p // block] * block + p % block
+                row = torch.arange(n).repeat_interleave(2)
+                column = p // block
+                slot = table[row, column] * block + p % block
+                if group == 0 and world > 1:
+                    local_column = column // world + origins[row] // block
+                    slot = torch.where(column % world == rank, table[row, local_column] * block + p % block, -1)
                 expected_slots.append(torch.cat((slot.int(), torch.full((capacity - 2 * n,), -1, dtype=torch.int32))))
             if mixed:
                 logical = expected_slots[1]
@@ -849,13 +969,20 @@ def test_actual_npu_metadata_kernel_matches_cpu_slots_and_padding(monkeypatch, m
                     expected_pos,
                     bases.clone() + 2,
                     expected_slots,
+                    seq_local.clone() if world > 1 else None,
+                    origins,
                 )
             )
     torch.npu.synchronize()
-    for positions, lengths, slots, expected_pos, expected_len, expected_slots in held:
+    for positions, lengths, slots, expected_pos, expected_len, expected_slots, local, origins in held:
         torch.testing.assert_close(positions.cpu(), expected_pos, rtol=0, atol=0)
         assert torch.equal(lengths[: len(expected_len)].cpu(), expected_len)
         assert torch.all(lengths[len(expected_len) :] == 0)
+        if local is not None:
+            tail = (expected_len % (world * 128) - rank * 128).clamp(0, 128)
+            assert torch.equal(local[:len(expected_len)].cpu(),
+                               origins[:len(expected_len)] + expected_len // (world * 128) * 128 + tail)
+            assert torch.all(local[len(expected_len):] == 0)
         for actual, expected in zip(slots, expected_slots):
             torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 

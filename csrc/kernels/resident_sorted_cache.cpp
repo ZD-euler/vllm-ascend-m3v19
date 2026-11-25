@@ -36,6 +36,12 @@
 #ifndef RESIDENT_EXPERIMENT_VECTOR_STATE
 #define RESIDENT_EXPERIMENT_VECTOR_STATE 0
 #endif
+#ifndef RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
+#define RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP 0
+#endif
+#ifndef RESIDENT_FREE_SLOT_FIRST
+#define RESIDENT_FREE_SLOT_FIRST 0
+#endif
 
 namespace {
 
@@ -55,6 +61,63 @@ constexpr uint32_t kShardMissCount = 1;
 constexpr uint32_t kShardEvictableCount = 2;
 constexpr uint32_t kShardOldCount = 3;
 constexpr uint32_t kShardSelectedEvictCount = 4;
+
+#ifdef RESIDENT_DCP_SHARDING
+constexpr uint32_t kDcpBlockBits = 7;
+constexpr uint32_t kDcpBlockSize = 1U << kDcpBlockBits;
+constexpr uint32_t kDcpCountStride = 16;
+
+__aicore__ inline void KeepDcpOwner(
+    AscendC::LocalTensor<uint8_t> selected,
+    AscendC::LocalTensor<uint8_t> ownerMask,
+    AscendC::LocalTensor<int32_t> tokens,
+    AscendC::LocalTensor<int32_t> blocks,
+    AscendC::LocalTensor<int32_t> scratch,
+    uint32_t bits, uint32_t rank, uint32_t width)
+{
+    AscendC::ShiftRight(blocks, tokens, static_cast<int32_t>(kDcpBlockBits), width);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::ShiftRight(scratch, blocks, static_cast<int32_t>(bits), width);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Muls(scratch, scratch, static_cast<int32_t>(1U << bits), width);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Sub(blocks, blocks, scratch, width);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Duplicate(scratch, static_cast<int32_t>(rank), width);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Compare(ownerMask, blocks, scratch, AscendC::CMPMODE::EQ, width);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::And(selected.ReinterpretCast<uint16_t>(), selected.ReinterpretCast<uint16_t>(),
+        ownerMask.ReinterpretCast<uint16_t>(), width / 16);
+    AscendC::PipeBarrier<PIPE_V>();
+}
+#endif
+
+#if RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
+// Only shard zero publishes the per-request row metadata. Finalize updates
+// the eviction field in this cacheline and preserves these three fields.
+constexpr uint32_t kMembershipValidRows = 5;
+constexpr uint32_t kMembershipBoundary = 6;
+// Compare works on whole 256-byte vector repeats. Align assembly segments to
+// one uint32 mask word so a row owner can publish their masks independently.
+constexpr uint32_t kMembershipCompareLanes = 64;
+constexpr uint32_t kMembershipMaskLanes = 32;
+
+__aicore__ inline uint32_t MembershipAlignUp(uint32_t count, uint32_t alignment)
+{
+    return (count + alignment - 1) & ~(alignment - 1);
+}
+
+__aicore__ inline AscendC::GatherMaskParams MembershipGatherParams()
+{
+    AscendC::GatherMaskParams params;
+    params.repeatTimes = 1;
+    params.src0BlockStride = 1;
+    params.src0RepeatStride = 8;
+    params.src1RepeatStride = 8;
+    return params;
+}
+#endif
 
 template <AscendC::HardEvent event>
 __aicore__ inline void Sync()
@@ -157,6 +220,13 @@ __aicore__ inline void CopyGlobalToLocalExact(
 // to one shard-local union entry.
 class DSAResidentShardedUnionKernel {
 public:
+#ifdef RESIDENT_DCP_SHARDING
+    __aicore__ inline void InitDcp(uint32_t bits, uint32_t rank)
+    {
+        dcpBits_ = bits;
+        dcpRank_ = rank;
+    }
+#endif
     __aicore__ inline void Init(
         __gm__ int32_t* topkIndices,
         __gm__ int32_t* splitBoundary,
@@ -278,9 +348,16 @@ public:
         pipe_.InitBuffer(
             mappingBuf_, requestWidth_ * sizeof(int16_t));
         pipe_.InitBuffer(shardMaskBuf_, maskBytes);
-        pipe_.InitBuffer(nonNegativeMaskBuf_, RESIDENT_EXPERIMENT_VECTOR_UNION ? requestWidth_ / 8 : maskBytes);
+        const uint32_t unionMaskBytes =
+            (RESIDENT_EXPERIMENT_VECTOR_UNION || RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP)
+            ? requestWidth_ / 8 : maskBytes;
+        pipe_.InitBuffer(nonNegativeMaskBuf_, unionMaskBytes);
         pipe_.InitBuffer(beforeBoundaryMaskBuf_, maskBytes);
-        pipe_.InitBuffer(selectedMaskBuf_, RESIDENT_EXPERIMENT_VECTOR_UNION ? requestWidth_ / 8 : maskBytes);
+        pipe_.InitBuffer(selectedMaskBuf_, unionMaskBytes);
+#if RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
+        // The third compare mask lives only during post-sort compaction.
+        pipe_.InitBuffer(nextOwnerMaskBuf_, unionMaskBytes);
+#endif
     }
 
     __aicore__ inline void Process()
@@ -339,6 +416,10 @@ public:
         gatherParams.src1RepeatStride = 8;
         uint32_t compactEnd = 0;
         uint32_t selectedElements = 0;
+#if RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
+        uint32_t validRows = 0;
+        int32_t boundaries[2] = {};
+#endif
         bool paddingZeroReady = false;
         bool paddingWritePending = false;
         for (uint32_t mtpRow = 0; mtpRow < rowsPerRequest_; ++mtpRow) {
@@ -381,6 +462,12 @@ public:
                 + static_cast<uint64_t>(mtpRow) * rowWidth_;
             const int32_t boundary =
                 ReadGlobalScalarFresh(splitBoundary_, row);
+#if RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
+            if (shard == 0) {
+                validRows |= 1U << mtpRow;
+                boundaries[mtpRow] = boundary;
+            }
+#endif
             AscendC::DataCopy(
                 input, topkIndices_[inputOffset], rowWidth_);
             Sync<AscendC::HardEvent::MTE2_V>();
@@ -440,10 +527,22 @@ public:
                 beforeBoundaryMask.ReinterpretCast<uint16_t>(),
                 rowWidth_ / 16);
             AscendC::PipeBarrier<PIPE_V>();
+#ifdef RESIDENT_DCP_SHARDING
+            KeepDcpOwner(selectedMask, shardMask, input, work, indices,
+                dcpBits_, dcpRank_, rowWidth_);
+#endif
+#if RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
+            // Sort32/MrgSort4 carry the payload as opaque uint32 bits.
+            // Encoding the one-hot tag as an exact float avoids an integer
+            // conversion after extracting the odd (payload) lanes.
+            const float queryTag = mtpRow == 0 ? 1.0F : 2.0F;
+            AscendC::Duplicate(indices.ReinterpretCast<float>(), queryTag, rowWidth_);
+#else
             AscendC::CreateVecIndex(
                 indices,
                 static_cast<int32_t>(mtpRow * rowWidth_),
                 rowWidth_);
+#endif
             AscendC::PipeBarrier<PIPE_V>();
 
             uint64_t tokenElements = 0;
@@ -502,6 +601,10 @@ public:
             WriteGlobalScalarVisible(shardCounts_, countOffset, static_cast<int32_t>(selectedElements));
             return;
         }
+#if RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
+        const uint32_t rank = VectorDeduplicateAndTag(
+            src, tmp, sortedTokens, mapping, selectedElements, sortElements);
+#else
         AscendC::Duplicate(
             mapping,
             static_cast<int16_t>(-1),
@@ -545,6 +648,7 @@ public:
                     original, static_cast<int16_t>(rank - 1));
             }
         }
+#endif
 
         if constexpr (RESIDENT_EXPERIMENT_UNION_STOP == 2) {
             Sync<AscendC::HardEvent::S_MTE3>();
@@ -667,8 +771,13 @@ public:
             CopyLocalToGlobalExact(
                 shardPacked_[shardOffset], sortedTokens, rank);
         }
-        AscendC::DataCopy(
-            shardMapping_[mappingOffset], mapping, requestWidth_);
+#if RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
+        // In this variant the existing int16 workspace stores one 0..3
+        // ownership value per union entry; only the count prefix is defined.
+        CopyLocalToGlobalExact(shardMapping_[mappingOffset], mapping, rank);
+#else
+        AscendC::DataCopy(shardMapping_[mappingOffset], mapping, requestWidth_);
+#endif
         if (rank > 0) {
             CopyLocalToGlobalExact(
                 priorSlots_[shardOffset], priorSlots, rank);
@@ -706,12 +815,113 @@ public:
         shardCounts_.SetValue(
             countOffset + kShardOldCount,
             static_cast<int32_t>(oldCount));
+#if RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
+        if (shard == 0) {
+            shardCounts_.SetValue(countOffset + kMembershipValidRows, static_cast<int32_t>(validRows));
+            shardCounts_.SetValue(countOffset + kMembershipBoundary, boundaries[0]);
+            shardCounts_.SetValue(countOffset + kMembershipBoundary + 1, boundaries[1]);
+        }
+#endif
         // SetValue updates the per-core DCache first. Publish the completed
         // cacheline so finalize blocks on other cores observe this launch.
         PublishGlobalCacheLine(shardCounts_, countOffset);
     }
 
 private:
+#if RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
+    __aicore__ inline uint32_t VectorDeduplicateAndTag(
+        AscendC::LocalTensor<float> src, AscendC::LocalTensor<float> tmp,
+        AscendC::LocalTensor<int32_t> tokens, AscendC::LocalTensor<int16_t> members,
+        uint32_t selected, uint32_t sortWidth)
+    {
+        if (selected == 0) {
+            return 0;
+        }
+        auto keys = compactTokenBuf_.Get<float>();
+        auto tags = compactIndexBuf_.Get<float>();
+        auto extract = MembershipGatherParams();
+        extract.repeatTimes = static_cast<uint8_t>(
+            sortWidth * kPairWidth * sizeof(float) / 256);
+        extract.src1RepeatStride = 0;
+        uint64_t extracted = 0;
+        AscendC::GatherMask(keys, src, static_cast<uint8_t>(1), false, 0U, extract, extracted);
+        if (deduplicate_) {
+            AscendC::GatherMask(tags, src, static_cast<uint8_t>(2), false, 0U, extract, extracted);
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Muls(keys, keys, -1.0F, sortWidth);
+        AscendC::PipeBarrier<PIPE_V>();
+        if (!deduplicate_) {
+            AscendC::Cast(tokens, keys, AscendC::RoundMode::CAST_ROUND, selected);
+            AscendC::Duplicate(members, static_cast<int16_t>(1), selected);
+            // The intersection reuses keys for its MTE2 destination.
+            Sync<AscendC::HardEvent::V_S>();
+            return selected;
+        }
+
+        // Pad the comparisons, not the sort. GatherMask consumes only the
+        // selected prefix, even when Sort32 left a padded final group.
+        const uint32_t width = MembershipAlignUp(sortWidth, kMembershipCompareLanes);
+        if (width > sortWidth) {
+            AscendC::Duplicate(keys[sortWidth], -1.0F, width - sortWidth);
+            AscendC::Duplicate(tags[sortWidth], 0.0F, width - sortWidth);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+        auto neighbor = tmp;
+        auto offsets = tmp[shardCapacity_].ReinterpretCast<int32_t>();
+        auto heads = selectedMaskBuf_.Get<uint8_t>();
+        auto keepTag = nonNegativeMaskBuf_.Get<uint8_t>();
+        auto sameTag = nextOwnerMaskBuf_.Get<uint8_t>();
+        AscendC::CreateVecIndex(offsets, static_cast<int32_t>(-1), width);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Maxs(offsets, offsets, static_cast<int32_t>(0), width);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Muls(offsets, offsets, static_cast<int32_t>(sizeof(float)), width);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Gather(neighbor, keys, offsets.ReinterpretCast<uint32_t>(), 0U, width);
+        Sync<AscendC::HardEvent::V_S>();
+        neighbor.SetValue(0, -1.0F);
+        Sync<AscendC::HardEvent::S_V>();
+        AscendC::Compare(heads, keys, neighbor, AscendC::CMPMODE::NE, width);
+        AscendC::CreateVecIndex(offsets, static_cast<int32_t>(1), width);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Mins(offsets, offsets, static_cast<int32_t>(selected - 1), width);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Muls(offsets, offsets, static_cast<int32_t>(sizeof(float)), width);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Gather(neighbor, keys, offsets.ReinterpretCast<uint32_t>(), 0U, width);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Compare(keepTag, keys, neighbor, AscendC::CMPMODE::NE, width);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Gather(neighbor, tags, offsets.ReinterpretCast<uint32_t>(), 0U, width);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Compare(sameTag, tags, neighbor, AscendC::CMPMODE::EQ, width);
+        AscendC::PipeBarrier<PIPE_V>();
+        // OR of two one-hot tags is 3 iff they differ. A last lane compared
+        // with itself keeps its own tag. No invalid next-lane read is needed.
+        AscendC::Or(keepTag.ReinterpretCast<uint16_t>(), keepTag.ReinterpretCast<uint16_t>(),
+            sameTag.ReinterpretCast<uint16_t>(), width / 16);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Select(neighbor, keepTag, tags, 3.0F,
+            AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE, width);
+        auto keysInt = src.ReinterpretCast<int32_t>();
+        // Sort padding may contain the float-rounded INT32_MAX sentinel.
+        // Only valid keys are converted back to int32.
+        AscendC::Cast(keysInt, keys, AscendC::RoundMode::CAST_ROUND, selected);
+        AscendC::PipeBarrier<PIPE_V>();
+        const auto params = MembershipGatherParams();
+        uint64_t count = 0;
+        uint64_t tagged = 0;
+        AscendC::GatherMask(tokens, keysInt, heads.ReinterpretCast<uint32_t>(), true, selected, params, count);
+        AscendC::GatherMask(tags, neighbor, heads.ReinterpretCast<uint32_t>(), true, selected, params, tagged);
+        Sync<AscendC::HardEvent::V_S>();
+        AscendC::Cast(members, tags, AscendC::RoundMode::CAST_ROUND, static_cast<uint32_t>(count));
+        // Both compact input buffers are reused by the resident intersection.
+        Sync<AscendC::HardEvent::V_S>();
+        return static_cast<uint32_t>(count);
+    }
+#endif
+
 #if RESIDENT_EXPERIMENT_VECTOR_INTERSECTION
     __aicore__ inline uint32_t IntersectionWidth(uint32_t count)
     {
@@ -1102,6 +1312,9 @@ private:
     AscendC::TBuf<AscendC::TPosition::VECCALC>
         beforeBoundaryMaskBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> selectedMaskBuf_;
+#if RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
+    AscendC::TBuf<AscendC::TPosition::VECCALC> nextOwnerMaskBuf_;
+#endif
     uint32_t requestCount_ = 0;
     uint32_t stateRowCount_ = 0;
     uint32_t dummyStateBase_ = 0;
@@ -1114,6 +1327,10 @@ private:
     uint32_t shardCountRequestStride_ = 0;
     uint32_t generationStride_ = 0;
     uint32_t shardBits_ = 0;
+#ifdef RESIDENT_DCP_SHARDING
+    uint32_t dcpBits_ = 0;
+    uint32_t dcpRank_ = 0;
+#endif
     bool deduplicate_ = false;
 };
 
@@ -1804,9 +2021,18 @@ private:
         // prefix that can actually be paired with a miss. Each UB segment
         // remains 32-byte aligned for DataCopy/DataCopyPad; the small gaps
         // are covered by packedElements' per-shard padding allowance.
+#if RESIDENT_FREE_SLOT_FIRST
+        ASSERT(totalOldCount <= capacity_);
+        const uint32_t unused = capacity_ - totalOldCount;
+        const uint32_t freshCount = totalMissCount < unused ? totalMissCount : unused;
+        const uint32_t evictionCount = totalMissCount - freshCount;
+        ASSERT(evictionCount <= totalEvictableCount);
+        uint32_t remainingEvictions = evictionCount;
+#else
         uint32_t remainingEvictions = totalMissCount < totalEvictableCount
             ? totalMissCount
             : totalEvictableCount;
+#endif
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
             const uint32_t selectedCount =
                 evictableCounts[shard] < remainingEvictions
@@ -1837,10 +2063,12 @@ private:
             evictableEnd = evictableOffset + selectedCount;
             remainingEvictions -= selectedCount;
         }
+#if !RESIDENT_FREE_SLOT_FIRST
         const uint32_t totalSelectedEvictCount =
             totalMissCount < totalEvictableCount
             ? totalMissCount
             : totalEvictableCount;
+#endif
         Sync<AscendC::HardEvent::MTE2_S>();
         Sync<AscendC::HardEvent::V_S>();
 
@@ -1857,7 +2085,11 @@ private:
                      localMiss < shardMissCount;
                      ++localMiss) {
                     int16_t slot;
+#if RESIDENT_FREE_SLOT_FIRST
+                    if (globalMiss >= freshCount) {
+#else
                     if (globalMiss < totalSelectedEvictCount) {
+#endif
                         while (
                             evictableShard < shardCount_ &&
                             evictableIndex >=
@@ -1870,6 +2102,11 @@ private:
                                 + evictableIndex);
                         ++evictableIndex;
                     } else {
+#if RESIDENT_FREE_SLOT_FIRST
+                        // Consume the unused dense-prefix tail before replacing
+                        // old tokens. Hit slots and miss ordering are unchanged.
+                        slot = static_cast<int16_t>(totalOldCount + globalMiss);
+#else
                         // Resident allocation preserves a dense occupied
                         // prefix. Every old entry not present in the current
                         // union is emitted above as an evictable slot; after
@@ -1880,6 +2117,7 @@ private:
                             totalOldCount
                             + globalMiss
                             - totalSelectedEvictCount);
+#endif
                     }
                     const uint32_t position = static_cast<uint32_t>(
                         missPositions.GetValue(
@@ -2015,6 +2253,16 @@ private:
 
 class DSAResidentSortedUpdateKernel {
 public:
+#ifdef RESIDENT_DCP_SHARDING
+    __aicore__ inline void InitDcp(uint32_t bits, uint32_t rank,
+        __gm__ int32_t* origins, __gm__ int32_t* counts)
+    {
+        dcpBits_ = bits;
+        dcpRank_ = rank;
+        liveOrigins_.SetGlobalBuffer(origins);
+        selectedCounts_.SetGlobalBuffer(counts);
+    }
+#endif
     __aicore__ inline void Init(
         __gm__ int32_t* topkIndices,
         __gm__ int32_t* shardPacked,
@@ -2099,27 +2347,41 @@ public:
             selectedMaskBuf_, capacity_ * sizeof(uint8_t));
         pipe_.InitBuffer(
             survivorTokenBuf_, capacity_ * sizeof(int32_t));
+        const uint32_t compactInt16Bytes =
+            capacity_ * sizeof(int16_t);
+#if RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
+        // A row job uses the remap buffers for aligned segments and one
+        // final compaction. At most one alignment gap per history shard.
+        const uint32_t assemblyBytes = MembershipAlignUp(
+            rowWidth_ + shardCount_ * (kMembershipMaskLanes - 1),
+            kMembershipMaskLanes) * sizeof(int32_t);
+        pipe_.InitBuffer(survivorSlotBuf_, compactInt16Bytes);
+#else
         // Remap reinterprets the survivor slot buffer as int32. For MTP=1
         // with one shard, remapPartWidth equals capacity, so an int16-only
         // allocation would expose only half the required elements.
         const uint32_t remapPartWidth = requestWidth_ / shardCount_;
         const uint32_t remapInt32Bytes =
             remapPartWidth * sizeof(int32_t);
-        const uint32_t compactInt16Bytes =
-            capacity_ * sizeof(int16_t);
         const uint32_t survivorSlotBytes =
             remapInt32Bytes > compactInt16Bytes
                 ? remapInt32Bytes
                 : compactInt16Bytes;
         pipe_.InitBuffer(survivorSlotBuf_, survivorSlotBytes);
+#endif
         pipe_.InitBuffer(
             mergedTokenBuf_, capacity_ * sizeof(int32_t));
         pipe_.InitBuffer(mergedSlotBuf_, compactInt16Bytes);
+#if RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
+        pipe_.InitBuffer(remapOffsetBuf_, assemblyBytes);
+        pipe_.InitBuffer(remapGatheredBuf_, assemblyBytes);
+#else
         // State writeback consumes the merged buffers through MTE3 while
         // remap starts vector work. Keep the remap temporaries disjoint so
         // both pipelines can overlap without remap overwriting MTE3 input.
         pipe_.InitBuffer(remapOffsetBuf_, remapInt32Bytes);
         pipe_.InitBuffer(remapGatheredBuf_, remapInt32Bytes);
+#endif
 #if RESIDENT_EXPERIMENT_VECTOR_STATE
         // Keep the 4096-entry/single-shard case on its original UB footprint.
         if (VectorStateCapacity()) pipe_.InitBuffer(vectorStateBuf_, 6 * kStateWidth * sizeof(int32_t));
@@ -2136,6 +2398,187 @@ public:
             ProcessBlock(block);
         }
     }
+
+#if RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
+    __aicore__ inline void ProcessMembership()
+    {
+        const uint32_t stateBlocks = requestCount_ * shardCount_;
+        const uint32_t rowBlocks = requestCount_ * rowsPerRequest_;
+        const uint32_t physicalBlocks = AscendC::GetBlockNum();
+        for (uint32_t block = AscendC::GetBlockIdx();
+             block < stateBlocks + rowBlocks; block += physicalBlocks) {
+            if (block < stateBlocks) {
+                ProcessBlock(block);
+            } else {
+                AssembleQueryRow(block - stateBlocks);
+            }
+        }
+    }
+
+    __aicore__ inline void MarkAssemblySegment(
+        AscendC::LocalTensor<uint32_t> mask, uint32_t begin, uint32_t count)
+    {
+        // Each nonempty segment starts at a fresh mask word. Full words
+        // and the partial last word cover the whole active mask prefix.
+        uint32_t word = begin / kMembershipMaskLanes;
+        for (; count >= kMembershipMaskLanes; count -= kMembershipMaskLanes) {
+            mask.SetValue(word++, 0xFFFFFFFFU);
+        }
+        if (count != 0) {
+            mask.SetValue(word, (1U << count) - 1U);
+        }
+    }
+
+    __aicore__ inline void AssembleQueryRow(uint32_t row)
+    {
+        const uint32_t request = row / rowsPerRequest_;
+        const uint32_t query = row % rowsPerRequest_;
+        const uint64_t countBase = static_cast<uint64_t>(request) * shardCountRequestStride_;
+        const uint32_t firstCount = static_cast<uint32_t>(ReadGlobalScalarFresh(shardCounts_, countBase));
+        const uint32_t validRows = static_cast<uint32_t>(shardCounts_.GetValue(countBase + kMembershipValidRows));
+        if ((validRows & (1U << query)) == 0) {
+            // The union's shard zero already cleared the padding row.
+#ifdef RESIDENT_DCP_SHARDING
+            WriteGlobalScalarVisible(selectedCounts_, static_cast<uint64_t>(row) * kDcpCountStride, 0);
+#endif
+            return;
+        }
+        const uint64_t rowOffset = static_cast<uint64_t>(row) * rowWidth_;
+        const uint64_t requestShardBase =
+            static_cast<uint64_t>(request) * shardCount_ * capacity_;
+        const int32_t boundary = shardCounts_.GetValue(countBase + kMembershipBoundary + query);
+
+        // These buffers are private to the AIV. This task does not read any
+        // resident state written by sibling tasks in the same launch.
+        auto bits = survivorTokenBuf_.Get<int16_t>();
+        auto members = oldSlotBuf_.Get<int16_t>();
+        auto slots = priorSlotBuf_.Get<int16_t>();
+        auto compactSlots = survivorSlotBuf_.Get<int16_t>();
+        auto floats = currentTokenBuf_.Get<float>();
+        auto zeros = mergedTokenBuf_.Get<float>();
+        auto predicate = selectedMaskBuf_.Get<uint8_t>();
+        auto segmentMask = mergedSlotBuf_.Get<uint32_t>();
+        auto packed = remapOffsetBuf_.Get<int32_t>();
+        auto output = remapGatheredBuf_.Get<int32_t>();
+        const auto params = MembershipGatherParams();
+        uint32_t packedEnd = 0;
+        if (rowsPerRequest_ == 2) {
+            AscendC::Duplicate(bits, static_cast<int16_t>(1U << query), capacity_);
+            AscendC::Duplicate(zeros, 0.0F, capacity_);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+        for (uint32_t shard = 0; shard < shardCount_; ++shard) {
+            const uint32_t count = shard == 0 ? firstCount : static_cast<uint32_t>(
+                ReadGlobalScalarFresh(shardCounts_, countBase + shard * shardCountStride_));
+            if (count == 0) {
+                continue;
+            }
+            const uint64_t offset = requestShardBase + static_cast<uint64_t>(shard) * capacity_;
+            CopyGlobalToLocalExact(slots, priorSlots_[offset], count);
+            if (rowsPerRequest_ == 2) {
+                CopyGlobalToLocalExact(members, shardMapping_[offset], count);
+            }
+            Sync<AscendC::HardEvent::MTE2_V>();
+            uint32_t selected = count;
+            auto selectedSlots = slots;
+            if (rowsPerRequest_ == 2) {
+                const uint32_t width = MembershipAlignUp(count, kMembershipCompareLanes);
+                AscendC::And(members, members, bits, width);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Cast(floats, members, AscendC::RoundMode::CAST_NONE, width);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Compare(predicate, floats, zeros, AscendC::CMPMODE::NE, width);
+                AscendC::PipeBarrier<PIPE_V>();
+                uint64_t compactCount = 0;
+                AscendC::GatherMask(compactSlots, slots, predicate.ReinterpretCast<uint16_t>(),
+                    true, count, params, compactCount);
+                Sync<AscendC::HardEvent::V_S>();
+                selected = static_cast<uint32_t>(compactCount);
+                selectedSlots = compactSlots;
+            }
+            if (selected != 0) {
+                const uint32_t begin = MembershipAlignUp(packedEnd, kMembershipMaskLanes);
+                AscendC::Cast(floats, selectedSlots, AscendC::RoundMode::CAST_NONE, selected);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Cast(packed[begin], floats, AscendC::RoundMode::CAST_ROUND, selected);
+                AscendC::PipeBarrier<PIPE_V>();
+                MarkAssemblySegment(segmentMask, begin, selected);
+                packedEnd = begin + selected;
+            }
+            // A one-row task casts directly from the slot input. In either
+            // case the next shard may overwrite the MTE2 destinations.
+            Sync<AscendC::HardEvent::V_MTE2>();
+        }
+
+        // Live indices stay in their original coordinate system and are
+        // copied as integers. Only nonnegative entries at/after the split
+        // qualify; valid input rows have a contiguous prefix and -1 tail.
+        auto input = oldTokenBuf_.Get<int32_t>();
+        auto clamped = currentTokenBuf_.Get<int32_t>();
+        AscendC::DataCopy(input, topkIndices_[rowOffset], rowWidth_);
+        Sync<AscendC::HardEvent::MTE2_V>();
+        AscendC::Mins(clamped, input, boundary > 0 ? boundary - 1 : -1, rowWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Compare(predicate, clamped, input, AscendC::CMPMODE::EQ, rowWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Not(predicate.ReinterpretCast<uint16_t>(), predicate.ReinterpretCast<uint16_t>(), rowWidth_ / 16);
+        AscendC::PipeBarrier<PIPE_V>();
+#ifdef RESIDENT_DCP_SHARDING
+        KeepDcpOwner(predicate, priorSlotBuf_.Get<uint8_t>(), input, clamped, output,
+            dcpBits_, dcpRank_, rowWidth_);
+        // Only live entries are translated. Miss source IDs stay global.
+        AscendC::ShiftRight(clamped, input, static_cast<int32_t>(kDcpBlockBits), rowWidth_);
+        AscendC::ShiftRight(output, input, static_cast<int32_t>(kDcpBlockBits + dcpBits_), rowWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Muls(clamped, clamped, static_cast<int32_t>(kDcpBlockSize), rowWidth_);
+        AscendC::Muls(output, output, static_cast<int32_t>(kDcpBlockSize), rowWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Sub(input, input, clamped, rowWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Add(input, input, output, rowWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Adds(input, input, ReadGlobalScalarFresh(liveOrigins_, request), rowWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+#endif
+        uint64_t live = 0;
+        AscendC::GatherMask(output, input, predicate.ReinterpretCast<uint32_t>(),
+            true, rowWidth_, params, live);
+        Sync<AscendC::HardEvent::V_S>();
+        uint64_t kept = live;
+        if (packedEnd != 0) {
+            if (live != 0) {
+                const uint32_t begin = MembershipAlignUp(packedEnd, kMembershipMaskLanes);
+                AscendC::Adds(packed[begin], output, static_cast<int32_t>(0), static_cast<uint32_t>(live));
+                AscendC::PipeBarrier<PIPE_V>();
+                MarkAssemblySegment(segmentMask, begin, static_cast<uint32_t>(live));
+                packedEnd = begin + static_cast<uint32_t>(live);
+            }
+            Sync<AscendC::HardEvent::S_V>();
+            AscendC::GatherMask(output, packed, segmentMask, true, packedEnd, params, kept);
+            Sync<AscendC::HardEvent::V_S>();
+        }
+
+        // A query contributes at most its original K entries. Only the
+        // compacted prefix is defined by GatherMask; explicitly write -1
+        // to the tail before the single aligned GM row store.
+        const uint32_t end = static_cast<uint32_t>(kept);
+        const uint32_t alignedEnd = MembershipAlignUp(end, kInt32PerDataBlock);
+        for (uint32_t i = end; i < alignedEnd; ++i) {
+            output.SetValue(i, -1);
+        }
+        if (alignedEnd < rowWidth_) {
+            AscendC::Duplicate(output[alignedEnd], static_cast<int32_t>(-1), rowWidth_ - alignedEnd);
+        }
+        Sync<AscendC::HardEvent::S_MTE3>();
+        Sync<AscendC::HardEvent::V_MTE3>();
+        AscendC::DataCopy(topkIndices_[rowOffset], output, rowWidth_);
+        Sync<AscendC::HardEvent::MTE3_S>();
+#ifdef RESIDENT_DCP_SHARDING
+        WriteGlobalScalarVisible(selectedCounts_, static_cast<uint64_t>(row) * kDcpCountStride,
+            static_cast<int32_t>(kept));
+#endif
+    }
+#endif
 
     __aicore__ inline void ProcessBlock(uint32_t block)
     {
@@ -2187,7 +2630,9 @@ public:
                 // selected for eviction. Preserve state bytes/counts, while
                 // still remapping every top-k partition and publishing the
                 // request generation (including empty/dummy requests).
+#if !RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
                 RemapPositionPartition(request, shard, requestShardBase);
+#endif
                 if (shard == 0) {
                     WriteGlobalScalarVisible(
                         stateGenerations_,
@@ -2303,8 +2748,9 @@ public:
             stateCounts_, newCountOffset,
             static_cast<int32_t>(mergedCount));
 
-        RemapPositionPartition(
-            request, shard, requestShardBase);
+#if !RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
+        RemapPositionPartition(request, shard, requestShardBase);
+#endif
 
         // Every shard copied its complete old list to private UB before
         // overwriting its own disjoint GM range. Generation mismatches were
@@ -2491,6 +2937,12 @@ public:
     }
 
 private:
+#ifdef RESIDENT_DCP_SHARDING
+    AscendC::GlobalTensor<int32_t> liveOrigins_;
+    AscendC::GlobalTensor<int32_t> selectedCounts_;
+    uint32_t dcpBits_ = 0;
+    uint32_t dcpRank_ = 0;
+#endif
 #if RESIDENT_EXPERIMENT_VECTOR_STATE
     static constexpr uint32_t kStateWidth = 2048;
     AscendC::TBuf<AscendC::TPosition::VECCALC> vectorStateBuf_;
@@ -3227,7 +3679,11 @@ dsa_resident_sharded_union_kernel(
     uint32_t shardCapacity,
     uint32_t shardCountStride,
     uint32_t shardCountRequestStride,
-    uint32_t generationStride)
+    uint32_t generationStride
+#ifdef RESIDENT_DCP_SHARDING
+    , uint32_t dcpBits, uint32_t dcpRank
+#endif
+    )
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     DSAResidentShardedUnionKernel op;
@@ -3241,9 +3697,13 @@ dsa_resident_sharded_union_kernel(
         requestCount, stateRowCount, dummyStateBase,
         rowsPerRequest, rowWidth, shardCount, shardCapacity,
         shardCountStride, shardCountRequestStride, generationStride);
+#ifdef RESIDENT_DCP_SHARDING
+    op.InitDcp(dcpBits, dcpRank);
+#endif
     op.Process();
 }
 
+#if !RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
 extern "C" __global__ __aicore__ void
 dsa_resident_sorted_read_probe_kernel(
     __gm__ int32_t* shardCounts,
@@ -3264,6 +3724,7 @@ dsa_resident_sorted_read_probe_kernel(
         shardCountStride, shardCountRequestStride);
     op.Process();
 }
+#endif
 
 extern "C" __global__ __aicore__ void
 dsa_resident_sorted_finalize_kernel(
@@ -3301,6 +3762,7 @@ dsa_resident_sorted_finalize_kernel(
     op.Process();
 }
 
+#if !RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
 extern "C" __global__ __aicore__ void
 dsa_resident_sorted_update_kernel(
     __gm__ int32_t* topkIndices,
@@ -3339,6 +3801,53 @@ dsa_resident_sorted_update_kernel(
     op.Process();
 }
 
+#else
+extern "C" __global__ __aicore__ void
+dsa_resident_sorted_membership_update_kernel(
+    __gm__ int32_t* topkIndices,
+    __gm__ int32_t* shardPacked,
+    __gm__ int16_t* shardMapping,
+    __gm__ int32_t* shardCounts,
+    __gm__ int16_t* priorSlots,
+    __gm__ int32_t* requestStateIndices,
+    __gm__ int64_t* requestStateGenerations,
+    __gm__ int32_t* stateTokens,
+    __gm__ int16_t* stateSlots,
+    __gm__ int32_t* stateCounts,
+    __gm__ int64_t* stateGenerations,
+    uint32_t requestCount,
+    uint32_t stateRowCount,
+    uint32_t dummyStateBase,
+    uint32_t rowsPerRequest,
+    uint32_t rowWidth,
+    uint32_t shardCount,
+    uint32_t capacity,
+    uint32_t shardCountStride,
+    uint32_t shardCountRequestStride,
+    uint32_t generationStride
+#ifdef RESIDENT_DCP_SHARDING
+    , uint32_t dcpBits, uint32_t dcpRank,
+    __gm__ int32_t* liveOrigins, __gm__ int32_t* selectedCounts
+#endif
+    )
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    DSAResidentSortedUpdateKernel op;
+    op.Init(
+        topkIndices, shardPacked, shardMapping, shardCounts,
+        priorSlots, requestStateIndices, requestStateGenerations,
+        stateTokens, stateSlots, stateCounts, stateGenerations,
+        requestCount, stateRowCount, dummyStateBase, rowsPerRequest,
+        rowWidth, shardCount, capacity, shardCountStride,
+        shardCountRequestStride, generationStride);
+#ifdef RESIDENT_DCP_SHARDING
+    op.InitDcp(dcpBits, dcpRank, liveOrigins, selectedCounts);
+#endif
+    op.ProcessMembership();
+}
+#endif
+
+#if !RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
 extern "C" __global__ __aicore__ void
 dsa_resident_sorted_state_update_kernel(
     __gm__ int32_t* topkIndices,
@@ -3399,6 +3908,7 @@ dsa_resident_sorted_remap_kernel(
         capacity, shardCountStride, shardCountRequestStride);
     op.Process();
 }
+#endif
 
 }  // namespace
 
@@ -3445,7 +3955,7 @@ void dsa_resident_sharded_union_impl(
     uint32_t shardCountStride,
     uint32_t shardCountRequestStride,
     uint32_t generationStride,
-    uint32_t coreCount)
+    uint32_t coreCount, [[maybe_unused]] uint32_t dcpBits, [[maybe_unused]] uint32_t dcpRank)
 {
     const uint32_t logicalBlockCount = requestCount * shardCount;
     dsa_resident_sharded_union_kernel<<<
@@ -3469,7 +3979,11 @@ void dsa_resident_sharded_union_impl(
         static_cast<int16_t*>(shardEvictableSlots),
         requestCount, stateRowCount, dummyStateBase, rowsPerRequest,
         rowWidth, shardCount, shardCapacity, shardCountStride,
-        shardCountRequestStride, generationStride);
+        shardCountRequestStride, generationStride
+#ifdef RESIDENT_DCP_SHARDING
+        , dcpBits, dcpRank
+#endif
+        );
 }
 
 void dsa_resident_sorted_plan_impl(
@@ -3505,7 +4019,8 @@ void dsa_resident_sorted_plan_impl(
     uint32_t generationStride,
     uint32_t blockTableWidth,
     uint32_t blockSize,
-    uint32_t coreCount)
+    uint32_t coreCount, [[maybe_unused]] uint32_t dcpBits, [[maybe_unused]] uint32_t dcpRank,
+    [[maybe_unused]] void* liveOrigins, [[maybe_unused]] void* selectedCounts)
 {
     dsa_resident_sorted_finalize_kernel<<<
         ResidentPhysicalBlockCount(requestCount, coreCount),
@@ -3524,8 +4039,13 @@ void dsa_resident_sorted_plan_impl(
         requestCount, shardCount, capacity, shardCountStride,
         shardCountRequestStride, missCountStride,
         blockTableWidth, blockSize, 0);
+#if RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
+    const uint32_t logicalBlockCount = requestCount * (shardCount + rowsPerRequest);
+    dsa_resident_sorted_membership_update_kernel<<<
+#else
     const uint32_t logicalBlockCount = requestCount * shardCount;
     dsa_resident_sorted_update_kernel<<<
+#endif
         ResidentPhysicalBlockCount(logicalBlockCount, coreCount),
         nullptr, stream>>>(
         static_cast<int32_t*>(topkIndices),
@@ -3542,9 +4062,14 @@ void dsa_resident_sorted_plan_impl(
         requestCount, stateRowCount, dummyStateBase,
         rowsPerRequest, rowWidth, shardCount, capacity,
         shardCountStride, shardCountRequestStride,
-        generationStride);
+        generationStride
+#ifdef RESIDENT_DCP_SHARDING
+        , dcpBits, dcpRank, static_cast<int32_t*>(liveOrigins), static_cast<int32_t*>(selectedCounts)
+#endif
+        );
 }
 
+#if !RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
 void dsa_resident_sorted_update_debug_impl(
     void* stream,
     void* topkIndices,
@@ -3624,7 +4149,7 @@ void dsa_resident_sorted_plan_no_remap_impl(
     uint32_t generationStride,
     uint32_t blockTableWidth,
     uint32_t blockSize,
-    uint32_t coreCount)
+    uint32_t coreCount, uint32_t, uint32_t, void*, void*)
 {
     dsa_resident_sorted_finalize_kernel<<<
         ResidentPhysicalBlockCount(requestCount, coreCount),
@@ -3759,5 +4284,7 @@ void dsa_resident_sorted_finalize_debug_impl(
         shardCountRequestStride, missCountStride,
         blockTableWidth, blockSize, debugStage);
 }
+
+#endif
 
 }  // namespace vllm_ascend

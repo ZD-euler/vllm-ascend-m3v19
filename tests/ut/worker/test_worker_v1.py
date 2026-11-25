@@ -19,6 +19,9 @@ init_cached_hf_modules_path = "vllm.utils.import_utils.init_cached_hf_modules"
 class TestNPUWorker(TestBase):
     def setUp(self):
         """Setup test environment"""
+        warmup = patch("vllm_ascend.ops.triton.decode_warmup.warmup_decode_kernels")
+        warmup.start()
+        self.addCleanup(warmup.stop)
         # Create configuration mocks
         self.cache_config_mock = MagicMock(spec=CacheConfig)
         self.cache_config_mock.cache_dtype = "auto"

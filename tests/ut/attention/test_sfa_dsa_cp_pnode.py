@@ -3,6 +3,7 @@
 
 import sys
 import unittest
+from copy import copy
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -57,7 +58,7 @@ class TestAscendSFADSACPPNode(unittest.TestCase):
         cfg.parallel_config.prefill_context_parallel_size = 1
         cfg.parallel_config.decode_context_parallel_size = 1
         cfg.parallel_config.cp_kv_cache_interleave_size = 1
-        cfg.kv_transfer_config = SimpleNamespace(is_kv_producer=True)
+        cfg.kv_transfer_config = SimpleNamespace(is_kv_producer=True, is_kv_consumer=False)
         cfg.scheduler_config.max_num_seqs = max_seqs
         cfg.scheduler_config.max_num_batched_tokens = max_tokens
         return cfg
@@ -270,9 +271,9 @@ class TestAscendSFADSACPPNode(unittest.TestCase):
                 meta_fg = builder_fg.build(0, common_fg)
             ctx_fg = meta_fg.dsa_cp_context
             assert ctx_fg is not None
-            # Rank 2 owns [4, 6): req1 covers [4, 5) (1 token) + full-graph pad [5, 6)
-            self.assertEqual(ctx_fg.actual_seq_lengths_query.tolist(), [0, 1])
-            self.assertEqual(ctx_fg.actual_seq_lengths_key.tolist(), [0, 20])
+            # Rank 2 owns [4, 6): req1 covers [4, 5) (1 token) + full-graph dummy seg [5, 8) (k=0)
+            self.assertEqual(ctx_fg.actual_seq_lengths_query.tolist(), [0, 1, 2])
+            self.assertEqual(ctx_fg.actual_seq_lengths_key.tolist(), [0, 20, 0])
 
     @patch_distributed_groups(dcp_size=1, pcp_size=1, needs_mocks=False)
     def test_dsa_cp_build_fallback_when_cpu_lengths_incomplete(self) -> None:
@@ -426,6 +427,7 @@ class TestAscendSFADSACPPNode(unittest.TestCase):
         for bad_t_attr, bad_c_attr in (
             ({"attn_state": AscendAttentionState.DecodeOnly}, {}),
             ({"num_decode_tokens": 1}, {}),
+            ({"cum_query_lens": torch.zeros((2,), dtype=torch.int32)}, {}),
             ({"dsa_cp_context": None}, {}),
             ({}, {"sfa_full_graph": True}),
             ({}, {"num_reqs": 2}),
@@ -435,6 +437,30 @@ class TestAscendSFADSACPPNode(unittest.TestCase):
             t_bad = SimpleNamespace(**{**vars(template), **bad_t_attr})
             c_bad = SimpleNamespace(**{**vars(common_b1), **bad_c_attr})
             self.assertIsNone(builder.rebind_layerwise_prefill_metadata(t_bad, c_bad))
+
+        # Chained lazy _dsa_cp_rebind_cache=None sharing + preserved sfa_dcp/block_size/selected_kv
+        tpl_lazy = copy(template)
+        delattr(tpl_lazy, "_dsa_cp_rebind_cache")
+        sfa_dcp_sentinel = SimpleNamespace(tag="dcp")
+        sel_kv_sentinel = SimpleNamespace(tag="skv")
+        tpl_lazy.sfa_dcp = sfa_dcp_sentinel
+        tpl_lazy.selected_kv = sel_kv_sentinel
+        with (
+            patch.object(sfa_v1, "get_cos_and_sin_mla", side_effect=cos_sin),
+            patch.object(sfa_v1, "get_tp_group", return_value=tp_grp),
+        ):
+            m1 = builder.rebind_layerwise_prefill_metadata(tpl_lazy, common_b1)
+            assert m1 is not None
+            m2 = builder.rebind_layerwise_prefill_metadata(m1, common_b0)
+        assert m2 is not None
+        lazy_cache = getattr(tpl_lazy, "_dsa_cp_rebind_cache", None)
+        self.assertIsNotNone(lazy_cache)
+        self.assertIs(m1._dsa_cp_rebind_cache, lazy_cache)
+        self.assertIs(m2._dsa_cp_rebind_cache, lazy_cache)
+        for rebound_m in (m1, m2):
+            self.assertIs(rebound_m.sfa_dcp, sfa_dcp_sentinel)
+            self.assertEqual(rebound_m.block_size, tpl_lazy.block_size)
+            self.assertIs(rebound_m.selected_kv, sel_kv_sentinel)
 
     @staticmethod
     def _det_cos_sin(pos: torch.Tensor, *_a: Any, **_k: Any) -> tuple[torch.Tensor, torch.Tensor]:
@@ -523,6 +549,8 @@ class TestAscendSFADSACPPNode(unittest.TestCase):
                         (cl.local_start, cl.local_end, cl.local_end_with_pad),
                         msg,
                     )
+                    if name == "full_graph":
+                        self.assertEqual(int(cf.actual_seq_lengths_query.shape[0]), 3, msg)
 
     @patch_distributed_groups(dcp_size=1, pcp_size=1, needs_mocks=False)
     def test_dsa_cp_build_bypasses_stale_cpu_mirror_when_speculative_unsafe(self) -> None:
@@ -650,6 +678,7 @@ class TestAscendSFADSACPPNode(unittest.TestCase):
         class _SliceProxy:
             def __init__(self, target: torch.Tensor) -> None:
                 self._t = target
+                self.device = _DevWrap()
 
             def copy_(self, src: torch.Tensor, non_blocking: bool = False) -> torch.Tensor:
                 self._t.copy_(src, non_blocking=False)
@@ -780,6 +809,114 @@ class TestAscendSFADSACPPNode(unittest.TestCase):
         assert ctx_big is not None
         self.assertEqual(ctx_big.actual_seq_lengths_query.tolist(), [0, 0, 1, 2, 2, 2])
         self.assertEqual(ctx_big.actual_seq_lengths_key.tolist(), [0, 0, 12, 13, 0, 0])
+
+    @patch_distributed_groups(dcp_size=1, pcp_size=1, needs_mocks=False)
+    def test_dsa_cp_decoder_build_unpadded_slot_mapping_skips_ring_and_rebind(self) -> None:
+        with patch.object(sfa_v1, "get_cos_and_sin_mla", side_effect=self._det_cos_sin):
+            for sfa_fg in (False, True):
+                builder = self._make_builder(["layer0"], max_seqs=4, max_tokens=16, full_graph=sfa_fg)
+                builder.dsa_cp_decoder = True
+                common = self._make_common(
+                    qsl=[0, 5],
+                    seq_lens=[20],
+                    num_actual_tokens=5,
+                    num_input_tokens=7,
+                    with_indexer=sfa_fg,
+                    sfa_full_graph=sfa_fg,
+                )
+                tp_grp = SimpleNamespace(world_size=4, rank_in_group=3)
+                with patch.object(sfa_v1, "get_tp_group", return_value=tp_grp):
+                    meta = builder.build(0, common)
+                    reb = builder.rebind_layerwise_prefill_metadata(meta, common)
+
+                self.assertIsNone(reb)
+                self.assertFalse(hasattr(meta, "_dsa_cp_rebind_cache"))
+                self.assertEqual(builder._dsa_cp_seq_lens_events, [None, None, None, None])
+                self.assertEqual(meta.slot_mapping.tolist(), [100, 101, 102, 103, 104, 105, 106])
+                ctx = meta.dsa_cp_context
+                assert ctx is not None
+                self.assertEqual((ctx.num_tokens, ctx.num_tokens_pad), (7, 8))
+                self.assertEqual(ctx.slot_mapping_cp.tolist(), [106, -1])
+                if sfa_fg:
+                    self.assertEqual(ctx.actual_seq_lengths_query.tolist(), [0, 1])
+                    self.assertEqual(ctx.actual_seq_lengths_key.tolist(), [0, 0])
+                else:
+                    self.assertEqual(ctx.actual_seq_lengths_query.tolist(), [0])
+                    self.assertEqual(ctx.actual_seq_lengths_key.tolist(), [0])
+
+    @patch_distributed_groups(dcp_size=1, pcp_size=1, needs_mocks=False)
+    def test_pnode_host_ring_zero_seq_len_segment_matches_cp_sequence_lengths(self) -> None:
+        with patch.object(sfa_v1, "get_cos_and_sin_mla", side_effect=self._det_cos_sin):
+            for rank in range(4):
+                b_fast = self._make_builder(["layer0"], max_seqs=8, max_tokens=32)
+                b_legacy = self._make_builder(["layer0"], max_seqs=8, max_tokens=32)
+                c_fast = self._make_common(
+                    qsl=[0, 2, 5, 8],
+                    seq_lens=[12, 0, 20],
+                    num_actual_tokens=8,
+                    num_input_tokens=8,
+                    with_cpu_qsl=True,
+                )
+                c_legacy = self._make_common(
+                    qsl=[0, 2, 5, 8],
+                    seq_lens=[12, 0, 20],
+                    num_actual_tokens=8,
+                    num_input_tokens=8,
+                    with_cpu_qsl=False,
+                )
+                tp_grp = SimpleNamespace(world_size=4, rank_in_group=rank)
+                with patch.object(sfa_v1, "get_tp_group", return_value=tp_grp):
+                    with self._no_item_patch(c_fast.query_start_loc, c_fast.seq_lens):
+                        m_fast = b_fast.build(0, c_fast)
+                    m_legacy = b_legacy.build(0, c_legacy)
+                cf, cl = m_fast.dsa_cp_context, m_legacy.dsa_cp_context
+                assert cf is not None and cl is not None
+                self.assertEqual(cf.actual_seq_lengths_key.tolist()[1], 0)
+                self.assertEqual(cf.actual_seq_lengths_query.tolist(), cl.actual_seq_lengths_query.tolist())
+                self.assertEqual(cf.actual_seq_lengths_key.tolist(), cl.actual_seq_lengths_key.tolist())
+
+    @patch_distributed_groups(dcp_size=1, pcp_size=1, needs_mocks=False)
+    def test_pnode_host_ring_mode_alternation_growth_and_malformed_seq_lens_parity(self) -> None:
+        steps = (
+            (True, [0, 4], [16], 4, 4),
+            (True, [0, 3, 8], [12, 24], 8, 8),
+            (False, [0, 2, 5, 8], [10, 20, 30], 8, 8),
+            (True, [0, 2, 4, 6, 8], [15, 25, 35, 45], 8, 8),
+            (True, [0, 1, 3, 5, 7, 8], [11, 22, 33, 44, 55], 8, 8),
+            # Malformed segment: s_lens_cpu[0] = 1 < (global_end - req_local_end) = 2 on rank 0
+            (True, [0, 4, 8], [1, 20], 8, 8),
+        )
+        with patch.object(sfa_v1, "get_cos_and_sin_mla", side_effect=self._det_cos_sin):
+            for rank in range(4):
+                b_fast = self._make_builder(["layer0"], max_seqs=2, max_tokens=32)
+                b_legacy = self._make_builder(["layer0"], max_seqs=2, max_tokens=32)
+                tp_grp = SimpleNamespace(world_size=4, rank_in_group=rank)
+                with patch.object(sfa_v1, "get_tp_group", return_value=tp_grp):
+                    for use_cpu_qsl, qsl, seq_lens, num_act, num_inp in steps:
+                        c_fast = self._make_common(
+                            qsl=qsl,
+                            seq_lens=seq_lens,
+                            num_actual_tokens=num_act,
+                            num_input_tokens=num_inp,
+                            with_cpu_qsl=use_cpu_qsl,
+                        )
+                        c_legacy = self._make_common(
+                            qsl=qsl,
+                            seq_lens=seq_lens,
+                            num_actual_tokens=num_act,
+                            num_input_tokens=num_inp,
+                            with_cpu_qsl=False,
+                        )
+                        if use_cpu_qsl:
+                            with self._no_item_patch(c_fast.query_start_loc, c_fast.seq_lens):
+                                m_fast = b_fast.build(0, c_fast)
+                        else:
+                            m_fast = b_fast.build(0, c_fast)
+                        m_legacy = b_legacy.build(0, c_legacy)
+                        cf, cl = m_fast.dsa_cp_context, m_legacy.dsa_cp_context
+                        assert cf is not None and cl is not None
+                        self.assertEqual(cf.actual_seq_lengths_query.tolist(), cl.actual_seq_lengths_query.tolist())
+                        self.assertEqual(cf.actual_seq_lengths_key.tolist(), cl.actual_seq_lengths_key.tolist())
 
 
 if __name__ == "__main__":

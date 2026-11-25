@@ -238,6 +238,8 @@ def test_pinning_uses_real_selection_and_original_kv_handoff(monkeypatch, proxy,
         monkeypatch.setattr(state, "decoder_placements_ready", lambda: True, raising=False)
         monkeypatch.setattr(state, "ensure_decoder_mooncake_segments", AsyncMock(), raising=False)
         if proxy is enhanced:
+            # A profiling target stays fixed even outside the normal count-slack window.
+            state.decoders[3].active_requests = 8
             monkeypatch.setattr(
                 state, "resolve_prefix_affinity", MagicMock(side_effect=AssertionError("target is fixed"))
             )
@@ -267,12 +269,16 @@ def test_pinning_uses_real_selection_and_original_kv_handoff(monkeypatch, proxy,
         try:
             info = await proxy._handle_select_instance("/completions", body, 50000, target_decoder_idx=3)
             assert info.decoder is state.decoders[3]
+            if proxy is enhanced:
+                assert info.decoder.active_requests == 9
             assert body["kv_transfer_params"]["source"] == "original-kv"
             if remote_fill:
                 assert captured[0]["destination_engine_id"] == "target-engine"
                 assert info.reservation.dp_rank == 0
             proxy._release_decoder_reservation(info)
             state.release_prefiller_kv(info.prefiller_idx, info.prefiller_score)
+            if proxy is enhanced:
+                assert info.decoder.active_requests == 8
             assert all(decoder.active_tokens == 0 for decoder in state.decoders)
         finally:
             await asyncio.gather(*(node.client.aclose() for node in state.prefillers + state.decoders))

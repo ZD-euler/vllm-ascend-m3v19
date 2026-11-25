@@ -14,6 +14,10 @@ def summary(samples):
 
 
 def kernel_names(variant):
+    if variant in ("dcp_old", "dcp_new"):
+        return {"union": "dsa_resident_sharded_union_kernel_dcp",
+                "finalize": f"dsa_resident_sorted_finalize_kernel_{variant}",
+                "update": "dsa_resident_sorted_membership_update_kernel_dcp"}
     union = "optimized" if variant == "optimized" else "baseline"
     finalize = ("dsa_resident_sharded_finalize_worker_kernel_sharded"
                 if variant in ("sharded_finalize", "combined")
@@ -25,6 +29,12 @@ def kernel_names(variant):
         union = "intersection"
     if variant in ('vector_state_update', 'exact_combined'):
         update = 'state'
+    if variant == "query_membership":
+        return {
+            "union": "dsa_resident_sharded_union_kernel_membership",
+            "finalize": finalize,
+            "update": "dsa_resident_sorted_membership_update_kernel_membership",
+        }
     return {"union": f"dsa_resident_sharded_union_kernel_{union}",
             "finalize": finalize, "update": f"dsa_resident_sorted_update_kernel_{update}"}
 

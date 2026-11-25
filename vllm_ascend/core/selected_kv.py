@@ -311,6 +311,8 @@ def _resolve_topology(runner: Any) -> tuple[tuple[str, ...], frozenset[str], dic
         skip_topk = bool(getattr(impl, "skip_topk", False))
         raw_dsa_cp = getattr(impl, "enable_dsa_cp", False)
         impl_dsa_cp = bool(raw_dsa_cp)
+        raw_dsa_cp_decoder = getattr(impl, "dsa_cp_decoder", False)
+        impl_dsa_cp_decoder = bool(raw_dsa_cp_decoder)
         raw_o_proj_tp = getattr(impl, "enable_dsa_cp_with_o_proj_tp", False)
         impl_o_proj_tp = bool(raw_o_proj_tp)
         vl_first = any(
@@ -323,6 +325,7 @@ def _resolve_topology(runner: Any) -> tuple[tuple[str, ...], frozenset[str], dic
         dims_ok = (kv_lora_rank, qk_rope_head_dim) == (NOPE_ROW_DIM, PE_ROW_DIM)
         layer_ok = (
             dims_ok
+            and not impl_dsa_cp_decoder
             and not impl_o_proj_tp
             and not (impl_dsa_cp and vl_first)
             and tp_ok
@@ -334,6 +337,7 @@ def _resolve_topology(runner: Any) -> tuple[tuple[str, ...], frozenset[str], dic
                 f"kv_lora_rank={_topology_diagnostic_value(kv_lora_rank)} (expected {NOPE_ROW_DIM}), "
                 f"qk_rope_head_dim={_topology_diagnostic_value(qk_rope_head_dim)} (expected {PE_ROW_DIM}), "
                 f"impl.enable_dsa_cp={_topology_diagnostic_value(raw_dsa_cp)}, "
+                f"impl.dsa_cp_decoder={_topology_diagnostic_value(raw_dsa_cp_decoder)}, "
                 f"impl.enable_dsa_cp_with_o_proj_tp={_topology_diagnostic_value(raw_o_proj_tp)}, "
                 f"is_vl_first_layer={vl_first}, "
                 f"impl.tp_size={_topology_diagnostic_value(impl_tp)}, "

@@ -7,6 +7,35 @@ the model worker must derive the same limit before either schedules recovery.
 
 from typing import Any
 
+from vllm_ascend import envs
+
+
+def independent_decoder_dcp(config: Any) -> bool:
+    """Select a static candidate; workers must still validate the loaded layout.
+
+    EngineCore computes its recovery budget before the worker sets the validated
+    decoder-DCP marker. Keep this opt-in separate from generic context parallelism.
+    """
+    parallel, model = config.parallel_config, getattr(config, "model_config", None)
+    transfer = config.kv_transfer_config
+    return bool(
+        envs.VLLM_ASCEND_SFA_INDEPENDENT_DP
+        and envs.VLLM_ASCEND_SFA_FULL_GRAPH
+        and envs.VLLM_ASCEND_DSA_UNBUNDLE
+        and envs.VLLM_ASCEND_DSA_TWO_GROUPS
+        and not envs.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
+        and parallel.distributed_executor_backend == "mp"
+        and parallel.nnodes_within_dp == 1
+        and not getattr(parallel, "enable_elastic_ep", False)
+        and parallel.decode_context_parallel_size in (2, 4, 8)
+        and parallel.decode_context_parallel_size == parallel.tensor_parallel_size == parallel.local_world_size
+        and transfer is not None
+        and transfer.is_kv_consumer
+        and getattr(model, "use_mla", False)
+        and not model.enforce_eager
+        and hasattr(model.hf_text_config, "index_topk")
+    )
+
 
 def calculate_mc2_tokens_capacity(config: Any, max_num_reqs: int, query_width: int) -> int:
     """Return the existing MC2 allocation size, rounded to a complete TP row."""
@@ -36,7 +65,7 @@ def decoder_recovery_budget(config: Any) -> int | None:
         or parallel.data_parallel_size <= 1
         or parallel.pipeline_parallel_size != 1
         or parallel.prefill_context_parallel_size != 1
-        or parallel.decode_context_parallel_size != 1
+        or (parallel.decode_context_parallel_size != 1 and not independent_decoder_dcp(config))
         or parallel.enable_dbo
     ):
         return None
